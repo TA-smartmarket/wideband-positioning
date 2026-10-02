@@ -20,6 +20,7 @@
 
 #include "config.h"
 #include "solver.h"
+#include "ekf.h"
 #include "net.h"
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,94 @@ inline void shortToDeviceId(uint16_t shortAddr, char *out, size_t n)
     snprintf(out, n, "%s-%u", role, (unsigned)lo);
 }
 
+// ---------------------------------------------------------------------------
+// Robust per-link range filter
+//
+// The DW1000 library's own `useRangeFilter()` is a plain low-pass that stores
+// its previous output inside DW1000Device. When one sample is wrong the bad
+// value is fed back forever, so the range walks away (observed: 1.5 m drifting
+// to 248 m). It is therefore DISABLED and replaced by this filter:
+//   * reject physically impossible jumps (outlier gate)
+//   * median-of-3 over the recent history (kills single-sample spikes)
+//   * light EMA for smoothing
+// ---------------------------------------------------------------------------
+#define MAX_LINKS  MAX_RANGES
+#define RANGE_HIST 3
+#define MAX_JUMP_M 5.0f      // a real person cannot jump 5 m between samples
+#define EMA_ALPHA  0.35f
+
+struct RangeFilter {
+    float   hist[RANGE_HIST];
+    uint8_t n;
+    float   out;
+    bool    seeded;
+    char    key[24];         // "src>dst", identifies the link
+    bool    used;
+};
+
+RangeFilter filters[MAX_LINKS];
+
+inline float rfUpdate(RangeFilter &f, float raw)
+{
+    // outlier gate: ignore jumps that are not physically plausible
+    if (f.seeded && fabsf(raw - f.out) > MAX_JUMP_M) return f.out;
+
+    // median of the last RANGE_HIST samples (+ the new one)
+    float s[RANGE_HIST + 1];
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < f.n; i++) s[n++] = f.hist[i];
+    s[n++] = raw;
+    for (uint8_t i = 0; i < n; i++)                 // insertion sort, n <= 4
+        for (uint8_t j = i + 1; j < n; j++)
+            if (s[j] < s[i]) { float t = s[i]; s[i] = s[j]; s[j] = t; }
+    const float med = s[n / 2];
+
+    // keep a short history
+    if (f.n < RANGE_HIST) f.hist[f.n++] = raw;
+    else {
+        memmove(&f.hist[0], &f.hist[1], sizeof(float) * (RANGE_HIST - 1));
+        f.hist[RANGE_HIST - 1] = raw;
+    }
+
+    f.out = f.seeded ? (EMA_ALPHA * med + (1.0f - EMA_ALPHA) * f.out) : med;
+    f.seeded = true;
+    return f.out;
+}
+
+// Filter the raw range for this link (creating state on first use).
+inline float filterRange(const char *src, const char *dst, float raw)
+{
+    char key[24];
+    snprintf(key, sizeof(key), "%s>%s", src, dst);
+
+    for (uint8_t i = 0; i < MAX_LINKS; i++)
+        if (filters[i].used && !strcmp(filters[i].key, key))
+            return rfUpdate(filters[i], raw);
+
+    for (uint8_t i = 0; i < MAX_LINKS; i++) {
+        if (!filters[i].used) {
+            memset(&filters[i], 0, sizeof(RangeFilter));
+            snprintf(filters[i].key, sizeof(filters[i].key), "%s", key);
+            filters[i].used = true;
+            return rfUpdate(filters[i], raw);
+        }
+    }
+    return raw;   // no slot: pass through
+}
+
+// Forget a link's filter state (called when the peer is lost).
+inline void filterForget(const char *id)
+{
+    for (uint8_t i = 0; i < MAX_LINKS; i++) {
+        if (!filters[i].used) continue;
+        if (strstr(filters[i].key, id)) {
+            filters[i].used = false;
+            filters[i].seeded = false;
+            filters[i].n = 0;
+        }
+    }
+}
+
 void pushRange(const char *src, const char *dst, float range, float rx, float fp, float q)
 {
     // replace the entry for the same pair, else append
@@ -108,7 +197,8 @@ void pushRange(const char *src, const char *dst, float range, float rx, float fp
     RangeRec &r = ranges[slot];
     strncpy(r.src, src, sizeof(r.src) - 1); r.src[sizeof(r.src) - 1] = 0;
     strncpy(r.dst, dst, sizeof(r.dst) - 1); r.dst[sizeof(r.dst) - 1] = 0;
-    r.range = range; r.rx = rx; r.fp = fp; r.quality = q;
+    r.range = cfg.range_filter ? filterRange(src, dst, range) : range;
+    r.rx = rx; r.fp = fp; r.quality = q;
     r.ts = millis();
 }
 
@@ -162,11 +252,51 @@ String buildTelemetry()
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// telemetry uplink (non-blocking)
+//
+// HTTP POSTs used to run inline in loop(), which stalls DW1000Ranging.loop()
+// for up to the HTTP timeout (1.5 s). The ranging protocol then misses its
+// reply window and the peer is dropped as "inactive" (1 s timeout) — the
+// visible symptom is a link that keeps dropping.
+//
+// The uplink therefore runs in its own FreeRTOS task on the other core.
+// ---------------------------------------------------------------------------
+String  pending_json;
+bool    pending_rest = false;
+SemaphoreHandle_t pending_lock = nullptr;
+
+void uplinkTask(void *)
+{
+    for (;;) {
+        String body;
+        bool   do_rest = false;
+
+        if (xSemaphoreTake(pending_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (pending_rest) { body = pending_json; do_rest = true; pending_rest = false; }
+            xSemaphoreGive(pending_lock);
+        }
+
+        if (do_rest && net.wifi_up && cfg.server_url[0]) httpPostJson("/api/v1/telemetry", body);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// Queue a batch for the uplink task. Never blocks the ranging loop.
+void queueRest(const String &body)
+{
+    if (xSemaphoreTake(pending_lock, 0) == pdTRUE) {
+        pending_json = body;
+        pending_rest = true;
+        xSemaphoreGive(pending_lock);
+    }
+}
+
 void publishTelemetry()
 {
     String body = buildTelemetry();
 
-    // MQTT: per-range live topics + a full telemetry snapshot
+    // MQTT: non-blocking publishes, safe to do inline
     if (net.mqtt_up) {
         char t[80];
         topic(t, sizeof(t), "telemetry");
@@ -186,10 +316,9 @@ void publishTelemetry()
         }
     }
 
-    // REST: batch (also the fallback when MQTT is down)
-    if (!net.mqtt_up || !cfg.mqtt_enabled) {
-        httpPostJson("/api/v1/telemetry", body);
-    }
+    // REST: hand off to the uplink task (also the fallback when MQTT is down)
+    if (!net.mqtt_up || !cfg.mqtt_enabled) queueRest(body);
+    else queueRest("");          // nothing pending, keeps the slot clear
 
     range_count = 0;
 }
@@ -198,6 +327,17 @@ void publishTelemetry()
 // standalone solver (tag only): uses ranges collected from anchors
 // ---------------------------------------------------------------------------
 AnchorFix fixes[MAX_ANCHORS];
+
+// ---------------------------------------------------------------------------
+// Localisation: bootstrap with the geometric solver, then track with the EKF.
+//
+//  * The closed-form solver gives the first fix (and a sanity check).
+//  * From then on the EKF fuses every anchor range over time: it smooths the
+//    noise, estimates velocity, and its innovation gate rejects NLOS/outlier
+//    measurements (see src/ekf.h for the model and Jacobians).
+// ---------------------------------------------------------------------------
+Ekf tag_ekf;
+float ekf_last_solve_ms = 0;
 
 void solveLocally()
 {
@@ -219,16 +359,45 @@ void solveLocally()
     }
     if (n < 2) { pos_count = 0; return; }
 
-    Position p = solvePosition(fixes, n, cfg.room_w, cfg.room_h);
-    if (!p.valid) { pos_count = 0; return; }
-
     char me[16];
     deviceId(cfg, me, sizeof(me));
+
+    // --- bootstrap: first fix from the geometric solver --------------------
+    if (!tag_ekf.init) {
+        Position p = solvePosition(fixes, n, cfg.room_w, cfg.room_h);
+        if (!p.valid) { pos_count = 0; return; }
+        ekfInit(tag_ekf, p.x, p.y);
+        ekf_last_solve_ms = millis();
+    } else {
+        // --- track: predict + one range update per anchor ------------------
+        const uint32_t now = millis();
+        ekfPredict(tag_ekf, (now - ekf_last_solve_ms) / 1000.0f);
+        ekf_last_solve_ms = now;
+    }
+
+    uint8_t used = 0;
+    for (uint8_t i = 0; i < n; i++)
+        if (ekfUpdateRange(tag_ekf, fixes[i].x, fixes[i].y, fixes[i].range))
+            used++;
+
+    // no measurement was accepted this cycle -> the estimate is coasting
+    if (used == 0 && tag_ekf.updates > 0) {
+        // keep publishing the prediction, but with reduced confidence
+    }
+
+    float px, py, vx, vy;
+    ekfPosition(tag_ekf, px, py, vx, vy);
+    const float sigma = ekfPositionSigma(tag_ekf);
+
     snprintf(positions[0].id, sizeof(positions[0].id), "%s", me);
-    positions[0].x = p.x; positions[0].y = p.y;
-    positions[0].confidence = p.confidence;
-    positions[0].ambiguous = p.ambiguous;
+    positions[0].x = px;
+    positions[0].y = py;
+    positions[0].confidence = 1.0f / (1.0f + sigma);   // 0..1, from the covariance
+    positions[0].ambiguous = false;                     // EKF resolves the mirror
     pos_count = 1;
+
+    Serial.printf("[ekf] x %.2f y %.2f v(%.2f,%.2f) sigma %.2f used %u/%u\n",
+                  px, py, vx, vy, sigma, used, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +416,10 @@ void newRange()
     const float rx    = d->getRXPower();
     const float fp    = DW1000.getFirstPathPower();
     const float q     = DW1000.getReceiveQuality();
+
+    // The smoothing filter can overshoot below zero on the first samples;
+    // a negative distance is meaningless and breaks the solver.
+    if (range <= 0.01f) return;
 
     if (cfg.role == ROLE_TAG) pushRange(other, me, range, rx, fp, q);
     else                      pushRange(me, other, range, rx, fp, q);
@@ -272,6 +445,19 @@ void blinkDevice(DW1000Device *d)
 void inactiveDevice(DW1000Device *d)
 {
     char id[16]; shortToDeviceId(d->getShortAddress(), id, sizeof(id));
+    if (!strncmp(id, "anchor", 6) && anchors_seen) anchors_seen--;
+    if (!strncmp(id, "tag", 3) && tags_seen) tags_seen--;
+
+    filterForget(id);   // drop the pre-filter state for this link
+
+    // drop the stale range so the solver does not use a dead link
+    for (uint8_t i = 0; i < range_count; i++) {
+        if (!strcmp(ranges[i].src, id) || !strcmp(ranges[i].dst, id)) {
+            memmove(&ranges[i], &ranges[i + 1], sizeof(RangeRec) * (range_count - i - 1));
+            range_count--;
+            i--;
+        }
+    }
     Serial.printf("[uwb] device lost: %s\n", id);
 }
 
@@ -654,6 +840,11 @@ void setup()
     // portal can be started later — e.g. when WiFi credentials are wrong.
     portalRegister();
 
+    // Uplink runs on its own task so an unreachable server can never stall
+    // the ranging protocol (see uplinkTask()).
+    pending_lock = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(uplinkTask, "uplink", 8192, nullptr, 1, nullptr, 0);
+
     if (cfg.role == ROLE_NONE) {
         Serial.println(F("no role configured -> starting setup portal"));
         printHelp();
@@ -671,7 +862,11 @@ void setup()
     DW1000Ranging.attachNewDevice(newDevice);
     DW1000Ranging.attachBlinkDevice(blinkDevice);
     DW1000Ranging.attachInactiveDevice(inactiveDevice);
-    DW1000Ranging.useRangeFilter(cfg.range_filter);
+    // The library's own low-pass filter is disabled on purpose: it stores its
+    // previous output inside DW1000Device and feeds a bad sample back forever
+    // (observed drift 1.5 m -> 248 m). src/main.cpp does the filtering instead
+    // (median + outlier gate), and src/ekf.h does the tracking.
+    DW1000Ranging.useRangeFilter(false);
 
     if (cfg.role == ROLE_TAG)
         DW1000Ranging.startAsTag(eui, uwbModeBytes(cfg.uwb_mode), false);

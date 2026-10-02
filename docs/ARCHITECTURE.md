@@ -67,20 +67,101 @@ device ──────────────── applies partial JSON →
   - REST:  `POST /api/v1/telemetry` (batch; used as fallback when MQTT is off/down)
 - Server stores latest range per `(anchor, tag)` and recomputes positions.
 
-## 5. Solver (identical on device & server)
+## 5. Localisation pipeline (device and server agree)
 
-Input: anchor positions + ranges. Output: `(x, y)`, `confidence`, `ambiguous`.
+Three stages, in order:
 
-- **0–1 anchors** → no fix.
-- **2 anchors** → circle intersection, two candidates. Pick the candidate
-  inside the room rect `[0,room_w]×[0,room_h]`. If both/neither → `ambiguous`
-  and nearest to room centre is returned. No intersection → midpoint with
-  low confidence.
-- **3+ anchors** → linearised least squares (subtract eq. 0), then 2
-  Gauss-Newton iterations; `confidence = 1 − RMS residual`.
+### 5.1 Pre-filter — `src/main.cpp` (`RangeFilter`, `filterRange()`)
 
-Server normalises to the same function (`solve_2d` in `app.py`); the device
-uses `solver.h` for standalone operation.
+The DW1000 library's own `useRangeFilter()` is **disabled on purpose**: it is a
+plain low-pass that stores its previous output *inside* `DW1000Device`, so one
+bad sample is fed back forever and the range walks away (observed on hardware:
+1.5 m drifting to 248 m). It is replaced by:
+
+1. **outlier gate** — reject a sample that jumps more than `MAX_JUMP_M` (5 m)
+   from the current estimate;
+2. **median-of-3** over the recent history — kills single-sample spikes;
+3. **light EMA** (`EMA_ALPHA = 0.35`) for smoothing.
+
+Filter state is per link (`"src>dst"`) and dropped when the peer is lost
+(`filterForget()`). The `filter on|off` setting controls this pre-filter.
+
+### 5.2 Bootstrap — `src/solver.h` / `server/app.py::solve_2d()`
+
+Closed-form geometry gives the first fix:
+
+- **2 anchors** → circle intersection, two mirror candidates; the one inside
+  the room rect wins. Both/neither inside → `ambiguous: true`, nearest to room
+  centre returned. No intersection → midpoint, low confidence.
+- **3+ anchors** → linearised least squares + 2 Gauss-Newton iterations.
+
+### 5.3 Tracking — Extended Kalman Filter, `src/ekf.h` / `server/app.py::TagEKF`
+
+Once a first fix exists, the **EKF** takes over (this is the estimator the
+supervisor asked for — the measurement model is non-linear, hence *Extended*).
+
+**State** `x = [px, py, vx, vy]ᵀ` — position (m) and velocity (m/s).
+
+**Motion model** (constant velocity, discrete white-acceleration noise):
+
+```
+x_{k+1} = F x_k ,  F = [[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]]
+Q = sigma_a^2 * [[dt^4/4, 0, dt^3/2, 0],
+                 [0, dt^4/4, 0, dt^3/2],
+                 [dt^3/2, 0, dt^2,   0],
+                 [0, dt^3/2, 0, dt^2  ]]
+```
+
+**Measurement model** — range to anchor *i* at `(ax_i, ay_i)`:
+
+```
+h_i(x) = sqrt((px-ax_i)^2 + (py-ay_i)^2)          <- NON-LINEAR
+H_i    = [ (px-ax_i)/d , (py-ay_i)/d , 0 , 0 ]    <- Jacobian (linearisation)
+```
+
+**Update** (one scalar measurement per anchor, processed sequentially):
+
+```
+y = z - h(x)                    innovation
+S = H P Hᵀ + sigma_r^2          innovation covariance
+K = P Hᵀ / S                    Kalman gain
+x = x + K y
+P = (I - K H) P
+```
+
+**Innovation gating**: a measurement is rejected when `|y| > 3·sqrt(S)`
+(NLOS / reflection outlier). Rejected samples are simply skipped, so the filter
+keeps coasting on the motion model instead of being corrupted.
+
+**Tuning**: `sigma_a = 1.0 m/s²` (process), `sigma_r = 0.15 m` (range noise).
+`confidence` reported to the UI is `1 / (1 + sigma)` where
+`sigma = sqrt(P00 + P11)` — it shrinks as measurements accumulate, so a
+converged track shows high confidence automatically.
+
+**Why it also fixes the "mirror" problem**: the EKF carries the previous state
+forward, so the 2-anchor ambiguity cannot flip the estimate between cycles.
+
+Verification (server-side, synthetic walk at y = 1.0 → 1.6 m):
+
+```
+step 0  true_y=1.0 -> x=1.99 y=1.12  vy=0.00  sigma=0.270  used=2
+step 1  true_y=1.2 -> x=2.01 y=1.03  vy=-0.28 sigma=0.263  used=2
+step 2  true_y=1.4 -> x=2.01 y=1.46  vy=0.73  sigma=0.257  used=2
+step 3  true_y=1.6 -> x=2.01 y=1.64  vy=0.68  sigma=0.202  used=2
+```
+
+### 5.4 Where each stage runs
+
+| Stage | Device (tag) | Server |
+|---|---|---|
+| pre-filter | yes | — (ranges arrive already filtered) |
+| bootstrap | yes (standalone) | yes |
+| EKF tracking | yes (standalone fallback) | yes (primary) |
+
+The tag publishes its own EKF estimate with `"source": "device"`; the server's
+estimate is authoritative and published as `"source": "server"`.
+
+---
 
 ## 6. State model
 

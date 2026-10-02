@@ -16,10 +16,15 @@
 #include "config.h"
 
 // ---- JSON helpers (shared with main.cpp) ----------------------------------
-
-inline void jsonPutFloat(JsonDocument doc, const char *k, float v)
+//
+// MUST be a template taking the object by reference. A `JsonDocument`
+// parameter would be passed BY VALUE, which makes ArduinoJson deep-copy the
+// subtree — every write then lands in the copy and is silently discarded
+// (symptom: range/rx_power arrive as 0 while ts/src/dst are fine).
+template <typename TJson>
+inline void jsonPutFloat(TJson &obj, const char *k, float v)
 {
-    doc[k] = v;   // v7: JsonDocument root is a JsonVariant
+    if (!isnan(v)) obj[k] = v;
 }
 
 // ---- network state --------------------------------------------------------

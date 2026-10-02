@@ -70,23 +70,43 @@ def touch_device(cfg):
 
 
 def merged_config(role, did):
-    """Full config for a device: per-device over base, plus anchor map."""
+    """Config for a device: its stored values over the defaults, plus the
+    anchor map.
+
+    For an *unknown* device only the identity + anchor map are returned — the
+    network/placement fields are omitted so the device keeps whatever it has
+    in NVS instead of being wiped by the server defaults.
+    """
     with LOCK:
         key = f"{role}-{did}"
+        entry = DEVICES.get(key)
+        # "_auto" devices were only seen in telemetry — their defaults must not
+        # be pushed back, or the device would lose its locally set WiFi/server.
+        known = entry is not None and not entry.get("_auto")
         cfg = copy.deepcopy(BASE_CFG)
-        if key in DEVICES:
-            cfg.update(DEVICES[key])
+        if known:
+            cfg.update(entry)
         cfg["device_id"] = key
         cfg["role"] = role
         cfg["id"] = did
         # anchors[] array so a tag can solve locally too
         anchors = []
         for dk, dc in DEVICES.items():
-            if dc.get("role") == "anchor":
+            if dc.get("role") == "anchor" and not dc.get("_auto"):
                 anchors.append({"id": dc.get("id"), "x": dc["position"]["x"],
                                 "y": dc["position"]["y"], "z": dc["position"]["z"],
                                 "device_id": dk})
         cfg["anchors"] = anchors
+        if not known:
+            # strip everything the device already knows locally
+            return {"device_id": key, "role": role, "id": did, "anchors": anchors}
+        # never push empty credentials back — that would wipe the device
+        if not cfg["wifi"]["ssid"]:
+            cfg.pop("wifi", None)
+        if not cfg["server"]["url"]:
+            cfg.pop("server", None)
+        if not cfg["mqtt"]["host"]:
+            cfg.pop("mqtt", None)
         return cfg
 
 
@@ -163,8 +183,93 @@ def solve_2d(fixes, room_w, room_h):
     return {"x": px, "y": py, "confidence": conf, "ambiguous": False}
 
 
+# ---------------------------------------------------------------------------
+# Extended Kalman Filter (mirror of src/ekf.h)
+#
+#   state x = [px, py, vx, vy], constant-velocity motion, range measurement
+#   h(x) = ||p - a_i|| is non-linear -> linearised with the Jacobian
+#   H = [(px-ax)/d, (py-ay)/d, 0, 0]. Innovation gating rejects NLOS outliers.
+# ---------------------------------------------------------------------------
+EKF_N = 4
+
+
+class TagEKF:
+    def __init__(self, px, py, sigma_a=1.0, sigma_r=0.15):
+        self.x = [px, py, 0.0, 0.0]
+        self.P = [[1.0, 0, 0, 0],
+                  [0, 1.0, 0, 0],
+                  [0, 0, 4.0, 0],
+                  [0, 0, 0, 4.0]]
+        self.sigma_a = sigma_a
+        self.sigma_r = sigma_r
+        self.last_ms = now_ms()
+        self.updates = 0
+
+    # x = F x , P = F P F^T + Q   (constant velocity)
+    def predict(self, dt):
+        if dt <= 0:
+            return
+        dt = min(dt, 2.0)
+        self.x[0] += self.x[2] * dt
+        self.x[1] += self.x[3] * dt
+
+        P = self.P
+        FP = [[P[0][j] + dt * P[2][j] for j in range(4)],
+              [P[1][j] + dt * P[3][j] for j in range(4)],
+              [P[2][j] for j in range(4)],
+              [P[3][j] for j in range(4)]]
+        FPFt = [[FP[i][0] + dt * FP[i][2], FP[i][1] + dt * FP[i][3],
+                 FP[i][2], FP[i][3]] for i in range(4)]
+
+        dt2, dt3, dt4 = dt * dt, dt ** 3, dt ** 4
+        q = self.sigma_a ** 2
+        Q = [[q * dt4 / 4, 0, q * dt3 / 2, 0],
+             [0, q * dt4 / 4, 0, q * dt3 / 2],
+             [q * dt3 / 2, 0, q * dt2, 0],
+             [0, q * dt3 / 2, 0, q * dt2]]
+        self.P = [[FPFt[i][j] + Q[i][j] for j in range(4)] for i in range(4)]
+
+    # one scalar range measurement to anchor (ax, ay); returns True if accepted
+    def update_range(self, ax, ay, rng, gate_sigma=3.0):
+        if rng <= 0.01:
+            return False
+        dx, dy = self.x[0] - ax, self.x[1] - ay
+        d = math.hypot(dx, dy) or 1e-3
+
+        H = [dx / d, dy / d, 0.0, 0.0]                    # Jacobian
+        innov = rng - d                                    # y = z - h(x)
+
+        PHt = [sum(self.P[i][k] * H[k] for k in range(4)) for i in range(4)]
+        S = sum(H[i] * PHt[i] for i in range(4)) + self.sigma_r ** 2
+        if S < 1e-9:
+            return False
+
+        if abs(innov) > gate_sigma * math.sqrt(S):         # innovation gate
+            return False
+
+        K = [PHt[i] / S for i in range(4)]
+        for i in range(4):
+            self.x[i] += K[i] * innov
+
+        Pn = [[self.P[i][j] - K[i] * sum(H[k] * self.P[k][j] for k in range(4))
+               for j in range(4)] for i in range(4)]
+        self.P = Pn
+        self.updates += 1
+        return True
+
+    def position(self):
+        return self.x[0], self.x[1], self.x[2], self.x[3]
+
+    def sigma(self):
+        return math.sqrt(max(self.P[0][0], 0.0) + max(self.P[1][1], 0.0))
+
+
+EKF = {}      # tag_id -> TagEKF
+
+
 def recompute_positions():
-    """Recompute all tag positions from the freshest ranges."""
+    """Recompute all tag positions: geometric solver for the first fix, then
+    the EKF tracks each tag over time (see class TagEKF)."""
     now = now_ms()
     out = {}
     tags = {dk for dk, dc in DEVICES.items() if dc.get("role") == "tag"}
@@ -184,12 +289,32 @@ def recompute_positions():
             anchors_used.append(a)
         if len(fixes) < 2:
             continue
+
         room = DEVICES.get("_room", BASE_CFG["room"])
-        sol = solve_2d(fixes, room["width"], room["height"])
-        if sol:
-            sol.update({"ts": now, "src": "server", "id": tag,
-                        "ranges": {a: RANGES[(a, tag)]["range"] for a in anchors_used}})
-            out[tag] = sol
+
+        # --- bootstrap: closed-form fix for the first estimate --------------
+        if tag not in EKF:
+            sol = solve_2d(fixes, room["width"], room["height"])
+            if not sol:
+                continue
+            EKF[tag] = TagEKF(sol["x"], sol["y"])
+        else:
+            EKF[tag].predict((now - EKF[tag].last_ms) / 1000.0)
+            EKF[tag].last_ms = now
+
+        # --- track: one range update per anchor ----------------------------
+        used = sum(1 for (ax, ay, rng) in fixes if EKF[tag].update_range(ax, ay, rng))
+        px, py, vx, vy = EKF[tag].position()
+        sigma = EKF[tag].sigma()
+
+        out[tag] = {
+            "ts": now, "src": "server", "id": tag,
+            "x": px, "y": py, "vx": vx, "vy": vy,
+            "confidence": 1.0 / (1.0 + sigma),
+            "sigma": sigma, "ambiguous": False,
+            "updates": EKF[tag].updates, "used": used,
+            "ranges": {a: RANGES[(a, tag)]["range"] for a in anchors_used},
+        }
     return out
 
 
@@ -221,6 +346,7 @@ def ingest_telemetry(payload, source):
                         cfg["id"] = 0
                     cfg["device_id"] = did
                     cfg["last_seen"] = now_ms()
+                    cfg["_auto"] = True        # seen, but not configured yet
                     DEVICES[did] = cfg
         if payload.get("status"):
             handle_status(payload["device_id"], payload["status"])
@@ -254,6 +380,8 @@ def ingest_telemetry(payload, source):
     with LOCK:
         for tag, sol in positions.items():
             TAG_POS[tag] = {"x": sol["x"], "y": sol["y"],
+                            "vx": sol.get("vx", 0.0), "vy": sol.get("vy", 0.0),
+                            "sigma": sol.get("sigma", 0.0),
                             "conf": sol["confidence"], "amb": sol["ambiguous"],
                             "ts": sol["ts"], "src": "server"}
     broadcast_state()
@@ -273,6 +401,8 @@ def build_state():
     tags = []
     for tag, p in TAG_POS.items():
         tags.append({"id": tag, "x": p["x"], "y": p["y"], "z": 0.9,
+                     "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
+                     "sigma": p.get("sigma", 0.0),
                      "confidence": p["conf"], "ambiguous": p["amb"],
                      "online": now - p["ts"] < STALE_MS, "last_seen": p["ts"],
                      "source": p.get("src", "server"),
@@ -397,6 +527,7 @@ def api_config_put():
         deep_merge(dev, body)
         dev["role"] = role
         dev["id"] = did
+        dev.pop("_auto", None)        # explicitly configured now
         dev["last_seen"] = now_ms()
         devcfg = merged_config(role, did)
     # push to device over MQTT (retained -> node picks it up even if offline)
@@ -426,10 +557,13 @@ def api_state():
 
 @APP.route("/api/v1/devices", methods=["GET"])
 def api_devices():
-    out = [{"device_id": dk, **{k: d[k] for k in ("role", "id") if k in d},
+    out = [{"device_id": dk,
+            **{k: d[k] for k in ("role", "id") if k in d},
+            "configured": not d.get("_auto", False),
             "last_seen": d.get("last_seen", 0),
             "online": now_ms() - d.get("last_seen", 0) < 5000}
-           for d in DEVICES.values() if d.get("role") in ("tag", "anchor")]
+           for dk, d in DEVICES.items()
+           if dk != "_room" and d.get("role") in ("tag", "anchor")]
     return jsonify({"ok": True, "devices": out})
 
 

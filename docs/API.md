@@ -192,15 +192,28 @@ not pick a room-interior solution — the position is a mirror guess.
 
 ---
 
-## 7. Solver rules (server)
+## 7. Localisation rules (server)
+
+The pipeline is **pre-filter → bootstrap → EKF tracking** (full maths in
+`docs/ARCHITECTURE.md` §5).
 
 1. Collect the most recent range per `(anchor, tag)` pair (age < `stale_ms`,
-   default 2000 ms).
+   default 2000 ms). Ranges arrive already pre-filtered by the device
+   (median + outlier gate; the library's own low-pass is disabled).
 2. Need ≥ 2 anchor ranges for a tag, with known anchor positions.
-3. **2 anchors** → circle intersection gives two candidates; pick the one
-   inside `room` bounds. If both or neither are inside → `ambiguous: true`,
-   return the one closer to room centre.
-4. **3+ anchors** → least-squares multilateration (linearised, 2 unknowns
-   x,y; z fixed at tag height or averaged anchor z).
-5. `confidence` = clamp(1 − RMS residual / max(range, 1), 0, 1).
+3. **Bootstrap (first fix only)** — closed-form geometry:
+   - **2 anchors** → circle intersection gives two candidates; pick the one
+     inside `room` bounds. If both or neither are inside → `ambiguous: true`,
+     the one closer to room centre is used.
+   - **3+ anchors** → least-squares multilateration (linearised, 2 unknowns).
+4. **Tracking (after the first fix)** — **Extended Kalman Filter**
+   (`class TagEKF`), state `[px, py, vx, vy]`:
+   - `predict(dt)` with the constant-velocity model + process noise `sigma_a`;
+   - one scalar `update_range(ax, ay, z)` per anchor, linearised Jacobian
+     `H = [(px-ax)/d, (py-ay)/d, 0, 0]`;
+   - **innovation gating**: `|z - h(x)| > 3·sqrt(S)` → measurement rejected
+     (NLOS/outlier) and skipped.
+5. `confidence` = `1 / (1 + sigma)` with `sigma = sqrt(P00 + P11)` from the
+   EKF covariance (shrinks as measurements accumulate). `vx`/`vy` (m/s) and
+   `sigma` are included in the tag state.
 6. Positions are recomputed on every ingest and broadcast on `<base>/state`.

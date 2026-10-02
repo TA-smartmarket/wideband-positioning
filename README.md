@@ -309,22 +309,65 @@ fallback ke REST.
 
 ## ⚙️ Cara Kerja & Logika Penting
 
-1. **Tag** memancarkan ranging poll; tiap **anchor** membalas.
-2. `DW1000Ranging` mengukur time-of-flight → jarak (m), RX power (dBm), dan
-   kualitas — dipanggil lewat callback `newRange()`.
-3. Range disimpan berpasangan `(anchor, tag)` lalu dikirim ke server
-   (REST/MQTT) tiap interval.
-4. **Solver** (identik di server & tag):
-   - **2 anchor** → perpotongan dua lingkaran = **2 kandidat (mirror)**.
-     Dipilih yang masuk batas ruangan (`room`). Kalau dua-duanya di dalam /
-     luar → ditandai `ambiguous: true` (ambil yang terdekat ke pusat ruangan).
-   - **3+ anchor** → least-squares (dengan iterasi Gauss-Newton),
-     `confidence = 1 − RMS residual`.
-5. Server publish `state` (web UI + MQTT) dengan koordinat tag real-time.
+Pipeline lokalisasi punya **3 tahap** (identik di device dan server):
 
-> Karena jarak radio ±10–30 cm noise di dalam ruangan (pantulan), filter
-> smoothing aktif default (`filter on`). Kalau posisi tag melompat-lompat
-> karena mirror, tambahkan anchor ke-3.
+### 1. Pre-filter (buang sampel liar)
+Filter bawaan library DW1000 **dimatikan sengaja** — itu low-pass yang menyimpan
+nilai sebelumnya di dalam `DW1000Device`, jadi satu sampel buruk diumpan-balik
+terus dan jarak melenceng jauh (terbukti di hardware: 1,5 m → 248 m). Diganti
+filter sendiri:
+- **outlier gate** — tolak lompatan > 5 m dari estimasi sekarang
+- **median-of-3** — buang spike satu sampel
+- **EMA ringan** (α = 0,35) untuk penghalusan
+
+### 2. Bootstrap (fix pertama)
+Geometri tertutup:
+- **2 anchor** → perpotongan dua lingkaran = 2 kandidat cermin; dipilih yang
+  masuk batas ruangan. Kalau dua-duanya di dalam/luar → `ambiguous`.
+- **3+ anchor** → least-squares + 2 iterasi Gauss-Newton.
+
+### 3. Tracking — **Extended Kalman Filter** (`src/ekf.h`, `server/app.py`)
+
+Setelah fix pertama ada, **EKF** yang jalan. Disebut *Extended* karena model
+pengukurannya non-linear (jarak = akar kuadrat posisi):
+
+```
+State     : x = [ px, py, vx, vy ]ᵀ        posisi (m) + kecepatan (m/s)
+Gerak     : constant velocity,  x ← F x ,  P ← F P Fᵀ + Q
+Pengukuran: h(x) = √((px-ax)² + (py-ay)²)          ← non-linear
+Jacobian  : H = [ (px-ax)/d , (py-ay)/d , 0 , 0 ]  ← linearisasi
+Update    : y = z - h(x) ; S = H P Hᵀ + σr² ; K = P Hᵀ/S
+            x ← x + K y ; P ← (I - K H) P
+```
+
+- **Innovation gating**: pengukuran ditolak bila `|y| > 3·√S` (outlier NLOS /
+  pantulan), jadi estimasi tidak rusak — filter lanjut pakai model gerak.
+- **Tuning**: `σa = 1,0 m/s²` (proses), `σr = 0,15 m` (noise jarak).
+- **Confidence** = `1/(1+σ)` dengan `σ = √(P₀₀+P₁₁)` — makin banyak data
+  masuk, makin kecil σ, makin tinggi confidence (otomatis).
+- **Bonus**: EKF membawa state sebelumnya, jadi masalah **cermin 2-anchor tidak
+  bisa membalik** estimasi antar-siklus.
+
+Verifikasi (server, lintasan sintetis y = 1,0 → 1,6 m):
+
+```
+step 0  true_y=1.0 -> x=1.99 y=1.12  vy=0.00  sigma=0.270  used=2
+step 1  true_y=1.2 -> x=2.01 y=1.03  vy=-0.28 sigma=0.263  used=2
+step 2  true_y=1.4 -> x=2.01 y=1.46  vy=0.73  sigma=0.257  used=2
+step 3  true_y=1.6 -> x=2.01 y=1.64  vy=0.68  sigma=0.202  used=2
+```
+
+| Tahap | Device (tag) | Server |
+|---|---|---|
+| pre-filter | ya | — |
+| bootstrap | ya (standalone) | ya |
+| EKF tracking | ya (fallback) | **ya (utama)** |
+
+Detail matematis lengkap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
+
+> Karena jarak radio ±10–30 cm noise di dalam ruangan (pantulan), EKF +
+> innovation gate sangat membantu. Kalau posisi masih melompat, tambahkan
+> anchor ke-3 (posisi non-kolinear) untuk geometri yang sehat.
 
 ---
 
