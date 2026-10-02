@@ -98,7 +98,10 @@ void setup()
 
     // Start as TAG (the node that measures distance).
     // MODE_LONGDATA_RANGE_LOWPOWER gives the best range at low power.
-    DW1000Ranging.startAsTag(TAG_ADDR, DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
+    // randomShortAddress = false -> short address is derived from the first
+    // two bytes of TAG_ADDR (0x7D00), so the tag keeps a stable ID instead
+    // of a new random one on every boot.
+    DW1000Ranging.startAsTag(TAG_ADDR, DW1000.MODE_LONGDATA_RANGE_LOWPOWER, false);
 
     Serial.print(F("[UWB] Tag "));
     Serial.print(TAG_ADDR);

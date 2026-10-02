@@ -9,7 +9,8 @@ Two firmwares are provided (one PlatformIO environment each):
 | Firmware | Environment | Role | What it does |
 |---|---|---|---|
 | [`src/tag/main.cpp`](src/tag/main.cpp) | `tag` | **Tag** (moving) | Measures distance to every anchor; prints + shows the latest distance on the OLED |
-| [`src/anchor/main.cpp`](src/anchor/main.cpp) | `anchor` | **Anchor** (fixed) | Replies to ranging requests from tags; prints each measured distance and shows its status on the OLED |
+| [`src/anchor/main.cpp`](src/anchor/main.cpp) | `anchor` | **Anchor #1** (fixed) | Replies to ranging requests from tags; prints each measured distance and shows its status on the OLED |
+| [`src/anchor/main.cpp`](src/anchor/main.cpp) | `anchor2` | **Anchor #2** (fixed) | Same firmware, but a **different UWB address** (`3D:4E:…`), so two anchors can run side by side |
 
 > The tag initiates ranging, so the distance value appears on **both** the
 > tag and the anchor's Serial output.
@@ -20,13 +21,13 @@ Two firmwares are provided (one PlatformIO environment each):
 
 ```
 wideband-positioning/
-├── platformio.ini          # PIO config: tag + anchor environments
+├── platformio.ini          # PIO config: tag, anchor, anchor2 environments
 ├── lib/
 │   └── DW1000/             # Makerfabs DW1000 library (vendored)
 │       └── src/            # DW1000, DW1000Ranging, DW1000Device, ...
 ├── src/
 │   ├── tag/main.cpp        # Tag firmware (env: tag)
-│   └── anchor/main.cpp     # Anchor firmware (env: anchor)
+│   └── anchor/main.cpp     # Anchor firmware (env: anchor, anchor2)
 ```
 
 The DW1000 library is committed into `lib/` so the project builds without
@@ -37,7 +38,8 @@ network access (no Arduino Library Manager needed).
 ## Requirements
 
 ### Hardware
-- 2× Makerfabs ESP32 UWB Pro with Display (or 1 tag + as many anchors as you like — multi-anchor works out of the box)
+- 3× Makerfabs ESP32 UWB Pro with Display (1 tag + 2 anchors), or any
+  combination — multi-anchor works out of the box
 - USB-C cables for programming
 
 ### Software
@@ -77,17 +79,29 @@ All connections are already fixed on the Makerfabs ESP32 UWB Pro with Display
 - **CLI**: `cd wideband-positioning`
 
 ### 2. Unique addresses (very important!)
-Every board must have its **own unique 8-byte UWB address**.
+Every board must have its **own unique 8-byte UWB address**. The **first two
+bytes** of that address become the *short address* (the ID shown in the logs
+and on the OLED), so they must differ between anchors.
 
-- Tag: edit `TAG_ADDR` in `src/tag/main.cpp`
-- Anchor: edit `ANCHOR_ADDR` in `src/anchor/main.cpp`
+| Board | Environment | UWB address (EUI) | Short address |
+|---|---|---|---|
+| Tag | `tag` | `7D:00:22:EA:82:60:3B:9B` | `0x7D00` |
+| Anchor #1 | `anchor` | `86:17:5B:D5:A9:9A:E2:9C` | `0x8617` |
+| Anchor #2 | `anchor2` | `3D:4E:7C:2A:08:5F:B1:C3` | `0x3D4E` |
 
-Example:
+- **Anchor #1** address is the default in `src/anchor/main.cpp`.
+- **Anchor #2** is the *same* firmware with a different address, injected by
+  the `anchor2` environment — no file editing needed:
 
-```cpp
-#define TAG_ADDR    "7D:00:22:EA:82:60:3B:9B"   // tag
-#define ANCHOR_ADDR "86:17:5B:D5:A9:9A:E2:9C"   // anchor
-```
+  ```ini
+  [env:anchor2]
+  build_flags = ... -DANCHOR_EUI="3D:4E:7C:2A:08:5F:B1:C3"
+  ```
+
+To add a **third** anchor, copy the `[env:anchor2]` block, rename it
+(`[env:anchor3]`) and give it a new EUI — just keep the first two bytes unique.
+
+To change the **tag** address, edit `TAG_ADDR` in `src/tag/main.cpp`.
 
 ### 3. Build
 
@@ -96,24 +110,27 @@ Example:
 
 ```bash
 pio run -e tag         # build tag firmware
-pio run -e anchor      # build anchor firmware
-pio run                # build both (default env: tag)
+pio run -e anchor      # build anchor #1 firmware
+pio run -e anchor2     # build anchor #2 firmware (unique address)
+pio run                # build the default env (tag)
 ```
 
 ### 4. Flash the firmware
-1. Connect the **anchor** board via USB, then upload the anchor firmware:
-   - IDE: select env `anchor` → click Upload (→)
-   - CLI: `pio run -e anchor -t upload`
-2. Connect the **tag** board, upload the tag firmware:
-   - `pio run -e tag -t upload`
+Upload the matching environment to each board (one board connected at a time):
 
-If multiple boards are connected, pick the port:
+| Board | Command |
+|---|---|
+| Anchor #1 | `pio run -e anchor -t upload` |
+| Anchor #2 | `pio run -e anchor2 -t upload --upload-port COM11` |
+| Tag | `pio run -e tag -t upload` |
+
+If multiple boards are connected, pick the port with `--upload-port`:
 
 ```bash
-pio run -e tag -t upload --upload-port COM5
+pio run -e anchor2 -t upload --upload-port COM11
 ```
 
-(On Windows the ports look like `COM3`, `COM5`, …)
+(On Windows the ports look like `COM3`, `COM5`, `COM11`, …)
 
 > **Stuck at "Connecting..." during upload?** The board resets automatically
 > most of the time, but if it doesn't: hold **BOOT**, tap **RST/EN**, release
@@ -130,24 +147,35 @@ pio device monitor -e tag -b 115200
 
 ## Expected Serial output
 
-**Tag** (`src/tag/main.cpp`):
+**Tag** (`env:tag`) — with two anchors running, the tag alternates between them:
 
 ```
 [UWB] Tag starting...
 [UWB] Tag 7D:00:22:EA:82:60:3B:9B started. Waiting for anchors...
-anchor added -> short: 0xE29C
-from: 0xE29C	Range: 1.484 m	RX power: -67.19 dBm
-from: 0xE29C	Range: 1.486 m	RX power: -67.31 dBm
+anchor added -> short: 0x8617
+anchor added -> short: 0x3D4E
+from: 0x8617	Range: 1.484 m	RX power: -67.19 dBm
+from: 0x3D4E	Range: 2.731 m	RX power: -71.04 dBm
+from: 0x8617	Range: 1.486 m	RX power: -67.31 dBm
+from: 0x3D4E	Range: 2.728 m	RX power: -70.98 dBm
 ```
 
-**Anchor** (`src/anchor/main.cpp`):
+**Anchor #1** (`env:anchor`):
 
 ```
 [UWB] Anchor starting...
 [UWB] Anchor 86:17:5B:D5:A9:9A:E2:9C started. Waiting for tags...
-tag added -> short: 0x3B9B
-from: 0x3B9B	Range: 1.484 m	RX power: -67.19 dBm
-from: 0x3B9B	Range: 1.486 m	RX power: -67.31 dBm
+tag added -> short: 0x7D00
+from: 0x7D00	Range: 1.484 m	RX power: -67.19 dBm
+```
+
+**Anchor #2** (`env:anchor2`) — same output, different IDs:
+
+```
+[UWB] Anchor starting...
+[UWB] Anchor 3D:4E:7C:2A:08:5F:B1:C3 started. Waiting for tags...
+tag added -> short: 0x7D00
+from: 0x7D00	Range: 2.731 m	RX power: -71.04 dBm
 ```
 
 ## OLED display
@@ -161,16 +189,25 @@ from: 0x3B9B	Range: 1.486 m	RX power: -67.31 dBm
 
 ## Alternative: Arduino IDE
 
-If you prefer the Arduino IDE over PlatformIO, the original sketches are kept
-here: [`examples/uwb_tag_distance`](examples/uwb_tag_distance/uwb_tag_distance.ino)
-and [`examples/uwb_anchor_distance`](examples/uwb_anchor_distance/uwb_anchor_distance.ino).
+If you prefer the Arduino IDE over PlatformIO, copy `src/tag/main.cpp` and
+`src/anchor/main.cpp` into sketch folders (rename them `main.ino`; the Arduino
+IDE auto-generates prototypes, so the explicit forward declarations are
+harmless).
 
 1. Install the **ESP32** board package (Boards Manager: `esp32 by Espressif Systems`).
 2. Install libraries (Sketch → Include Library → Manage Libraries):
    - **Adafruit SSD1306** + **Adafruit GFX Library**
    - **Makerfabs DW1000** from ZIP (`mf_DW1000.zip`, from the Makerfabs repo)
+     — or copy the vendored `lib/DW1000` folder into your Arduino `libraries/`
 3. Board: `Tools → Board → ESP32 Arduino → ESP32 Dev Module`
-4. Open the `.ino`, select the port, click Upload.
+4. Open the sketch, select the port, click Upload.
+
+For a second anchor in the Arduino IDE, just change the default in
+`src/anchor/main.cpp` (the `#define` inside the `#ifndef ANCHOR_EUI` block):
+
+```cpp
+#define ANCHOR_EUI "3D:4E:7C:2A:08:5F:B1:C3"
+```
 
 ---
 

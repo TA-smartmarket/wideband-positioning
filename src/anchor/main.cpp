@@ -26,11 +26,20 @@
 
 /*
  * UWB address of this anchor.
- * Every UWB node on the network MUST have its own unique address.
+ * Every UWB node on the network MUST have its own unique address
+ * (the first two bytes become the short address used in the network).
+ *
+ * The default below is anchor #1. For the second anchor (env:anchor2)
+ * platformio.ini overrides it with -DANCHOR_EUI="..." so each board
+ * gets a different address without touching this file.
  */
+#ifndef ANCHOR_EUI
+#define ANCHOR_EUI "86:17:5B:D5:A9:9A:E2:9C"
+#endif
+
 // Non-const array: the DW1000 library takes char* (writable), so a plain
 // string literal would trigger -Wwrite-strings.
-char ANCHOR_ADDR[] = "86:17:5B:D5:A9:9A:E2:9C";
+char ANCHOR_ADDR[] = ANCHOR_EUI;
 
 /*
  * Pinout of the ESP32 UWB Pro with Display.
