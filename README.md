@@ -1,105 +1,361 @@
-# 📡 UWB Positioning — ESP32 UWB Pro with Display
+# 📡 ESP32 UWB Positioning — Makerfabs ESP32 UWB Pro with Display
 
-Real-time indoor positioning: **tag** (moving device) measures distance to
-**anchors** placed in room corners, and the position is tracked live on a web
-map. Everything is configurable from a web UI — no recompiling, no serial
-editing.
+Real-time indoor **tag tracking**: boards placed in the room corners
+(**anchors**) measure the distance to a moving **tag**, and a server solves
+the tag's 2D position, displayed live on a web map.
 
-One firmware runs on **every** board. Role (`tag`/`anchor`) and ID (1–10) are
-chosen at runtime from the web UI, the setup portal, or the serial menu — the
-UWB address is generated automatically (no more manual `7D:00:22:…` editing).
+**One firmware runs on every board.** Role (`tag`/`anchor`) and ID (1–10) are
+chosen at runtime — from the web UI, a setup Wi-Fi portal, or the serial
+menu. The UWB address is generated automatically, so there is **no manual
+address editing anywhere**.
 
 ```
-┌────────┐  range  ┌────────┐        ┌──────────────────┐
-│ anchor1├────────▶│  tag   │        │  server (Flask)  │
-│ (0,0)  │◀────────│ (moves)│──REST/MQTT──▶ REST + MQTT  │
-└────────┘         └───┬────┘        │  solver → (x,y)  │
-┌────────┐             │             │  web UI          │
-│ anchor2│◀────────────┘             └──────────────────┘
-│ (5,0)  │
-└────────┘
+┌──────────┐  UWB range   ┌──────────┐  REST/MQTT   ┌────────────────────┐
+│ anchor-1 │◀────────────▶│   tag-1  │─────────────▶│  server (Flask)    │
+│  (0,0)   │              │ (moves)  │              │  solver → (x,y)    │
+└──────────┘              └──────────┘              │  web UI live map   │
+┌──────────┐                                        └────────────────────┘
+│ anchor-2 │
+│ (W,0)    │
+└──────────┘
 ```
 
-## Features
+---
 
-- **One binary, every board** — role & ID 1–10 via web UI / AP portal / serial
-  menu; UWB EUI + short address auto-derived.
-- **Config from the server** — set WiFi, MQTT, anchor position (`x,y`),
-  room size, UWB mode; devices poll + receive MQTT pushes (retained).
-- **Two transports** — HTTP REST *and* MQTT; MQTT preferred, REST fallback.
-- **Position solver** — server (and device, standalone) computes 2D position
-  from ≥2 anchor ranges with room-bound disambiguation.
-- **Live web map** — anchors, tag position, ranges, confidence, online status.
-- **Multi-anchor ready** — up to 10 tags and 10 anchors per site.
+## ✅ Fitur
 
-## Quick start
+- **Satu firmware untuk semua board** — role & ID (1–10) dipilih runtime
+  (web UI / setup portal / serial menu), disimpan di NVS.
+- **EUI & short address otomatis** dari role+ID — tidak perlu edit kode.
+- **Konfigurasi dari server** — WiFi, MQTT, posisi anchor (x, y dalam meter),
+  ukuran ruangan, mode UWB — device mengambilnya via REST poll **dan** MQTT
+  push (retained, jadi config tidak hilang saat device restart).
+- **2 jalur data** — REST **dan** MQTT; MQTT dipakai kalau ada, REST fallback.
+- **Position solver 2D** — di server (dan fallback di tag standalone) dari
+  ≥2 jangkauan anchor, dengan disambiguasi batas ruangan.
+- **Web UI** — live map (anchor, tag, garis jarak), tabel tag, form setup.
+- **Multi-device** — sampai 10 tag + 10 anchor per site.
 
-### 1. Run the server (your computer / Ubuntu later)
+---
+
+## 🧰 Hardware & Software
+
+### Hardware
+| Item | Jumlah | Catatan |
+|---|---|---|
+| Makerfabs ESP32 UWB Pro with Display (DW1000) | **3×** | 2 anchor + 1 tag (bisa lebih) |
+| Kabel USB-C (data, bukan cuma charge) | 3× | Untuk flash & serial |
+| Router / Wi-Fi | 1 | Board + server harus satu jaringan |
+
+### Software
+| Tool | Cara dapat |
+|---|---|
+| **PlatformIO** | VS Code + ekstensi *PlatformIO IDE*, atau CLI: `pip install platformio` |
+| **Python 3.9+** | Untuk server (CLI install butuh pip) |
+| **(Opsional) MQTT broker** | Mosquitto — kalau mau pakai jalur MQTT (FTP: Windows & Ubuntu punya paket `mosquitto`) |
+
+Semua library (ESP32 Arduino framework, Adafruit SSD1306/GFX, PubSubClient,
+ArduinoJson) diunduh otomatis oleh PlatformIO saat build pertama.
+
+---
+
+## 📁 Struktur Project
+
+```
+wideband-positioning/
+├── platformio.ini        # 1 env: esp32uwb (partisi huge_app)
+├── src/
+│   ├── main.cpp          # firmware: ranging, OLED UI, serial menu, portal AP,
+│   │                     #          REST+MQTT, terapkan config dari server
+│   ├── config.h          # model config + NVS + derivasi EUI + anchor map
+│   ├── net.h             # WiFi, HTTP client, MQTT (PubSubClient), setup portal
+│   └── solver.h          # multilaterasi 2D (dipakai tag standalone)
+├── lib/
+│   └── DW1000/           # library Makerfabs DW1000 (di-vendor, include guard difix)
+└── server/
+    ├── app.py            # Flask: REST + MQTT ingest + solver + web UI (1 file)
+    ├── requirements.txt  # flask, paho-mqtt
+    ├── README.md         # panduan server (ringkas)
+    └── mosquitto.test.conf
+```
+
+---
+
+## 🚀 Setup Lengkap
+
+### Langkah 1 — Install PlatformIO
+
+**VS Code**: buka *Extensions* → cari *PlatformIO IDE* → *Install* → reload.
+**CLI**:
+
+```bash
+pip install platformio
+```
+
+### Langkah 2 — Jalankan Server
+
+Munculkan terminal di folder `server/`:
 
 ```bash
 cd server
 pip install -r requirements.txt
-python app.py                     # http://<your-ip>:8080
+python app.py
 ```
 
-### 2. Flash the firmware (one board)
+Server jalan di **`http://0.0.0.0:8080`**. Buka di browser:
+`http://127.0.0.1:8080` (mesin sendiri) — atau `http://<IP-LAN-mesin>:8080`
+kalau diakses board/HP lain dalam jaringan.
+
+**Opsi server:**
 
 ```bash
-pio run -t upload                 # PlatformIO, ESP32 UWB Pro with Display
+python app.py --port 9000              # port beda
+python app.py --token rahasia123       # proteksi API dengan bearer token
+python app.py --mqtt-host 192.168.1.20 # host broker MQTT (default 127.0.0.1)
+python app.py --mqtt-port 1883         # port broker
+python app.py --mqtt-base uwb/ruangku  # base topic MQTT
+python app.py --mqtt 0                 # nonaktifkan MQTT (khusus REST)
 ```
 
-### 3. Configure each board
+### Langkah 3 — Build & Flash Firmware
 
-- **First boot** → the board starts a setup AP `UWB-Setup` (WiFi) →
-  open `http://192.168.4.1` → pick role (anchor/tag), ID, WiFi, server URL.
-- **From the web UI** → open `http://<server>:8080`, choose role+ID, set
-  anchor position in metres (`x`, `y` from room corner), save. The server
-  pushes the config over MQTT (retained) — device applies and reboots.
-- **Serial menu** → open `pio device monitor`, type `?` for the full menu
-  (`role tag`, `id 1`, `wifi SSID PASS`, `server http://192.168.1.10:8080`, …).
+Dari folder root project:
 
-Minimal setup to track a tag:
+```bash
+pio run                     # build saja
+pio run -t upload           # build + upload ke board yang tersambung
+```
 
-| Board | Role | ID | Position |
+Flash **ketiga board dengan firmware yang sama**. Kalau beberapa port
+tersambung sekaligus, pilih port:
+
+```bash
+pio run -t upload --upload-port COM5
+```
+
+> **Gagal di "Connecting..."?** Tahan **BOOT**, tekan **RST/EN** sebentar,
+> lepas BOOT, upload, lalu tekan RST sekali biar sketch jalan.
+
+### Langkah 4 — Konfigurasi Tiap Board
+
+Board belum dikonfigur → OLED menampilkan `NOT CONFIGURED`. Ada **3 cara**:
+
+#### 4a. Lewat Web UI (paling gampang) ✅
+1. Board terhubung Wi-Fi (WiFi & server URL sudah diset sewaktu pertama kali;
+   kalau belum, pakai 4b atau 4c dulu satu kali).
+2. Buka `http://<IP-server>:8080` → form **Setup**.
+3. Isi per board:
+   - **Anchor 1** → role `anchor`, ID `1`, Position X `0`, Position Y `0`
+     (taruh board di pojok ruangan), Room width/height → misal `5` × `4`.
+   - **Anchor 2** → role `anchor`, ID `2`, Position X `5` (lebar ruangan),
+     Position Y `0` (pojok seberang).
+   - **Tag** → role `tag`, ID `1`.
+   - WiFi SSID/password & Server URL diisi sekali (sama untuk semua board).
+4. Klik **💾 Save**. Server push config via MQTT → device terapkan & reboot.
+
+#### 4b. Lewat Serial Menu
+Flash dulu, buka monitor:
+
+```bash
+pio device monitor           # baud otomatis 115200
+```
+
+Ketik `?` untuk daftar semua perintah:
+
+```
+show                       lihat config saat ini
+role tag|anchor            set role
+id <1-10>                  set ID device
+site <nama>                nama site/lokasi
+wifi <ssid> <pass>         set WiFi
+server <url>               mis. server http://192.168.1.10:8080
+mqtt <host> [port]         aktifkan MQTT (port default 1883)
+mqtt off                   nonaktifkan MQTT
+base <topic>               base topic MQTT (default uwb/home)
+pos <x> <y> [z]            posisi anchor (meter) — khusus anchor
+room <w> <h>               ukuran ruangan (meter)
+mode <nama>                mode PHY UWB (lihat 'show')
+filter on|off              filter smoothing jarak
+rate <ms>                  interval telemetry
+save                       simpan ke NVS
+reboot                     restart
+reset                      hapus config & reboot
+```
+
+Contoh minimal:
+
+```
+role anchor
+id 1
+wifi NamaWifi Password123
+server http://192.168.1.10:8080
+pos 0 0
+room 5 4
+save
+```
+
+#### 4c. Lewat Setup Portal (AP)
+Saat pertama boot (belum ada config), board membuka **AP `UWB-Setup`**:
+1. HP/laptop → Wi-Fi → join **UWB-Setup**.
+2. Buka **`http://192.168.4.1`** → form serupa dengan web UI → isi → Save.
+3. Board reboot dengan config baru.
+
+### Langkah 5 — Lihat Tracking-nya
+
+Buka web UI server. Tag muncul di peta ruangan dan bergerak real-time sesuai
+gerakanmu. Tiap tag menampilkan koordinat, confidence, dan jarak ke tiap
+anchor. Anchor abu-abu = offline.
+
+---
+
+## 🔢 Skema ID & Alamat UWB (otomatis)
+
+Role+ID → EUI & short address (2 byte pertama = short address):
+
+| Role | ID | EUI | Short address |
 |---|---|---|---|
-| Board A | anchor | 1 | x=0, y=0 (room corner) |
-| Board B | anchor | 2 | x=room width, y=0 |
-| Board C | tag | 1 | — |
+| anchor | 1 | `01:A0:5B:D5:A9:9A:E2:9C` | `0xA001` |
+| anchor | 2 | `02:A0:5B:D5:A9:9A:E2:9C` | `0xA002` |
+| anchor | 10 | `0A:A0:5B:D5:A9:9A:E2:9C` | `0xA00A` |
+| tag | 1 | `01:7D:00:22:EA:82:60:3B` | `0x7D01` |
 
-> 2 anchors give 2 mirror candidates; the solver picks the one inside the room
-> (you set room width/height in the UI). 3+ anchors resolve it exactly.
+Log/telemetry memakai label `anchor-2`, `tag-1`, dst.
 
-## Project layout
+> **Penting**: tiap board wajib punya **ID unik**. 2 anchor di dua sudut ruangan
+> + tag sudah cukup. Maks 10 anchor + 10 tag per site.
 
+---
+
+## 🌐 REST API
+
+Semua body JSON. Base URL: `http://<server>:8080`.
+
+| Method | Path | Fungsi |
+|---|---|---|
+| `POST` | `/api/v1/telemetry` | device kirim data jarak/status |
+| `GET` | `/api/v1/config/device?role=anchor&id=1` | device ambil config-nya |
+| `PUT` | `/api/v1/config` | web UI/API simpan config |
+| `GET` | `/api/v1/state` | state dunia (tag, anchor, links) |
+| `GET` | `/api/v1/devices` | daftar device yang dikenal |
+| `POST` | `/api/v1/position` | paksa hitung ulang posisi (debug) |
+| `GET` | `/` | web UI |
+
+Contoh (curl):
+
+```bash
+# set anchor 1 di pojok (0,0), ruangan 5×4 m
+curl -X PUT localhost:8080/api/v1/config -H 'Content-Type: application/json' \
+     -d '{"role":"anchor","id":1,"position":{"x":0,"y":0},"room":{"width":5,"height":4}}'
+
+# set anchor 2 di (5,0)
+curl -X PUT localhost:8080/api/v1/config -H 'Content-Type: application/json' \
+     -d '{"role":"anchor","id":2,"position":{"x":5,"y":0}}'
+
+# kirim jarak dari anchor-1 ke tag-1
+curl -X POST localhost:8080/api/v1/telemetry -H 'Content-Type: application/json' \
+     -d '{"device_id":"anchor-1","ranges":[{"src":"anchor-1","dst":"tag-1","range":2.236,"rx_power":-60}]}'
+
+# lihat hasil
+curl localhost:8080/api/v1/state
 ```
-├── platformio.ini      # one env: esp32uwb (huge_app partition)
-├── src/
-│   ├── main.cpp        # firmware: ranging, UI, config, REST+MQTT
-│   ├── config.h        # config model + NVS + auto EUI
-│   ├── net.h           # WiFi, AP portal, REST, MQTT
-│   └── solver.h        # 2D multilateration (mirrored on server)
-├── lib/DW1000/         # Makerfabs DW1000 library (vendored, patched guard)
-└── server/
-    ├── app.py          # Flask: REST + MQTT ingest + solver + web UI
-    ├── requirements.txt
-    └── README.md
+
+Respons `state`:
+
+```json
+{
+  "site": "home",
+  "ts": 1727880000123,
+  "room": {"width": 5, "height": 4},
+  "anchors": [{"id": "anchor-1", "x": 0, "y": 0, "online": true, "last_seen": 1727880000123}],
+  "tags": [{"id": "tag-1", "x": 2.0, "y": 1.0, "confidence": 0.8, "ambiguous": false,
+            "online": true, "last_seen": 1727880000123,
+            "ranges": {"anchor-1": 2.236, "anchor-2": 3.162}}],
+  "links": [{"src": "anchor-1", "dst": "tag-1", "range": 2.236, "rx_power": -60, "ts": 1727880000123}]
+}
 ```
 
-## Documentation
+Detail lengkap & model payload: [`docs/API.md`](docs/API.md).
 
-- [`docs/API.md`](docs/API.md) — frozen REST/MQTT contract, config & telemetry
-  models, solver rules.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the pieces fit, UWB
-  short-address scheme, 2-anchor mirror math.
-- [`docs/README.md`](docs/README.md) — step-by-step setup guide (family
-  friendly).
-- [`server/README.md`](server/README.md) — run & configure the server.
+---
 
-## Notes & limitations
+## 📡 MQTT
 
-- **No WiFi CSI / radar**: the DW1000 UWB radio cannot do WiFi CSI (that
-  feature belongs to an ESP32-S3 + WiFi). This repo does UWB ranging.
-- Accuracy ≈ ±10–30 cm indoor; reflections cause noise — enable the range
-  filter (default on) for smoother tracking.
-- Server state is in-memory: device configs are lost on server restart
-  (persistence is a later step).
+Base topic default: `uwb/home` (bisa diganti lewat `base <topic>` / `--mqtt-base`).
+
+| Topic | Arah | Payload |
+|---|---|---|
+| `uwb/home/range` | device → server | satu baris jarak |
+| `uwb/home/telemetry` | device → server | batch telemetry |
+| `uwb/home/status/<device_id>` | device → server | status online (retained) |
+| `uwb/home/config/<device_id>` | server → device | config push (retained) |
+| `uwb/home/state` | server → semua | state dunia (retained) |
+
+Uji cepat:
+
+```bash
+# subscribe semua topic
+mosquitto_sub -h 127.0.0.1 -t 'uwb/home/#'
+
+# kirim jarak tiruan
+mosquitto_pub -h 127.0.0.1 -t 'uwb/home/telemetry' -m \
+ '{"device_id":"anchor-1","ranges":[{"src":"anchor-1","dst":"tag-1","range":2.1,"rx_power":-58}]}'
+```
+
+Device pakai MQTT kalau `mqtt on` dan broker terjangkau; kalau tidak, otomatis
+fallback ke REST.
+
+---
+
+## ⚙️ Cara Kerja & Logika Penting
+
+1. **Tag** memancarkan ranging poll; tiap **anchor** membalas.
+2. `DW1000Ranging` mengukur time-of-flight → jarak (m), RX power (dBm), dan
+   kualitas — dipanggil lewat callback `newRange()`.
+3. Range disimpan berpasangan `(anchor, tag)` lalu dikirim ke server
+   (REST/MQTT) tiap interval.
+4. **Solver** (identik di server & tag):
+   - **2 anchor** → perpotongan dua lingkaran = **2 kandidat (mirror)**.
+     Dipilih yang masuk batas ruangan (`room`). Kalau dua-duanya di dalam /
+     luar → ditandai `ambiguous: true` (ambil yang terdekat ke pusat ruangan).
+   - **3+ anchor** → least-squares (dengan iterasi Gauss-Newton),
+     `confidence = 1 − RMS residual`.
+5. Server publish `state` (web UI + MQTT) dengan koordinat tag real-time.
+
+> Karena jarak radio ±10–30 cm noise di dalam ruangan (pantulan), filter
+> smoothing aktif default (`filter on`). Kalau posisi tag melompat-lompat
+> karena mirror, tambahkan anchor ke-3.
+
+---
+
+## 🔧 Troubleshooting
+
+| Masalah | Solusi |
+|---|---|
+| OLED tulisan `NOT CONFIGURED` | Set role+ID (serial `role tag` + `id 1` + `save`, atau AP `UWB-Setup`) |
+| Tidak ada jarak sama sekali | Pastikan anchor & tag ID unik, jarak masih jangkauan, power USB cukup |
+| Web map kosong | Cek `/api/v1/devices` — device online? Posisi anchor sudah diset? |
+| Posisi tag loncat/cermin | 2 anchor → mirror (tanda `ambiguous`). Tambah anchor ke-3 |
+| Server tidak bisa diakses board | Board & server harus satu Wi-Fi; pakai IP LAN (`192.168.x.x`), bukan `127.0.0.1` |
+| MQTT tidak terima | Broker harus jalan (`mosquitto -v`); REST tetap jalan tanpa MQTT |
+| Flash stuck "Connecting..." | BOOT + RST manual (lihat Langkah 3) |
+| Posisi beku | Server drop range lebih 5 detik tanpa data baru (device offline) |
+| Boros flash/RAM? | Partisi huge_app sudah diset; pakai `mode shortdata_fast_accuracy` kalau mau hemat |
+
+---
+
+## 📚 Dokumentasi Tambahan
+
+- [`docs/API.md`](docs/API.md) — kontrak API/MQTT lengkap + model payload.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — cara kerja sistem, skema
+  alamat UWB, matematika solver, trade-off.
+- [`server/README.md`](server/README.md) — panduan server saja.
+
+## ⚠️ Catatan & Keterbatasan
+
+- **Bukan WiFi CSI / radar**: radio board ini DW1000 (UWB), bukan WiFi — tidak
+  bisa deteksi manusia tanpa tag (fitur CSI ada di board ESP32-S3 + WiFi).
+- Akurasi ±10–30 cm indoor; noise karena pantulan radio.
+- State server **in-memory**: config device hilang saat server restart
+  (device akan ambil ulang config dalam 15 detik setelah online kembali).
+- Server dev Flask cocok untuk LAN; untuk produksi pakai gunicorn
+  (`gunicorn -w 4 -b 0.0.0.0:8080 app:APP`) di belakang reverse proxy.
