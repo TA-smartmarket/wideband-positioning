@@ -1,235 +1,105 @@
-# Wideband Positioning — ESP32 UWB (Distance)
+# 📡 UWB Positioning — ESP32 UWB Pro with Display
 
-UWB (Ultra-Wideband) distance measurement firmware for the
-**Makerfabs ESP32 UWB Pro with Display** boards, built with **PlatformIO**,
-based on the official [Makerfabs-ESP32-UWB](https://github.com/Makerfabs/Makerfabs-ESP32-UWB) library.
+Real-time indoor positioning: **tag** (moving device) measures distance to
+**anchors** placed in room corners, and the position is tracked live on a web
+map. Everything is configurable from a web UI — no recompiling, no serial
+editing.
 
-Two firmwares are provided (one PlatformIO environment each):
-
-| Firmware | Environment | Role | What it does |
-|---|---|---|---|
-| [`src/tag/main.cpp`](src/tag/main.cpp) | `tag` | **Tag** (moving) | Measures distance to every anchor; prints + shows the latest distance on the OLED |
-| [`src/anchor/main.cpp`](src/anchor/main.cpp) | `anchor` | **Anchor #1** (fixed) | Replies to ranging requests from tags; prints each measured distance and shows its status on the OLED |
-| [`src/anchor/main.cpp`](src/anchor/main.cpp) | `anchor2` | **Anchor #2** (fixed) | Same firmware, but a **different UWB address** (`3D:4E:…`), so two anchors can run side by side |
-
-> The tag initiates ranging, so the distance value appears on **both** the
-> tag and the anchor's Serial output.
-
----
-
-## Project structure
+One firmware runs on **every** board. Role (`tag`/`anchor`) and ID (1–10) are
+chosen at runtime from the web UI, the setup portal, or the serial menu — the
+UWB address is generated automatically (no more manual `7D:00:22:…` editing).
 
 ```
-wideband-positioning/
-├── platformio.ini          # PIO config: tag, anchor, anchor2 environments
-├── lib/
-│   └── DW1000/             # Makerfabs DW1000 library (vendored)
-│       └── src/            # DW1000, DW1000Ranging, DW1000Device, ...
+┌────────┐  range  ┌────────┐        ┌──────────────────┐
+│ anchor1├────────▶│  tag   │        │  server (Flask)  │
+│ (0,0)  │◀────────│ (moves)│──REST/MQTT──▶ REST + MQTT  │
+└────────┘         └───┬────┘        │  solver → (x,y)  │
+┌────────┐             │             │  web UI          │
+│ anchor2│◀────────────┘             └──────────────────┘
+│ (5,0)  │
+└────────┘
+```
+
+## Features
+
+- **One binary, every board** — role & ID 1–10 via web UI / AP portal / serial
+  menu; UWB EUI + short address auto-derived.
+- **Config from the server** — set WiFi, MQTT, anchor position (`x,y`),
+  room size, UWB mode; devices poll + receive MQTT pushes (retained).
+- **Two transports** — HTTP REST *and* MQTT; MQTT preferred, REST fallback.
+- **Position solver** — server (and device, standalone) computes 2D position
+  from ≥2 anchor ranges with room-bound disambiguation.
+- **Live web map** — anchors, tag position, ranges, confidence, online status.
+- **Multi-anchor ready** — up to 10 tags and 10 anchors per site.
+
+## Quick start
+
+### 1. Run the server (your computer / Ubuntu later)
+
+```bash
+cd server
+pip install -r requirements.txt
+python app.py                     # http://<your-ip>:8080
+```
+
+### 2. Flash the firmware (one board)
+
+```bash
+pio run -t upload                 # PlatformIO, ESP32 UWB Pro with Display
+```
+
+### 3. Configure each board
+
+- **First boot** → the board starts a setup AP `UWB-Setup` (WiFi) →
+  open `http://192.168.4.1` → pick role (anchor/tag), ID, WiFi, server URL.
+- **From the web UI** → open `http://<server>:8080`, choose role+ID, set
+  anchor position in metres (`x`, `y` from room corner), save. The server
+  pushes the config over MQTT (retained) — device applies and reboots.
+- **Serial menu** → open `pio device monitor`, type `?` for the full menu
+  (`role tag`, `id 1`, `wifi SSID PASS`, `server http://192.168.1.10:8080`, …).
+
+Minimal setup to track a tag:
+
+| Board | Role | ID | Position |
+|---|---|---|---|
+| Board A | anchor | 1 | x=0, y=0 (room corner) |
+| Board B | anchor | 2 | x=room width, y=0 |
+| Board C | tag | 1 | — |
+
+> 2 anchors give 2 mirror candidates; the solver picks the one inside the room
+> (you set room width/height in the UI). 3+ anchors resolve it exactly.
+
+## Project layout
+
+```
+├── platformio.ini      # one env: esp32uwb (huge_app partition)
 ├── src/
-│   ├── tag/main.cpp        # Tag firmware (env: tag)
-│   └── anchor/main.cpp     # Anchor firmware (env: anchor, anchor2)
+│   ├── main.cpp        # firmware: ranging, UI, config, REST+MQTT
+│   ├── config.h        # config model + NVS + auto EUI
+│   ├── net.h           # WiFi, AP portal, REST, MQTT
+│   └── solver.h        # 2D multilateration (mirrored on server)
+├── lib/DW1000/         # Makerfabs DW1000 library (vendored, patched guard)
+└── server/
+    ├── app.py          # Flask: REST + MQTT ingest + solver + web UI
+    ├── requirements.txt
+    └── README.md
 ```
 
-The DW1000 library is committed into `lib/` so the project builds without
-network access (no Arduino Library Manager needed).
+## Documentation
 
----
+- [`docs/API.md`](docs/API.md) — frozen REST/MQTT contract, config & telemetry
+  models, solver rules.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the pieces fit, UWB
+  short-address scheme, 2-anchor mirror math.
+- [`docs/README.md`](docs/README.md) — step-by-step setup guide (family
+  friendly).
+- [`server/README.md`](server/README.md) — run & configure the server.
 
-## Requirements
+## Notes & limitations
 
-### Hardware
-- 3× Makerfabs ESP32 UWB Pro with Display (1 tag + 2 anchors), or any
-  combination — multi-anchor works out of the box
-- USB-C cables for programming
-
-### Software
-- **PlatformIO** (IDE extension for VS Code, or CLI: `pip install platformio`)
-- Python 3.9+ (only for the CLI install)
-
-The ESP32 platform, Arduino framework and Adafruit SSD1306/GFX libraries are
-downloaded automatically by PlatformIO on the first build.
-
----
-
-## Wiring / Pinout
-
-All connections are already fixed on the Makerfabs ESP32 UWB Pro with Display
-(SPI for the DW1000, I2C for the OLED) — **no extra wiring needed**:
-
-| Signal | ESP32 pin |
-|---|---|
-| SPI SCK  | GPIO 18 |
-| SPI MISO | GPIO 19 |
-| SPI MOSI | GPIO 23 |
-| UWB CS (SS)   | GPIO 21 |
-| UWB Reset (RST) | GPIO 27 |
-| UWB IRQ | GPIO 34 |
-| OLED SDA | GPIO 4 |
-| OLED SCL | GPIO 5 |
-| OLED address | `0x3C` |
-
----
-
-## Getting Started (PlatformIO)
-
-### 1. Open the project
-- **VS Code**: install the *PlatformIO IDE* extension, then
-  `File → Open Folder` this project. PlatformIO automatically activates the
-  project (look for the 🚀 task bar at the bottom).
-- **CLI**: `cd wideband-positioning`
-
-### 2. Unique addresses (very important!)
-Every board must have its **own unique 8-byte UWB address**. The **first two
-bytes** of that address become the *short address* (the ID shown in the logs
-and on the OLED), so they must differ between anchors.
-
-| Board | Environment | UWB address (EUI) | Short address |
-|---|---|---|---|
-| Tag | `tag` | `7D:00:22:EA:82:60:3B:9B` | `0x7D00` |
-| Anchor #1 | `anchor` | `86:17:5B:D5:A9:9A:E2:9C` | `0x8617` |
-| Anchor #2 | `anchor2` | `3D:4E:7C:2A:08:5F:B1:C3` | `0x3D4E` |
-
-- **Anchor #1** address is the default in `src/anchor/main.cpp`.
-- **Anchor #2** is the *same* firmware with a different address, injected by
-  the `anchor2` environment — no file editing needed:
-
-  ```ini
-  [env:anchor2]
-  build_flags = ... -DANCHOR_EUI="3D:4E:7C:2A:08:5F:B1:C3"
-  ```
-
-To add a **third** anchor, copy the `[env:anchor2]` block, rename it
-(`[env:anchor3]`) and give it a new EUI — just keep the first two bytes unique.
-
-To change the **tag** address, edit `TAG_ADDR` in `src/tag/main.cpp`.
-
-### 3. Build
-
-**PlatformIO IDE**: click the ✔ (build) icon for the environment you want.
-**CLI**:
-
-```bash
-pio run -e tag         # build tag firmware
-pio run -e anchor      # build anchor #1 firmware
-pio run -e anchor2     # build anchor #2 firmware (unique address)
-pio run                # build the default env (tag)
-```
-
-### 4. Flash the firmware
-Upload the matching environment to each board (one board connected at a time):
-
-| Board | Command |
-|---|---|
-| Anchor #1 | `pio run -e anchor -t upload` |
-| Anchor #2 | `pio run -e anchor2 -t upload --upload-port COM11` |
-| Tag | `pio run -e tag -t upload` |
-
-If multiple boards are connected, pick the port with `--upload-port`:
-
-```bash
-pio run -e anchor2 -t upload --upload-port COM11
-```
-
-(On Windows the ports look like `COM3`, `COM5`, `COM11`, …)
-
-> **Stuck at "Connecting..." during upload?** The board resets automatically
-> most of the time, but if it doesn't: hold **BOOT**, tap **RST/EN**, release
-> BOOT, then upload — and press RST once after uploading.
-
-### 5. Monitor
-Open the Serial Monitor (115200 baud) on either board:
-
-```bash
-pio device monitor -e tag -b 115200
-```
-
----
-
-## Expected Serial output
-
-**Tag** (`env:tag`) — with two anchors running, the tag alternates between them:
-
-```
-[UWB] Tag starting...
-[UWB] Tag 7D:00:22:EA:82:60:3B:9B started. Waiting for anchors...
-anchor added -> short: 0x8617
-anchor added -> short: 0x3D4E
-from: 0x8617	Range: 1.484 m	RX power: -67.19 dBm
-from: 0x3D4E	Range: 2.731 m	RX power: -71.04 dBm
-from: 0x8617	Range: 1.486 m	RX power: -67.31 dBm
-from: 0x3D4E	Range: 2.728 m	RX power: -70.98 dBm
-```
-
-**Anchor #1** (`env:anchor`):
-
-```
-[UWB] Anchor starting...
-[UWB] Anchor 86:17:5B:D5:A9:9A:E2:9C started. Waiting for tags...
-tag added -> short: 0x7D00
-from: 0x7D00	Range: 1.484 m	RX power: -67.19 dBm
-```
-
-**Anchor #2** (`env:anchor2`) — same output, different IDs:
-
-```
-[UWB] Anchor starting...
-[UWB] Anchor 3D:4E:7C:2A:08:5F:B1:C3 started. Waiting for tags...
-tag added -> short: 0x7D00
-from: 0x7D00	Range: 2.731 m	RX power: -71.04 dBm
-```
-
-## OLED display
-- **Tag**: shows `No Anchor — waiting...` until the first anchor is seen,
-  then the latest distance (big), the measured anchor, RX power, and count of
-  active anchors.
-- **Anchor**: shows its own address; when a tag ranges, the last measured
-  distance and the tag's short address appear.
-
----
-
-## Alternative: Arduino IDE
-
-If you prefer the Arduino IDE over PlatformIO, copy `src/tag/main.cpp` and
-`src/anchor/main.cpp` into sketch folders (rename them `main.ino`; the Arduino
-IDE auto-generates prototypes, so the explicit forward declarations are
-harmless).
-
-1. Install the **ESP32** board package (Boards Manager: `esp32 by Espressif Systems`).
-2. Install libraries (Sketch → Include Library → Manage Libraries):
-   - **Adafruit SSD1306** + **Adafruit GFX Library**
-   - **Makerfabs DW1000** from ZIP (`mf_DW1000.zip`, from the Makerfabs repo)
-     — or copy the vendored `lib/DW1000` folder into your Arduino `libraries/`
-3. Board: `Tools → Board → ESP32 Arduino → ESP32 Dev Module`
-4. Open the sketch, select the port, click Upload.
-
-For a second anchor in the Arduino IDE, just change the default in
-`src/anchor/main.cpp` (the `#define` inside the `#ifndef ANCHOR_EUI` block):
-
-```cpp
-#define ANCHOR_EUI "3D:4E:7C:2A:08:5F:B1:C3"
-```
-
----
-
-## How it works
-
-1. The **tag** broadcasts ranging polls; each **anchor** replies.
-2. `DW1000Ranging` measures the round-trip time of flight → distance.
-3. `newRange()` fires on every completed measurement (tag and anchor) — the
-   values are printed, and the tag refreshes the OLED ~2×/second.
-
-```
-Tag ──poll──▶ Anchor │ Anchor ──ack──▶ Tag │ Tag computes range
-```
-
-## Notes & tips
-- Move the tag **slowly** while testing; UWB picks up reflections in cluttered
-  rooms, so expect ±10–30 cm noise.
-- Try `DW1000.MODE_LONGDATA_FAST_ACCURACY` (or enable
-  `DW1000Ranging.useRangeFilter(true)`) for smoother results.
-- For positioning (2D/3D coordinates from multiple anchors), see the
-  Makerfabs `IndoorPositioning` / `OutdoorPositioning_display` examples.
-
-## Reference
-- Makerfabs repo: https://github.com/Makerfabs/Makerfabs-ESP32-UWB
-- Board product page: https://www.makerfabs.com/esp32-uwb-pro-with-display.html
+- **No WiFi CSI / radar**: the DW1000 UWB radio cannot do WiFi CSI (that
+  feature belongs to an ESP32-S3 + WiFi). This repo does UWB ranging.
+- Accuracy ≈ ±10–30 cm indoor; reflections cause noise — enable the range
+  filter (default on) for smoother tracking.
+- Server state is in-memory: device configs are lost on server restart
+  (persistence is a later step).

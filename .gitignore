@@ -1,3 +1,8 @@
 .pio/
 build/
 .smoke/
+__pycache__/
+*.log
+server/mosquitto.test.conf
+server/mqtt_send*.py
+server/mqtt_probe.py

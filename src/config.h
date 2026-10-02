@@ -1,0 +1,224 @@
+// ============================================================================
+//  config.h — device configuration model
+//
+//  One firmware runs on every board. Role (tag/anchor), id, WiFi, server,
+//  MQTT and anchor position are all runtime configuration stored in NVS.
+//  See docs/API.md section 2 for the wire format.
+// ============================================================================
+#pragma once
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include "DW1000Ranging.h"
+
+#define FW_VERSION      "1.0.0"
+#ifndef MAX_DEVICES
+#define MAX_DEVICES     10      // ids 1..10 for both roles
+#endif
+#define MAX_ANCHORS     10
+#define MAX_TAGS        10
+#define SSID_AP         "UWB-Setup"
+
+enum Role : uint8_t { ROLE_NONE = 0, ROLE_TAG = 1, ROLE_ANCHOR = 2 };
+
+// UWB PHY mode, selectable from the web UI / serial menu.
+enum UwbMode : uint8_t {
+    MODE_RANGE_LOWPOWER = 0,   // 110 kbps, 16 MHz PRF  (longest range)
+    MODE_FAST_LOWPOWER,        // 6.8 Mbps, 16 MHz PRF
+    MODE_LONGDATA_FAST_LP,     // 6.8 Mbps, 16 MHz PRF, long preamble
+    MODE_FAST_ACCURACY,        // 6.8 Mbps, 64 MHz PRF  (best accuracy)
+    MODE_LONGDATA_FAST_ACC,    // 6.8 Mbps, 64 MHz PRF, long preamble
+    MODE_RANGE_ACCURACY,       // 110 kbps, 64 MHz PRF
+    MODE_COUNT
+};
+
+struct Config {
+    // identity
+    Role     role = ROLE_NONE;
+    uint8_t  id   = 0;
+    char     site[16] = "home";
+
+    // network
+    char     wifi_ssid[33] = "";
+    char     wifi_pass[65] = "";
+    char     server_url[64] = "";   // http://host:8080
+    char     api_token[40] = "";
+
+    // mqtt
+    bool     mqtt_enabled = false;
+    char     mqtt_host[64] = "";
+    uint16_t mqtt_port = 1883;
+    char     mqtt_user[32] = "";
+    char     mqtt_pass[32] = "";
+    char     mqtt_base[32] = "uwb/home";
+
+    // anchor placement (metres, origin = room corner)
+    float    pos_x = 0.0f;
+    float    pos_y = 0.0f;
+    float    pos_z = 2.2f;
+
+    // room bounds (used by the solver)
+    float    room_w = 5.0f;
+    float    room_h = 4.0f;
+
+    // uwb
+    UwbMode  uwb_mode = MODE_RANGE_LOWPOWER;
+    bool     range_filter = true;
+    uint16_t update_ms = 200;
+
+    // Positions of every anchor, pushed by the server so a tag can solve its
+    // own position without asking the server. Encoded "id:x,y;id:x,y".
+    char     anchor_map[192] = "";
+};
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+inline const char *roleName(Role r)
+{
+    return r == ROLE_TAG ? "tag" : (r == ROLE_ANCHOR ? "anchor" : "unset");
+}
+
+// "anchor-1", "tag-3", "unset-0"
+inline void deviceId(const Config &c, char *out, size_t n)
+{
+    snprintf(out, n, "%s-%u", roleName(c.role), (unsigned)c.id);
+}
+
+// The DW1000 EUI is derived from role+id so no address is ever typed by hand.
+//   anchor 1 -> "01:A0:5B:D5:A9:9A:E2:9C"   tag 1 -> "01:7D:00:22:EA:82:60:3B"
+// With randomShortAddress=false the first two bytes become the short address,
+// which is why the id sits there.
+inline void deviceEui(const Config &c, char *out, size_t n)
+{
+    if (c.role == ROLE_ANCHOR)
+        snprintf(out, n, "%02X:A0:5B:D5:A9:9A:E2:9C", (unsigned)c.id);
+    else
+        snprintf(out, n, "%02X:7D:00:22:EA:82:60:3B", (unsigned)c.id);
+}
+
+inline const byte *uwbModeBytes(UwbMode m)
+{
+    switch (m) {
+    case MODE_FAST_LOWPOWER:       return DW1000.MODE_SHORTDATA_FAST_LOWPOWER;
+    case MODE_LONGDATA_FAST_LP:    return DW1000.MODE_LONGDATA_FAST_LOWPOWER;
+    case MODE_FAST_ACCURACY:       return DW1000.MODE_SHORTDATA_FAST_ACCURACY;
+    case MODE_LONGDATA_FAST_ACC:   return DW1000.MODE_LONGDATA_FAST_ACCURACY;
+    case MODE_RANGE_ACCURACY:      return DW1000.MODE_LONGDATA_RANGE_ACCURACY;
+    default:                       return DW1000.MODE_LONGDATA_RANGE_LOWPOWER;
+    }
+}
+
+inline const char *uwbModeName(UwbMode m)
+{
+    switch (m) {
+    case MODE_FAST_LOWPOWER:     return "shortdata_fast_lowpower";
+    case MODE_LONGDATA_FAST_LP:  return "longdata_fast_lowpower";
+    case MODE_FAST_ACCURACY:     return "shortdata_fast_accuracy";
+    case MODE_LONGDATA_FAST_ACC: return "longdata_fast_accuracy";
+    case MODE_RANGE_ACCURACY:    return "longdata_range_accuracy";
+    default:                     return "longdata_range_lowpower";
+    }
+}
+
+inline UwbMode uwbModeFromName(const char *s)
+{
+    if (!s) return MODE_RANGE_LOWPOWER;
+    if (!strcmp(s, "shortdata_fast_lowpower"))   return MODE_FAST_LOWPOWER;
+    if (!strcmp(s, "longdata_fast_lowpower"))    return MODE_LONGDATA_FAST_LP;
+    if (!strcmp(s, "shortdata_fast_accuracy"))   return MODE_FAST_ACCURACY;
+    if (!strcmp(s, "longdata_fast_accuracy"))    return MODE_LONGDATA_FAST_ACC;
+    if (!strcmp(s, "longdata_range_accuracy"))   return MODE_RANGE_ACCURACY;
+    return MODE_RANGE_LOWPOWER;
+}
+
+// Parse the anchor map "1:0,0;2:5,0" and return the position of anchor `id`.
+inline bool anchorPos(const Config &c, uint8_t id, float &x, float &y)
+{
+    const char *p = c.anchor_map;
+    while (*p) {
+        while (*p == ';' || *p == ' ') p++;
+        if (!*p) break;
+        int aid = atoi(p);
+        const char *colon = strchr(p, ':');
+        if (!colon) break;
+        float ax = atof(colon + 1);
+        const char *comma = strchr(colon + 1, ',');
+        if (!comma) break;
+        float ay = atof(comma + 1);
+        if (aid == (int)id) { x = ax; y = ay; return true; }
+        const char *semi = strchr(comma, ';');
+        if (!semi) break;
+        p = semi + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// NVS persistence
+// ---------------------------------------------------------------------------
+
+inline void configLoad(Config &c)
+{
+    Preferences p;
+    if (!p.begin("uwbcfg", true)) return;   // read-only
+    c.role = (Role)p.getUChar("role", ROLE_NONE);
+    c.id   = p.getUChar("id", 0);
+    p.getString("site", c.site, sizeof(c.site));
+    p.getString("wssid", c.wifi_ssid, sizeof(c.wifi_ssid));
+    p.getString("wpass", c.wifi_pass, sizeof(c.wifi_pass));
+    p.getString("surl", c.server_url, sizeof(c.server_url));
+    p.getString("tok", c.api_token, sizeof(c.api_token));
+    c.mqtt_enabled = p.getBool("mq_en", false);
+    p.getString("mq_host", c.mqtt_host, sizeof(c.mqtt_host));
+    c.mqtt_port = p.getUShort("mq_port", 1883);
+    p.getString("mq_user", c.mqtt_user, sizeof(c.mqtt_user));
+    p.getString("mq_pass", c.mqtt_pass, sizeof(c.mqtt_pass));
+    p.getString("mq_base", c.mqtt_base, sizeof(c.mqtt_base));
+    c.pos_x = p.getFloat("px", 0.0f);
+    c.pos_y = p.getFloat("py", 0.0f);
+    c.pos_z = p.getFloat("pz", 2.2f);
+    c.room_w = p.getFloat("rw", 5.0f);
+    c.room_h = p.getFloat("rh", 4.0f);
+    c.uwb_mode = (UwbMode)p.getUChar("uwbm", MODE_RANGE_LOWPOWER);
+    c.range_filter = p.getBool("rfilt", true);
+    c.update_ms = p.getUShort("upd", 200);
+    p.getString("amap", c.anchor_map, sizeof(c.anchor_map));
+    p.end();
+}
+
+inline void configSave(const Config &c)
+{
+    Preferences p;
+    if (!p.begin("uwbcfg", false)) return;  // read-write
+    p.putUChar("role", (uint8_t)c.role);
+    p.putUChar("id", c.id);
+    p.putString("site", c.site);
+    p.putString("wssid", c.wifi_ssid);
+    p.putString("wpass", c.wifi_pass);
+    p.putString("surl", c.server_url);
+    p.putString("tok", c.api_token);
+    p.putBool("mq_en", c.mqtt_enabled);
+    p.putString("mq_host", c.mqtt_host);
+    p.putUShort("mq_port", c.mqtt_port);
+    p.putString("mq_user", c.mqtt_user);
+    p.putString("mq_pass", c.mqtt_pass);
+    p.putString("mq_base", c.mqtt_base);
+    p.putFloat("px", c.pos_x);
+    p.putFloat("py", c.pos_y);
+    p.putFloat("pz", c.pos_z);
+    p.putFloat("rw", c.room_w);
+    p.putFloat("rh", c.room_h);
+    p.putUChar("uwbm", (uint8_t)c.uwb_mode);
+    p.putBool("rfilt", c.range_filter);
+    p.putUShort("upd", c.update_ms);
+    p.putString("amap", c.anchor_map);
+    p.end();
+}
+
+inline void configClear()
+{
+    Preferences p;
+    if (p.begin("uwbcfg", false)) { p.clear(); p.end(); }
+}
