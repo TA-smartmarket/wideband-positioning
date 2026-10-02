@@ -1,23 +1,20 @@
 /*
  * ============================================================
- *  UWB Tag — Distance Measurement
+ *  UWB Anchor - Distance Measurement, fixed node (PlatformIO)
  *  Board : Makerfabs ESP32 UWB Pro with Display (DW1000)
- *  Role  : TAG  (the moving node that measures distance)
+ *  Role  : ANCHOR (the fixed node the tag ranges against)
+ *  Build : pio run -e anchor
  * ============================================================
  *
- *  This sketch turns the board into a UWB tag.
- *  It ranges against every nearby anchor (fixed node) and:
- *    - prints distance + RX power to Serial (115200 baud)
- *    - shows the latest distance on the built-in SSD1306 OLED
+ *  This firmware turns the board into a UWB anchor.
+ *  It answers ranging requests from the tag and:
+ *    - prints every measured distance to Serial (115200 baud)
+ *    - shows its own address + last distance on the OLED
  *
- *  Flash the companion sketch (uwb_anchor_distance) on at
- *  least one other board so there is an anchor to range with.
- *
- *  Dependencies (Arduino IDE > Sketch > Include Library > Manage Libraries):
- *    - Makerfabs DW1000 library
- *      https://github.com/Makerfabs/Makerfabs-ESP32-UWB
- *    - Adafruit SSD1306
- *    - Adafruit GFX Library
+ *  Flash the companion firmware (tag) on the board that
+ *  should move around and measure distance.
+ *  Any number of anchors can be added - the tag shows the
+ *  distance to anchors one by one.
  */
 
 #include <SPI.h>
@@ -28,11 +25,12 @@
 #include <Adafruit_SSD1306.h>
 
 /*
- * UWB address of this tag.
+ * UWB address of this anchor.
  * Every UWB node on the network MUST have its own unique address.
- * Keep the same address in <example/uwb_tag_distance> and its anchor.
  */
-#define TAG_ADDR "7D:00:22:EA:82:60:3B:9B"
+// Non-const array: the DW1000 library takes char* (writable), so a plain
+// string literal would trigger -Wwrite-strings.
+char ANCHOR_ADDR[] = "86:17:5B:D5:A9:9A:E2:9C";
 
 /*
  * Pinout of the ESP32 UWB Pro with Display.
@@ -53,13 +51,15 @@
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
 // ------------------------------------------------------------------
-// Ranging state (updated from DW1000 interrupts, read from loop)
+// Callbacks & helpers — declared here because setup()/loop() call them
+// and (unlike the Arduino IDE) PlatformIO compiles each file directly.
 // ------------------------------------------------------------------
-float    lastRange      = 0.0f;   // measured distance in meters
-float    lastRXPower    = 0.0f;   // received signal strength in dBm
-uint16_t lastAnchorAddr = 0;      // short address of the anchor
-int      anchorCount    = 0;      // number of anchors currently active
-unsigned long lastRangeMillis = 0;
+void newRange();
+void newBlink(DW1000Device *device);
+void inactiveDevice(DW1000Device *device);
+void showLogo();
+void updateDisplay(uint16_t tagAddr, float range, float rxPower, unsigned long now);
+void drawScreen();
 
 // ------------------------------------------------------------------
 // Setup
@@ -68,7 +68,7 @@ void setup()
 {
     Serial.begin(115200);
     delay(500);
-    Serial.println(F("[UWB] Tag starting..."));
+    Serial.println(F("[UWB] Anchor starting..."));
 
     // OLED
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -86,16 +86,15 @@ void setup()
     DW1000Ranging.initCommunication(UWB_RST, UWB_SS, UWB_IRQ);
 
     DW1000Ranging.attachNewRange(newRange);             // distance measured
-    DW1000Ranging.attachNewDevice(newDevice);           // new anchor appeared
-    DW1000Ranging.attachInactiveDevice(inactiveDevice); // anchor disappeared
+    DW1000Ranging.attachBlinkDevice(newBlink);          // tag announced itself
+    DW1000Ranging.attachInactiveDevice(inactiveDevice); // tag disappeared
 
-    // Start as TAG (the node that measures distance).
-    // MODE_LONGDATA_RANGE_LOWPOWER gives the best range at low power.
-    DW1000Ranging.startAsTag(TAG_ADDR, DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
+    // Start as ANCHOR. The tag initiates the ranging.
+    DW1000Ranging.startAsAnchor(ANCHOR_ADDR, DW1000.MODE_LONGDATA_RANGE_LOWPOWER, false);
 
-    Serial.print(F("[UWB] Tag "));
-    Serial.print(TAG_ADDR);
-    Serial.println(F(" started. Waiting for anchors..."));
+    Serial.print(F("[UWB] Anchor "));
+    Serial.print(ANCHOR_ADDR);
+    Serial.println(F(" started. Waiting for tags..."));
 }
 
 // ------------------------------------------------------------------
@@ -104,52 +103,52 @@ void setup()
 void loop()
 {
     DW1000Ranging.loop(); // keep the ranging protocol running
-    updateDisplay();      // refresh OLED ~2x per second
+    drawScreen();         // refresh OLED ~2x per second
 }
 
 // ------------------------------------------------------------------
 // DW1000Ranging callbacks
 // ------------------------------------------------------------------
 
-// Called whenever a distance measurement with an anchor completes.
+// Called whenever the tag finished a distance measurement with us.
 void newRange()
 {
     DW1000Device *d = DW1000Ranging.getDistantDevice();
 
-    lastAnchorAddr   = d->getShortAddress();
-    lastRange        = d->getRange();
-    lastRXPower      = d->getRXPower();
-    lastRangeMillis  = millis();
-
     Serial.print(F("from: 0x"));
-    Serial.print(lastAnchorAddr, HEX);
+    Serial.print(d->getShortAddress(), HEX);
     Serial.print(F("\tRange: "));
-    Serial.print(lastRange, 3);
+    Serial.print(d->getRange(), 3);
     Serial.print(F(" m\tRX power: "));
-    Serial.print(lastRXPower);
+    Serial.print(d->getRXPower());
     Serial.println(F(" dBm"));
+
+    updateDisplay(d->getShortAddress(), d->getRange(), d->getRXPower(), millis());
 }
 
-// A new anchor joined the network.
-void newDevice(DW1000Device *device)
+// A tag (or another anchor) blinked and joined the network.
+void newBlink(DW1000Device *device)
 {
-    anchorCount++;
-    Serial.print(F("anchor added -> short: 0x"));
+    Serial.print(F("tag added -> short: 0x"));
     Serial.println(device->getShortAddress(), HEX);
 }
 
-// An anchor stopped responding and was removed.
+// A tag stopped responding and was removed.
 void inactiveDevice(DW1000Device *device)
 {
-    if (anchorCount > 0)
-        anchorCount--;
-    Serial.print(F("anchor removed -> short: 0x"));
+    Serial.print(F("tag removed -> short: 0x"));
     Serial.println(device->getShortAddress(), HEX);
 }
 
 // ------------------------------------------------------------------
 // OLED screen
 // ------------------------------------------------------------------
+
+// Values copied out of the DW1000 callback so they stay valid in loop()
+float    lastRange     = 0.0f;
+float    lastRXPower   = 0.0f;
+uint16_t lastTagAddr   = 0;
+unsigned long lastRangeMillis = 0;
 
 void showLogo(void)
 {
@@ -160,16 +159,26 @@ void showLogo(void)
     display.println(F("Makerfabs"));
     display.setTextSize(1);
     display.setCursor(0, 20);
-    display.println(F("UWB TAG"));
+    display.println(F("UWB Anchor"));
     display.setCursor(0, 40);
-    display.println(TAG_ADDR);
+    display.println(ANCHOR_ADDR);
     display.display();
     delay(1500);
 }
 
 unsigned long lastScreen = 0;
 
-void updateDisplay()
+void updateDisplay(uint16_t tagAddr, float range, float rxPower, unsigned long now)
+{
+    lastTagAddr    = tagAddr;
+    lastRange      = range;
+    lastRXPower    = rxPower;
+    lastRangeMillis = now;
+}
+
+// Small helper so loop() stays tiny but the screen still refreshes:
+// called from loop() below via DW1000Ranging; kept on a timer here.
+void drawScreen()
 {
     if (millis() - lastScreen < 500)
         return;
@@ -178,37 +187,34 @@ void updateDisplay()
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
-    if (anchorCount == 0)
+    if (lastTagAddr == 0 || millis() - lastRangeMillis > 3000)
     {
-        display.setTextSize(2);
-        display.setCursor(0, 0);
-        display.println(F("No Anchor"));
         display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println(F("Anchor"));
+        display.setCursor(0, 12);
+        display.println(ANCHOR_ADDR);
         display.setCursor(0, 40);
-        display.println(F("waiting..."));
+        display.println(F("Distance: --.- m"));
         display.display();
         return;
     }
 
-    // Latest distance — big and clear
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println(F("Anchor"));
+    display.setCursor(0, 12);
+    display.println(ANCHOR_ADDR);
+
     display.setTextSize(2);
-    display.setCursor(0, 2);
+    display.setCursor(0, 28);
     display.print(lastRange, 2);
     display.println(F(" m"));
 
     display.setTextSize(1);
-    display.setCursor(0, 26);
-    display.print(F("Anchor 0x"));
-    display.print(lastAnchorAddr, HEX);
-
-    display.setCursor(0, 38);
-    display.print(F("RX "));
-    display.print(lastRXPower, 1);
-    display.println(F(" dBm"));
-
-    display.setCursor(0, 52);
-    display.print(F("active: "));
-    display.print(anchorCount);
+    display.setCursor(0, 50);
+    display.print(F("tag 0x"));
+    display.print(lastTagAddr, HEX);
 
     display.display();
 }
