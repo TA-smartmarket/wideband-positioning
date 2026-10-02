@@ -146,15 +146,17 @@ Base topic from config: `base_topic` (e.g. `uwb/home`).
 | `<base>/range` | device → server | no | one range object (section 3) |
 | `<base>/telemetry` | device → server | no | full telemetry object |
 | `<base>/config/<device_id>` | server → device | **yes** | config object |
+| `<base>/cmd/<device_id>` | server → device | no | `{"cmd":"reboot"}` |
 | `<base>/state` | server → all | yes | world state (section 6) |
 | `<base>/status/<device_id>` | device → server | yes | status object |
 
 Device behaviour:
 1. On connect, publish its `status` (retained) and subscribe to
-   `<base>/config/<device_id>` + `<base>/state`.
-2. Publish every range to `<base>/range`; batch to REST every
-   `update_ms * 5` or when MQTT is down.
-3. On `config/<device_id>` message → apply partial config, persist to NVS.
+   `<base>/config/<device_id>` + `<base>/cmd/<device_id>`.
+2. Publish every range to `<base>/range` plus a batch to `<base>/telemetry`;
+   batch to REST every `update_ms * 5` or when MQTT is down.
+3. On a `config/<device_id>` message → apply partial config, persist to NVS
+   (reboot when role/id changed). On `cmd/<device_id>` → run the command.
 
 If `mqtt.enabled` is false the device uses REST only. Both paths are always
 available; MQTT is used when reachable, REST otherwise.

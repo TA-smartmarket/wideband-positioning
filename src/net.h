@@ -57,6 +57,14 @@ inline void topicDevice(char *out, size_t n, const char *kind, const char *suffi
              roleName(cfg.role), (unsigned)cfg.id, suffix);
 }
 
+// Config topic for this device: "<base>/config/<role>-<id>" (must match the
+// server's publish topic in server/app.py).
+inline void topicConfig(char *out, size_t n)
+{
+    snprintf(out, n, "%s/config/%s-%u", cfg.mqtt_base,
+             roleName(cfg.role), (unsigned)cfg.id);
+}
+
 // ---- REST -----------------------------------------------------------------
 
 // POST json to "<server_url><path>". Returns true on HTTP 2xx.
@@ -104,7 +112,7 @@ inline void mqttPublish(const char *topic_name, const String &payload, bool reta
 inline void mqttCallback(char *t, byte *payload, unsigned int len)
 {
     char cfg_topic[80], cmd_topic[80];
-    topicDevice(cfg_topic, sizeof(cfg_topic), "config", "set");
+    topicConfig(cfg_topic, sizeof(cfg_topic));
     snprintf(cmd_topic, sizeof(cmd_topic), "%s/cmd/%s-%u", cfg.mqtt_base,
              roleName(cfg.role), (unsigned)cfg.id);
 
@@ -137,7 +145,7 @@ inline void mqttEnsureConnected()
     if (!ok) return;
 
     char t[80];
-    topicDevice(t, sizeof(t), "config", "set");
+    topicConfig(t, sizeof(t));
     g_mqtt.subscribe(t);
     snprintf(t, sizeof(t), "%s/cmd/%s-%u", cfg.mqtt_base, roleName(cfg.role), (unsigned)cfg.id);
     g_mqtt.subscribe(t);
@@ -172,12 +180,21 @@ inline void syncConfigFromServer(bool force = false)
 }
 
 // ---- setup portal (captive AP) -------------------------------------------
+//
+// IMPORTANT: the WebServer socket may only be opened AFTER the network
+// interface exists, otherwise lwIP aborts with
+//   "assert failed: tcpip_send_msg_wait_sem (Invalid mbox)".
+// So: bring up WiFi (AP) first, give lwIP a moment, then begin() the server.
+// WIFI_AP_STA keeps the STA connection attempt alive while the portal is up.
 
 inline void portalStart()
 {
     if (net.portal_on) return;
-    WiFi.mode(WIFI_AP);
+
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(SSID_AP);
+    delay(300);                 // let the AP + lwIP come up before opening the socket
+    g_portal.begin();
     net.portal_on = true;
     Serial.printf("[ap] setup portal at http://192.168.4.1  (ssid %s)\n", SSID_AP);
 }
@@ -200,8 +217,11 @@ inline void portalLoop()
 
 inline void wifiBegin()
 {
-    if (cfg.wifi_ssid[0] == 0) { portalStart(); return; }
-    WiFi.mode(WIFI_STA);
+    if (cfg.wifi_ssid[0] == 0) {
+        portalStart();          // nothing to join -> go straight to the portal
+        return;
+    }
+    WiFi.mode(WIFI_AP_STA);     // STA now, AP only if the portal is needed
     WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
     Serial.printf("[wifi] connecting to %s\n", cfg.wifi_ssid);
 }
@@ -209,6 +229,8 @@ inline void wifiBegin()
 inline void wifiLoop()
 {
     static unsigned long last = 0;
+    static uint8_t fails = 0;
+
     if (net.wifi_up) {
         if (WiFi.status() != WL_CONNECTED) {
             net.wifi_up = false;
@@ -218,12 +240,18 @@ inline void wifiLoop()
     }
     if (WiFi.status() == WL_CONNECTED) {
         net.wifi_up = true;
+        fails = 0;
         Serial.printf("[wifi] connected, ip %s\n", WiFi.localIP().toString().c_str());
+        if (net.portal_on) portalStop();     // reached the network, close the portal
         syncConfigFromServer(true);
         return;
     }
-    if (millis() - last > 10000) {          // retry / fall back to portal
+    if (millis() - last > 10000) {           // retry; after 3 tries open the portal
         last = millis();
         if (cfg.wifi_ssid[0]) { WiFi.disconnect(); WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass); }
+        if (++fails >= 3 && !net.portal_on) {
+            Serial.println(F("[wifi] cannot connect -> starting setup portal"));
+            portalStart();
+        }
     }
 }

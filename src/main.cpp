@@ -310,7 +310,18 @@ void drawUi()
     display.setCursor(0, 0);
     display.print(id);
     display.setCursor(96, 0);
-    display.print(net.mqtt_up ? F("MQTT") : (net.wifi_up ? F("REST") : F("----")));
+    display.print(net.portal_on ? F("AP") : (net.mqtt_up ? F("MQTT") : (net.wifi_up ? F("REST") : F("----"))));
+
+    if (net.portal_on) {
+        display.setCursor(0, 20);
+        display.print(F("Join WiFi:"));
+        display.setCursor(0, 30);
+        display.print(SSID_AP);
+        display.setCursor(0, 44);
+        display.print(F("open 192.168.4.1"));
+        display.display();
+        return;
+    }
 
     if (range_count == 0) {
         display.setCursor(0, 28);
@@ -524,7 +535,9 @@ void portalRegister()
         ESP.restart();
     });
 
-    g_portal.begin();
+    // NOTE: g_portal.begin() is intentionally NOT called here — opening the
+    // listening socket before WiFi is up crashes lwIP. portalStart() does it
+    // after the AP is running.
     Serial.println("[ap] portal handlers registered");
 }
 
@@ -637,10 +650,13 @@ void setup()
     display.println(F(FW_VERSION));
     display.display();
 
+    // Handlers are registered on every boot (cheap, no socket yet) so the
+    // portal can be started later — e.g. when WiFi credentials are wrong.
+    portalRegister();
+
     if (cfg.role == ROLE_NONE) {
         Serial.println(F("no role configured -> starting setup portal"));
         printHelp();
-        portalRegister();
         portalStart();
         return;
     }

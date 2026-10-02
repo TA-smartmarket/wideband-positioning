@@ -288,6 +288,7 @@ Base topic default: `uwb/home` (bisa diganti lewat `base <topic>` / `--mqtt-base
 | `uwb/home/telemetry` | device → server | batch telemetry |
 | `uwb/home/status/<device_id>` | device → server | status online (retained) |
 | `uwb/home/config/<device_id>` | server → device | config push (retained) |
+| `uwb/home/cmd/<device_id>` | server → device | perintah (`{"cmd":"reboot"}`) |
 | `uwb/home/state` | server → semua | state dunia (retained) |
 
 Uji cepat:
