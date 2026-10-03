@@ -540,10 +540,29 @@ function buildAnchors() {
 // (position always, plus the current range/RSSI when the device reports them).
 function anchorLabel(a, live) {
   const online = live ? live.online : false;
-  const spr = label(a.label || a.id, new THREE.Vector3(0, a.z + 0.42, 0),
+  const spr = label(anchorLabelText(a, live), new THREE.Vector3(0, a.z + 0.42, 0),
                     online ? 0x9ff5cf : 0x93a4c8, 0.125);
   spr.userData.anchorId = a.id;
   return spr;
+}
+
+// The text shown above an anchor. Built here (not in the sprite) so a rebuild
+// — which happens on every selection change — keeps the full two-line label.
+// Previously the sprite was created with the short name only and the live text
+// arrived 500 ms later on the next poll, so the label visibly shrank ("kempes")
+// for a moment every time an object was selected.
+function anchorLabelText(a, live) {
+  const online = live ? live.online : false;
+  let rng = null;
+  for (const t of S.state.tags || []) {
+    const l = (t.links || {})[a.id];
+    if (l && t.ranges && t.ranges[a.id] !== undefined) { rng = t.ranges[a.id]; break; }
+  }
+  const lines = [`${a.label || a.id}  (${a.x.toFixed(2)}, ${a.y.toFixed(2)})`];
+  if (!online) lines.push('offline');
+  else if (rng !== null) lines.push(`${rng.toFixed(2)} m`);
+  else lines.push('online');
+  return lines.join('\n');
 }
 
 // Live text for every anchor label, refreshed from /api/v1/state.
@@ -564,11 +583,7 @@ function updateAnchorLabels() {
       if (l && t.ranges && t.ranges[a.id] !== undefined) { rng = t.ranges[a.id]; break; }
     }
 
-    const lines = [`${a.label || a.id}  (${a.x.toFixed(2)}, ${a.y.toFixed(2)})`];
-    if (!online) lines.push('offline');
-    else if (rng !== null) lines.push(`${rng.toFixed(2)} m`);
-    else lines.push('online');
-    spr.userData.setText(lines.join('\n'), online ? 0x9ff5cf : 0x93a4c8);
+    spr.userData.setText(anchorLabelText(a, live), online ? 0x9ff5cf : 0x93a4c8);
   }
 }
 
@@ -1654,9 +1669,9 @@ let renderOn = true;
 function toggleRender() {
   renderOn = !renderOn;
   const b = $('render-toggle');
-  b.textContent = renderOn ? '⏸' : '▶';
+  b.textContent = renderOn ? '⏸ Pause' : '▶ Resume';
   b.classList.toggle('on', !renderOn);
-  toast(renderOn ? 'Rendering resumed' : 'Rendering paused (Space to resume)');
+  toast(renderOn ? 'Rendering resumed' : 'Rendering paused — CPU saved (Space to resume)');
 }
 
 /* ==========================================================================
@@ -1869,6 +1884,29 @@ window.__uwbPickAt = (clientX, clientY) => {
   if (!p) return null;
   return { pick: p.obj.userData.pick, id: p.obj.userData.id || null,
            axis: p.obj.userData.axis || null };
+};
+
+// Label sprite state (test/debug helper).
+window.__uwbLabels = () => {
+  const out = [];
+  const walk = (root, where) => {
+    root.traverse((o) => {
+      if (o.isSprite && o.userData && o.userData.setText) {
+        const img = o.material.map && o.material.map.image;
+        out.push({
+          where,
+          text: (o.userData.text || '').replace(/\n/g, '|'),
+          scale: [+o.scale.x.toFixed(4), +o.scale.y.toFixed(4)],
+          aspect: +(o.scale.x / o.scale.y).toFixed(3),
+          canvas: img ? [img.width, img.height] : null,
+          texAspect: img && img.height ? +(img.width / img.height).toFixed(3) : null,
+        });
+      }
+    });
+  };
+  walk(anchorGroup, 'anchor');
+  walk(tagGroup, 'tag');
+  return out;
 };
 
 // Pulse ring state (test/debug helper).
