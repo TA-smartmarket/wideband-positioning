@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UWB Positioning — 3D Room</title>
+<link rel="stylesheet" href="/static/style.css">
+<script type="importmap">
+{ "imports": { "three": "/static/vendor/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="app">
+  <div id="viewport">
+    <div id="hud"></div>
+    <div id="viewbar">
+      <button id="view-iso" title="Perspective view">3D</button>
+      <button id="view-top" title="Top-down view">Top</button>
+      <button id="view-reset" title="Clear the movement trail">Clear trail</button>
+    </div>
+    <div id="palette"></div>
+    <div id="toast"></div>
+  </div>
+
+  <aside id="panel">
+    <header>
+      <h1>📡 UWB Positioning</h1>
+      <p class="sub">Drag anchors to the corners, add walls, then Save —
+         the server uses your room to correct NLOS measurements.</p>
+    </header>
+
+    <section>
+      <h3>Room <span class="pill">metres</span></h3>
+      <div class="row">
+        <label>Width (X)<input id="r-w" type="number" step="0.1" min="0.5"></label>
+        <label>Depth (Y)<input id="r-d" type="number" step="0.1" min="0.5"></label>
+      </div>
+      <label>Height (Z)<input id="r-h" type="number" step="0.1" min="0.5"></label>
+      <label><input id="nlos" type="checkbox"> Obstacle-aware NLOS correction</label>
+      <label><input id="trail" type="checkbox" checked> Show movement trail</label>
+    </section>
+
+    <section>
+      <h3>Inspector</h3>
+      <div id="inspector">
+        <p class="muted">Nothing selected.<br>Click an anchor, obstacle or the tag.</p>
+      </div>
+    </section>
+
+    <footer>
+      <button id="save" class="primary full">💾 Save room &amp; anchors</button>
+      <button id="reload" class="full" style="margin-top:8px">↺ Reload from server</button>
+      <p class="hint">Drag = move · corner handles = resize · Delete = remove ·
+         Esc = deselect · drag empty space = orbit · scroll = zoom</p>
+    </footer>
+  </aside>
+</div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

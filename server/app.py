@@ -11,6 +11,8 @@ Endpoints (see docs/API.md):
     GET  /api/v1/config/device?role=&id=  config for one device (merged)
     PUT  /api/v1/config                 save partial config for a device
     GET  /api/v1/state                  current world state
+    GET  /api/v1/scene                  room + anchors + obstacles (3D editor)
+    PUT  /api/v1/scene                  save the 3D scene (pushes anchor config)
     GET  /api/v1/devices                known devices + last seen
     POST /api/v1/position               solve now (debug)
     GET  /  -> web UI
@@ -22,10 +24,13 @@ import argparse
 import copy
 import json
 import math
+import os
 import threading
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
+
+import scene as scene_mod
 
 # ---------------------------------------------------------------------------
 # config model
@@ -50,6 +55,9 @@ STALE_MS = 5000       # device offline threshold
 RANGES = {}           # (anchor_id, tag_id) -> {"range","rx","fp","q","ts"}
 TAG_POS = {}          # tag_id -> {"x","y","conf","amb","ts","src"}
 STATUS = {}           # device_id -> status dict
+SCENE = scene_mod.default_scene()   # room + anchors + obstacles (3D editor)
+NLOS = {}             # (anchor_id, tag_id) -> {"blocked","atten","sigma","bias"}
+NLOS_ENABLED = True   # inflate sigma / bias for blocked paths
 
 APP = Flask(__name__)
 
@@ -230,9 +238,11 @@ class TagEKF:
         self.P = [[FPFt[i][j] + Q[i][j] for j in range(4)] for i in range(4)]
 
     # one scalar range measurement to anchor (ax, ay); returns True if accepted
-    def update_range(self, ax, ay, rng, gate_sigma=3.0):
+    # sigma_r may be overridden per measurement (NLOS paths are noisier).
+    def update_range(self, ax, ay, rng, gate_sigma=3.0, sigma_r=None):
         if rng <= 0.01:
             return False
+        sr = self.sigma_r if sigma_r is None else sigma_r
         dx, dy = self.x[0] - ax, self.x[1] - ay
         d = math.hypot(dx, dy) or 1e-3
 
@@ -240,7 +250,7 @@ class TagEKF:
         innov = rng - d                                    # y = z - h(x)
 
         PHt = [sum(self.P[i][k] * H[k] for k in range(4)) for i in range(4)]
-        S = sum(H[i] * PHt[i] for i in range(4)) + self.sigma_r ** 2
+        S = sum(H[i] * PHt[i] for i in range(4)) + sr ** 2
         if S < 1e-9:
             return False
 
@@ -267,34 +277,65 @@ class TagEKF:
 EKF = {}      # tag_id -> TagEKF
 
 
+def anchor_xyz(device_id, fallback_id=None):
+    """Anchor position: the 3D scene is the source of truth, the device config
+    is the fallback (so a device that was configured before the scene existed
+    still works)."""
+    with LOCK:
+        for a in SCENE.get("anchors", []):
+            if a["id"] == device_id:
+                return a["x"], a["y"], a.get("z", 2.2)
+        dev = DEVICES.get(device_id)
+        if dev and dev.get("role") == "anchor":
+            p = dev.get("position", {})
+            return p.get("x", 0.0), p.get("y", 0.0), p.get("z", 2.2)
+    return None
+
+
 def recompute_positions():
     """Recompute all tag positions: geometric solver for the first fix, then
-    the EKF tracks each tag over time (see class TagEKF)."""
+    the EKF tracks each tag over time (see class TagEKF).
+
+    Obstacles in the scene make this NLOS-aware: a blocked anchor→tag path gets
+    an inflated measurement sigma (so the EKF trusts it less, or rejects it via
+    the innovation gate) plus a small positive bias (UWB NLOS reads long)."""
+    global NLOS
     now = now_ms()
     out = {}
     tags = {dk for dk, dc in DEVICES.items() if dc.get("role") == "tag"}
     for (a, t) in RANGES.keys():
         tags.add(t)
+
+    with LOCK:
+        room = dict(SCENE["room"])
+        obstacles = list(SCENE.get("obstacles", []))
+
     for tag in tags:
         fixes, anchors_used = [], []
+        links = []
         for (a, t), r in RANGES.items():
             if t != tag:
                 continue
-            if now - r["ts"] > STALE_MS:
+            if now - r.get("recv_ts", r["ts"]) > STALE_MS:
                 continue
-            acfg = DEVICES.get(a)
-            if not acfg:
+            pos = anchor_xyz(a)
+            if not pos:
                 continue
-            fixes.append((acfg["position"]["x"], acfg["position"]["y"], r["range"]))
+            ax, ay, az = pos
+            dz = az - scene_mod.DEFAULT_TAG_Z
+            rng2d = scene_mod.horizontal_range(r["range"], dz)
+            if rng2d <= 0.01:
+                continue
+            fixes.append((ax, ay, rng2d))
             anchors_used.append(a)
+            links.append((a, ax, ay, az, rng2d))
+
         if len(fixes) < 2:
             continue
 
-        room = DEVICES.get("_room", BASE_CFG["room"])
-
         # --- bootstrap: closed-form fix for the first estimate --------------
         if tag not in EKF:
-            sol = solve_2d(fixes, room["width"], room["height"])
+            sol = solve_2d(fixes, room["width"], room["depth"])
             if not sol:
                 continue
             EKF[tag] = TagEKF(sol["x"], sol["y"])
@@ -302,18 +343,39 @@ def recompute_positions():
             EKF[tag].predict((now - EKF[tag].last_ms) / 1000.0)
             EKF[tag].last_ms = now
 
-        # --- track: one range update per anchor ----------------------------
-        used = sum(1 for (ax, ay, rng) in fixes if EKF[tag].update_range(ax, ay, rng))
+        # --- track: one range update per anchor, NLOS-aware ------------------
+        used = 0
+        link_info = {}
+        for (a, ax, ay, az, rng2d) in links:
+            blockers = scene_mod.los_blockers(
+                (ax, ay, az), (EKF[tag].x[0], EKF[tag].x[1], scene_mod.DEFAULT_TAG_Z),
+                obstacles) if NLOS_ENABLED else []
+            sigma = scene_mod.measurement_sigma(blockers, EKF[tag].sigma_r)
+            bias = scene_mod.nlos_bias(blockers)
+            link_info[a] = {
+                "blocked": bool(blockers),
+                "atten": max([ob.get("atten", 1.0) for ob in blockers], default=0.0),
+                "sigma": sigma,
+                "bias": bias,
+                "obstacles": [ob["id"] for ob in blockers],
+            }
+            if EKF[tag].update_range(ax, ay, rng2d + bias, sigma_r=sigma):
+                used += 1
+
+        NLOS.update({(a, tag): info for a, info in link_info.items()})
+
         px, py, vx, vy = EKF[tag].position()
         sigma = EKF[tag].sigma()
 
         out[tag] = {
             "ts": now, "src": "server", "id": tag,
-            "x": px, "y": py, "vx": vx, "vy": vy,
+            "x": px, "y": py, "z": scene_mod.DEFAULT_TAG_Z,
+            "vx": vx, "vy": vy,
             "confidence": 1.0 / (1.0 + sigma),
             "sigma": sigma, "ambiguous": False,
             "updates": EKF[tag].updates, "used": used,
             "ranges": {a: RANGES[(a, tag)]["range"] for a in anchors_used},
+            "links": link_info,
         }
     return out
 
@@ -359,16 +421,26 @@ def ingest_telemetry(payload, source):
             anc = src if src.startswith("anchor") else dst
             if payload.get("device_id") != did or not cfg:
                 continue
+            # Device clocks are millis()-based (uptime), so they cannot be
+            # compared with the server epoch. Keep both: `ts` for display and
+            # `recv_ts` for staleness, which is what the solver uses.
             RANGES[(anc, tag)] = {
                 "range": r.get("range", 0.0), "rx": r.get("rx_power", 0.0),
                 "fp": r.get("fp_power", 0.0), "q": r.get("quality", 0.0),
-                "ts": r.get("ts", now_ms()),
+                "ts": r.get("ts", 0), "recv_ts": now_ms(),
             }
             if cfg.get("role") == "anchor":
                 cfg.setdefault("position", BASE_CFG["position"])
 
         for p in payload.get("positions", []):
+            # The server EKF is authoritative; a device estimate is only used
+            # as a fallback when the server has no track yet (otherwise it
+            # would wipe sigma/vx/vy every cycle).
+            if p["id"] in EKF:
+                continue
             TAG_POS[p["id"]] = {"x": p["x"], "y": p["y"],
+                                "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
+                                "sigma": p.get("sigma", 0.0),
                                 "conf": p.get("confidence", 0.5),
                                 "amb": p.get("ambiguous", False),
                                 "ts": now_ms(), "src": "device"}
@@ -390,31 +462,60 @@ def ingest_telemetry(payload, source):
 
 def build_state():
     now = now_ms()
-    room = DEVICES.get("_room", BASE_CFG["room"])
+    with LOCK:
+        room = dict(SCENE["room"])
+        scene_anchors = {a["id"]: a for a in SCENE.get("anchors", [])}
+        obstacles = list(SCENE.get("obstacles", []))
+
     anchors = []
     for dk, dc in DEVICES.items():
-        if dc.get("role") == "anchor":
-            anchors.append({
-                "id": dk, "x": dc["position"]["x"], "y": dc["position"]["y"],
-                "z": dc["position"]["z"], "online": now - dc.get("last_seen", 0) < 5000,
-                "last_seen": dc.get("last_seen", 0)})
+        if dc.get("role") != "anchor":
+            continue
+        sa = scene_anchors.get(dk)
+        pos = sa or dc.get("position", {})
+        anchors.append({
+            "id": dk,
+            "label": sa.get("label", dk) if sa else dk,
+            "x": pos.get("x", 0.0), "y": pos.get("y", 0.0), "z": pos.get("z", 2.2),
+            "online": now - dc.get("last_seen", 0) < 5000,
+            "last_seen": dc.get("last_seen", 0)})
+
+    # anchors that exist in the scene but have not reported yet
+    for aid, sa in scene_anchors.items():
+        if aid not in DEVICES:
+            anchors.append({"id": aid, "label": sa.get("label", aid),
+                            "x": sa["x"], "y": sa["y"], "z": sa.get("z", 2.2),
+                            "online": False, "last_seen": 0})
+
     tags = []
     for tag, p in TAG_POS.items():
-        tags.append({"id": tag, "x": p["x"], "y": p["y"], "z": 0.9,
+        tags.append({"id": tag, "x": p["x"], "y": p["y"],
+                     "z": p.get("z", scene_mod.DEFAULT_TAG_Z),
                      "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
                      "sigma": p.get("sigma", 0.0),
                      "confidence": p["conf"], "ambiguous": p["amb"],
                      "online": now - p["ts"] < STALE_MS, "last_seen": p["ts"],
                      "source": p.get("src", "server"),
                      "ranges": {a: r["range"] for (a, t), r in RANGES.items()
-                                if t == tag}})
-    links = [{"src": a, "dst": t, "range": r["range"], "rx_power": r["rx"],
-              "ts": r["ts"]} for (a, t), r in RANGES.items()]
+                                if t == tag},
+                     "links": p.get("links", {})})
+
+    links = []
+    for (a, t), r in RANGES.items():
+        info = NLOS.get((a, t), {})
+        links.append({"src": a, "dst": t, "range": r["range"], "rx_power": r["rx"],
+                      "ts": r["ts"],
+                      "blocked": bool(info.get("blocked", False)),
+                      "obstacles": info.get("obstacles", [])})
+
     return {"site": BASE_CFG["site"], "ts": now, "room": room,
+            "obstacles": obstacles,
+            "nlos_enabled": NLOS_ENABLED,
             "anchors": anchors, "tags": tags, "links": links}
 
 
-STATE = {"site": "home", "ts": 0, "room": BASE_CFG["room"],
+STATE = {"site": "home", "ts": 0, "room": dict(scene_mod.DEFAULT_ROOM),
+         "obstacles": [], "nlos_enabled": True,
          "anchors": [], "tags": [], "links": []}
 
 
@@ -514,12 +615,13 @@ def api_config_device():
 
 @APP.route("/api/v1/config", methods=["PUT"])
 def api_config_put():
+    """Save a device config (legacy/API path). Anchor positions and the room
+    are mirrored into the 3D scene so the editor and the API never diverge."""
+    global SCENE
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"ok": False, "error": "bad json"}), 400
     with LOCK:
-        if body.get("room"):
-            DEVICES["_room"] = body["room"]
         role = body.get("role", "anchor")
         did = body.get("id", 1)
         key = f"{role}-{did}"
@@ -529,6 +631,25 @@ def api_config_put():
         dev["id"] = did
         dev.pop("_auto", None)        # explicitly configured now
         dev["last_seen"] = now_ms()
+
+        # keep the 3D scene in sync
+        pos = dev.get("position") or {}
+        if role == "anchor" and ("x" in pos or "y" in pos):
+            a = next((x for x in SCENE["anchors"] if x["id"] == key), None)
+            if not a:
+                a = {"id": key, "label": key, "x": 0.0, "y": 0.0, "z": 2.2}
+                SCENE["anchors"].append(a)
+            a["x"] = float(pos.get("x", a["x"]))
+            a["y"] = float(pos.get("y", a["y"]))
+            a["z"] = float(pos.get("z", a.get("z", 2.2)))
+        room = body.get("room") or {}
+        if room.get("width"):
+            SCENE["room"]["width"] = float(room["width"])
+        if room.get("height"):
+            SCENE["room"]["depth"] = float(room["height"])
+        SCENE = scene_mod.normalise_scene(SCENE)
+        save_scene()
+
         devcfg = merged_config(role, did)
     # push to device over MQTT (retained -> node picks it up even if offline)
     try:
@@ -536,6 +657,7 @@ def api_config_put():
                      json.dumps(devcfg), retained=True)
     except Exception:
         pass
+    EKF.clear()          # geometry changed -> restart the filters
     broadcast_state()
     return jsonify({"ok": True, "config": devcfg})
 
@@ -553,6 +675,94 @@ def deep_merge(base, patch):
 @APP.route("/api/v1/state", methods=["GET"])
 def api_state():
     return jsonify(STATE)
+
+
+@APP.route("/api/v1/scene", methods=["GET"])
+def api_scene_get():
+    with LOCK:
+        return jsonify({"ok": True, "scene": SCENE,
+                        "nlos_enabled": NLOS_ENABLED,
+                        "device_positions": {
+                            dk: dc.get("position", {})
+                            for dk, dc in DEVICES.items()
+                            if dc.get("role") == "anchor"}})
+
+
+@APP.route("/api/v1/scene", methods=["PUT"])
+def api_scene_put():
+    """Save the 3D scene and push each anchor's position to its device."""
+    global SCENE
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"ok": False, "error": "bad json"}), 400
+
+    with LOCK:
+        SCENE = scene_mod.normalise_scene(body.get("scene", body))
+        if "nlos_enabled" in body:
+            global NLOS_ENABLED
+            NLOS_ENABLED = bool(body["nlos_enabled"])
+
+        pushed = []
+        for a in SCENE["anchors"]:
+            did = a["id"]
+            dev = DEVICES.setdefault(did, copy.deepcopy(BASE_CFG))
+            dev.setdefault("position", {})
+            dev["position"] = {"x": a["x"], "y": a["y"], "z": a.get("z", 2.2)}
+            dev["role"] = "anchor"
+            dev.pop("_auto", None)
+            try:
+                dev["id"] = int(did.split("-")[1])
+            except (IndexError, ValueError):
+                pass
+            # room is kept on the device too (used by its standalone solver)
+            dev["room"] = {"width": SCENE["room"]["width"],
+                           "height": SCENE["room"]["depth"]}
+            pushed.append(did)
+
+        save_scene()
+
+    # push the new anchor position to each device over MQTT (retained)
+    for did in pushed:
+        role, _, num = did.partition("-")
+        devcfg = merged_config(role or "anchor", int(num) if num.isdigit() else 1)
+        mqtt_publish(cfg["mqtt"]["base_topic"] + f"/config/{did}",
+                     json.dumps(devcfg), retained=True)
+
+    # anchors moved -> existing EKF states are stale, restart the filters
+    EKF.clear()
+    recompute_positions()
+    broadcast_state()
+    return jsonify({"ok": True, "scene": SCENE, "pushed": pushed})
+
+
+@APP.route("/static/<path:filename>")
+def static_files(filename):
+    return send_from_directory(os.path.join(os.path.dirname(__file__), "static"),
+                               filename)
+
+
+def save_scene(path=None):
+    """Persist the scene next to the server so restarts keep the room setup."""
+    path = path or os.path.join(os.path.dirname(__file__), "scene.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"scene": SCENE, "nlos_enabled": NLOS_ENABLED}, fh, indent=2)
+    except OSError as e:
+        print(f"[scene] save failed: {e}")
+
+
+def load_scene(path=None):
+    global SCENE, NLOS_ENABLED
+    path = path or os.path.join(os.path.dirname(__file__), "scene.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        SCENE = scene_mod.normalise_scene(data.get("scene", data))
+        NLOS_ENABLED = bool(data.get("nlos_enabled", True))
+        print(f"[scene] loaded {path} "
+              f"({len(SCENE['anchors'])} anchors, {len(SCENE['obstacles'])} obstacles)")
+    except (OSError, ValueError):
+        pass          # no saved scene yet -> defaults
 
 
 @APP.route("/api/v1/devices", methods=["GET"])
@@ -577,81 +787,10 @@ def api_position():
 # web UI
 # ---------------------------------------------------------------------------
 
-UI = """<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UWB positioning — __SITE__</title>
-<style>
- body{font:14px system-ui;margin:0;background:#0f1220;color:#e8e8f0}
- .wrap{max-width:1100px;margin:0 auto;padding:16px}
- h1,h2{font-weight:600}
- .grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}
- @media(max-width:800px){.grid{grid-template-columns:1fr}}
- .card{background:#1a1e33;border:1px solid #2a2f4a;border-radius:10px;padding:14px;margin-bottom:16px}
- svg{background:#11152a;border:1px solid #22264a;border-radius:8px;width:100%}
- table{border-collapse:collapse;width:100%}
- td,th{padding:5px 8px;text-align:left;border-bottom:1px solid #272b48}
- .tag{color:#ffd166}.anc{color:#6ee7b7}.stale{opacity:.35}
- input,select{padding:6px;margin:3px 0 8px;border-radius:6px;border:1px solid #333;background:#12152a;color:#eee}
- button{padding:8px 16px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer}
- .ok{color:#6ee7b7}.off{color:#f87171}
-</style></head><body><div class="wrap">
-<h1>📡 UWB positioning <span style="font-weight:400;color:#8b8fb0">· __SITE__</span></h1>
-<div class="grid">
- <div>
-  <div class="card"><h2>Live map</h2><div id="map"></div></div>
-  <div class="card"><h2>Tags</h2><table id="tags"><tr><th>id</th><th>x</th><th>y</th><th>conf</th><th>status</th></tr></table></div>
- </div>
- <div>
-  <div class="card"><h2>Anchors / devices</h2><table id="anc"><tr><th>id</th><th>pos</th><th>state</th></tr></table></div>
-  <div class="card"><h2>Setup</h2>
-   <label>Role</label><select id="setR"><option>anchor</option><option>tag</option></select>
-   <label>ID (1-10)</label><input id="setI" type="number" min="1" max="10" value="1">
-   <label>Position X (m)</label><input id="setX" type="number" step="0.01" value="0">
-   <label>Position Y (m)</label><input id="setY" type="number" step="0.01" value="0">
-   <label>Room width / height (m)</label><input id="setW" type="number" step="0.01" value="5">
-   <input id="setH" type="number" step="0.01" value="4">
-   <label>WiFi SSID</label><input id="setS" placeholder="MyWiFi">
-   <label>WiFi password</label><input id="setP" type="password">
-   <label>Server URL (on device)</label><input id="setU" placeholder="http://192.168.1.10:8080">
-   <button onclick="saveCfg()">💾 Save to device</button>
-   <p style="color:#8b8fb0;font-size:12px">Save pushes config over MQTT (retained). The device applies it and reboots.</p>
-  </div>
- </div>
-</div>
-<script>
-let state={};
-async function poll(){try{const r=await fetch('/api/v1/state');state=await r.json();render();}catch(e){}}
-function render(){
- const W=400,H=320,r=state.room||{width:5,height:4};
- const sx=W/r.width, sy=H/r.height;
- let svg=`<svg viewBox="0 0 ${W} ${H}">`;
- svg+=`<rect x="0" y="0" width="${W}" height="${H}" fill="none" stroke="#2a2f4a"/>`;
- (state.anchors||[]).forEach(a=>{svg+=`<g class="anc"><circle cx="${a.x*sx}" cy="${a.y*sy}" r="8" fill="#6ee7b7"/><text x="${a.x*sx+10}" y="${a.y*sy+4}" font-size="11">${a.id}</text></g>`;});
- (state.links||[]).forEach(l=>{const a=(state.anchors||[]).find(x=>x.id===l.src);if(!a)return;const t=(state.tags||[]).find(x=>x.id===l.dst);if(!t)return;svg+=`<line x1="${a.x*sx}" y1="${a.y*sy}" x2="${t.x*sx}" y2="${t.y*sy}" stroke="#ffd166" stroke-width="1.5" stroke-dasharray="4,3"/>`;});
- (state.tags||[]).forEach(t=>{svg+=`<g class="tag"><circle cx="${t.x*sx}" cy="${t.y*sy}" r="10" fill="#ffd166"/><text x="${t.x*sx+12}" y="${t.y*sy+4}" font-size="11">${t.id}</text></g>`;});
- svg+='</svg>';
- document.getElementById('map').innerHTML=svg;
- const tc=document.getElementById('tags');tc.innerHTML='<tr><th>id</th><th>x</th><th>y</th><th>conf</th><th>status</th></tr>';
- (state.tags||[]).forEach(t=>{tc.innerHTML+=`<tr><td>${t.id}</td><td>${t.x.toFixed(2)}</td><td>${t.y.toFixed(2)}</td><td>${(t.confidence*100).toFixed(0)}%</td><td class="${t.online?'ok':'off'}">${t.online?'live':(t.ambiguous?'ambig':'off')}</td></tr>`;});
- const ac=document.getElementById('anc');ac.innerHTML='<tr><th>id</th><th>pos</th><th>state</th></tr>';
- (state.anchors||[]).forEach(a=>{ac.innerHTML+=`<tr><td>${a.id}</td><td>${a.x.toFixed(1)},${a.y.toFixed(1)}</td><td class="${a.online?'ok':'off'}">${a.online?'online':'off'}</td></tr>`;});
-}
-function saveCfg(){const body={role:document.getElementById('setR').value,id:+document.getElementById('setI').value,
- position:{x:+document.getElementById('setX').value,y:+document.getElementById('setY').value},
- room:{width:+document.getElementById('setW').value,height:+document.getElementById('setH').value},
- wifi:{ssid:document.getElementById('setS').value,password:document.getElementById('setP').value},
- server:{url:document.getElementById('setU').value}};
- fetch('/api/v1/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(async r=>{alert('Saved: '+JSON.stringify((await r.json()).config||{}).slice(0,120));});
-}
-poll();setInterval(poll,700);
-</script></div></body></html>"""
-
-
 @APP.route("/")
 def web():
-    room = DEVICES.get("_room", BASE_CFG["room"])
-    return UI.replace("__SITE__", BASE_CFG["site"])
+    return send_from_directory(os.path.join(os.path.dirname(__file__), "static"),
+                               "index.html")
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +819,7 @@ def main():
     cfg["mqtt"]["base_topic"] = args.mqtt_base
 
     print(f"[server] http://0.0.0.0:{args.port}" + ("  (token auth)" if args.token else ""))
+    load_scene()
     if args.mqtt:
         mqtt_start()
 

@@ -8,3 +8,4 @@ server/mqtt_send*.py
 server/mqtt_probe.py
 .vscode/
 
+server/scene.json

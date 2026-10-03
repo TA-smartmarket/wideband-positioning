@@ -307,6 +307,69 @@ fallback ke REST.
 
 ---
 
+## 🖥️ Web UI 3D (editor ruangan + live tracking)
+
+Buka `http://<server>:8080` — tampil **ruangan 3D interaktif** (Three.js):
+
+| Aksi | Cara |
+|---|---|
+| Putar / zoom kamera | drag area kosong · scroll |
+| Pindah anchor | drag bola hijau — otomatis dikunci di dalam ruangan |
+| Ubah ukuran ruangan | isi Width/Depth/Height di panel kanan |
+| Tambah anchor / obstacle | tombol **Anchor** / **Obstacle**, lalu klik lantai |
+| Geser obstacle | drag badannya |
+| Ubah ukuran obstacle | drag **handle bola di sudut** |
+| Ubah tinggi obstacle | drag **cone di atas** |
+| Hapus | pilih lalu `Delete` (atau tombol Delete di inspector) |
+| Simpan | **💾 Save room & anchors** — langsung di-push ke device via MQTT |
+| View | **3D** / **Top** / **Clear trail** |
+
+Yang terlihat di scene:
+
+- **Bola hijau** = anchor (redup = offline), dengan tiang setinggi `z`
+- **Bola kuning** = tag live + **cincin 1σ** dari kovarians EKF
+- **Jejak kuning** = riwayat gerak tag
+- **Garis** anchor→tag: **hijau penuh = LOS**, **merah putus-putus = NLOS**
+  (terhalang obstacle)
+- **Kotak ungu** = obstacle; opacity mengikuti nilai attenuation
+
+### Obstacle benar-benar dihitung (bukan hiasan)
+
+Setiap jalur anchor→tag diuji terhadap obstacle (`segment_hits_box`, slab
+method). Kalau terhalang:
+
+1. **σ pengukuran dinaikkan** (`base × (1 + 7·atten)`) → EKF lebih tidak
+   percaya pada anchor itu;
+2. **bias positif** ditambahkan (UWB NLOS cenderung terbaca lebih jauh);
+3. kalau inovasi tetap di luar gerbang 3σ, pengukuran **ditolak** dan filter
+   lanjut memakai model gerak.
+
+Toggle **Obstacle-aware NLOS correction** mematikan/menyalakan seluruh
+mekanisme ini. Scene disimpan ke `server/scene.json` sehingga restart server
+tidak menghilangkan denah ruangan.
+
+### Endpoint scene
+
+| Method | Path | Fungsi |
+|---|---|---|
+| `GET` | `/api/v1/scene` | denah (room + anchors + obstacles) + status NLOS |
+| `PUT` | `/api/v1/scene` | simpan denah; posisi anchor otomatis di-push ke device |
+
+```bash
+# contoh: ruangan 5×4×2.7 m, 2 anchor di sudut, 1 dinding di tengah
+curl -X PUT localhost:8080/api/v1/scene -H 'Content-Type: application/json' -d '{
+  "scene": {
+    "room": {"width":5,"depth":4,"height":2.7},
+    "anchors": [{"id":"anchor-2","x":0,"y":0,"z":2.2},
+                {"id":"anchor-3","x":5,"y":0,"z":2.2}],
+    "obstacles": [{"id":"obstacle-1","label":"Wall","x":1.5,"y":1.5,"z":1.35,
+                   "sx":3.0,"sy":0.2,"sz":2.7,"rot":0,"atten":1.0}]
+  },
+  "nlos_enabled": true }'
+```
+
+---
+
 ## ⚙️ Cara Kerja & Logika Penting
 
 Pipeline lokalisasi punya **3 tahap** (identik di device dan server):

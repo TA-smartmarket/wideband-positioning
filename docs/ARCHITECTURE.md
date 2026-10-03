@@ -150,7 +150,42 @@ step 2  true_y=1.4 -> x=2.01 y=1.46  vy=0.73  sigma=0.257  used=2
 step 3  true_y=1.6 -> x=2.01 y=1.64  vy=0.68  sigma=0.202  used=2
 ```
 
-### 5.4 Where each stage runs
+### 5.4 NLOS from the 3D scene (`server/scene.py`)
+
+The room, anchor placements and obstacles are edited in the 3D web UI and
+stored in `server/scene.json` (the server is the source of truth; anchor
+positions are mirrored onto the devices through the normal config push).
+
+Coordinate system is right-handed with **Z up** (`x` width, `y` depth,
+`z` height); the UI maps this to Three.js as `(x, z, y)`.
+
+For every anchor→tag path the server runs a segment/oriented-box test
+(`segment_hits_box`, slab method in the box's yaw frame). A blocked path is
+treated as **NLOS**:
+
+| Effect | Formula |
+|---|---|
+| measurement noise | `sigma = base * (1 + 7 * atten)` |
+| range bias | `z = z + 0.35 * atten` (UWB NLOS reads long) |
+| rejection | innovation gate `|y| > 3*sqrt(S)` still applies |
+
+`atten` is per-obstacle (0 = transparent, 1 = solid wall), so a glass partition
+and a concrete wall behave differently. The flag `nlos_enabled` turns the whole
+mechanism off for comparison.
+
+Vertical geometry is handled exactly: the EKF is 2D, so each 3D range is
+projected with `r_2d = sqrt(r^2 - dz^2)` using the anchor height and the
+assumed tag height (`DEFAULT_TAG_Z = 0.9 m`) — the vertical offset is removed
+instead of being absorbed as error.
+
+Verified on hardware + synthetic input:
+
+```
+wall at y=1.5 (x 0..3): anchor-2 path blocked=True, anchor-3 blocked=False
+tag at (2.5, 3.0) -> estimate (2.61, 3.09), sigma 0.79 (inflated by NLOS)
+```
+
+### 5.5 Where each stage runs
 
 | Stage | Device (tag) | Server |
 |---|---|---|
@@ -160,6 +195,13 @@ step 3  true_y=1.6 -> x=2.01 y=1.64  vy=0.68  sigma=0.202  used=2
 
 The tag publishes its own EKF estimate with `"source": "device"`; the server's
 estimate is authoritative and published as `"source": "server"`.
+
+### 5.6 Timestamps
+
+Device clocks are `millis()`-based (uptime) and cannot be compared with the
+server's epoch, so ranges carry both: `ts` (device, for display) and
+`recv_ts` (server, **used for staleness**). Mixing them silently discards every
+measurement as "stale" — a bug that cost an afternoon.
 
 ---
 
