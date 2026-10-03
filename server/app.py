@@ -936,11 +936,14 @@ def api_ota_list():
     directly; keep this endpoint behind --token on untrusted networks."""
     firmwares = []
     if os.path.isdir(OTA_DIR):
-        for f in sorted(os.listdir(OTA_DIR)):
-            if f.endswith(".bin"):
-                p = os.path.join(OTA_DIR, f)
-                firmwares.append({"name": f, "size": os.path.getsize(p),
-                                  "mtime": int(os.path.getmtime(p))})
+        for f in os.listdir(OTA_DIR):
+            if not f.endswith(".bin"):
+                continue
+            p = os.path.join(OTA_DIR, f)
+            firmwares.append({"name": f, "size": os.path.getsize(p),
+                              "mtime": int(os.path.getmtime(p))})
+        # newest build first, so the UI dropdown defaults to the latest image
+        firmwares.sort(key=lambda x: x["mtime"], reverse=True)
     with LOCK:
         devs = []
         for dk, dc in DEVICES.items():

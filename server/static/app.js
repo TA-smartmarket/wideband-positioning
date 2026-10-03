@@ -603,22 +603,21 @@ function buildObstacles() {
     g.add(edges);
 
     if (sel) {
-      // Blender-style 3-axis gizmo: one arrow per axis.
-      //   X arrow (red)   -> drag left/right   (width)
-      //   Y arrow (green) -> drag forward/back (depth)
-      //   Z arrow (blue)  -> drag up/down      (height)
-      // Each arrow has a shaft plus a cone tip; the whole group is the pick
-      // target so the hit area is generous. Handles are placed OUTSIDE the
-      // body, otherwise the box face wins the raycast.
-      const gz = new THREE.Group();
-      gz.userData.pick = 'gizmo';
-      gz.userData.id = ob.id;
+      // ---------------------------------------------------------------------
+      // Two SEPARATE sets of controls, like a real 3D editor:
+      //
+      //   ARROWS  (X red / Y green / Z blue)  -> TRANSLATE the obstacle
+      //           X = left-right, Y = forward-back, Z = up-down
+      //
+      //   CUBES at the footprint corners + TOP handle -> RESIZE the body
+      //           corners scale width/depth, the top handle changes the height
+      //
+      // (The arrows used to resize, which read as "the up arrow makes it
+      //  bigger instead of lifting it". Resizing now lives on its own handles.)
+      // ---------------------------------------------------------------------
+      const armLen = 0.62, armR = 0.030, tipR = 0.085, tipH = 0.24;
 
-      const armLen = 0.55;
-      const armR = 0.028;
-      const tipR = 0.085, tipH = 0.22;
-
-      const axisGroup = (dir, color, name) => {
+      const axisArrow = (dir, color, name) => {
         const a = new THREE.Group();
         const shaft = new THREE.Mesh(
           new THREE.CylinderGeometry(armR, armR, armLen, 10),
@@ -630,44 +629,56 @@ function buildObstacles() {
         tip.position.y = armLen + tipH / 2;
         a.add(shaft, tip);
         a.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-        a.userData.pick = 'gizmoAxis';
-        a.userData.axis = name;
-        a.userData.id = ob.id;
-        a.traverse((o) => { o.userData.pick = 'gizmoAxis'; o.userData.axis = name; o.userData.id = ob.id; });
+        a.traverse((o) => {
+          o.userData.pick = 'gizmoAxis';
+          o.userData.axis = name;
+          o.userData.id = ob.id;
+        });
         return a;
       };
 
-      // offset the gizmo so it sits just outside the box surface
-      const ox = ob.sx / 2 + 0.10, oy = ob.sy / 2 + 0.10, oz = ob.sz / 2 + 0.10;
-      const ax = axisGroup(new THREE.Vector3(1, 0, 0), 0xff6b6b, 'x');
-      ax.position.set(ox, 0, 0);
-      const ay = axisGroup(new THREE.Vector3(0, 0, 1), 0x6bff9c, 'y');
-      ay.position.set(0, 0, oy);
-      const az = axisGroup(new THREE.Vector3(0, 1, 0), 0x6bb5ff, 'z');
-      az.position.set(0, oz, 0);
-      gz.add(ax, ay, az);
+      // The gizmo lives at the obstacle CENTRE so the arrows read as
+      // "move this object", and is drawn above the body so the box never
+      // swallows the ray.
+      const gz = new THREE.Group();
+      gz.position.set(0, 0, 0);
+      gz.userData.pick = 'gizmo';
+      gz.userData.id = ob.id;
+      gz.add(axisArrow(new THREE.Vector3(1, 0, 0), 0xff6b6b, 'x'));
+      gz.add(axisArrow(new THREE.Vector3(0, 0, 1), 0x6bff9c, 'y'));
+      gz.add(axisArrow(new THREE.Vector3(0, 1, 0), 0x6bb5ff, 'z'));
+      gz.renderOrder = 20;
       g.add(gz);
 
-      // corner cubes: drag to scale two axes at once (kept for convenience)
+      // ---- resize handles -------------------------------------------------
+      // footprint corners: scale width (sx) and depth (sy)
       for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
         const h = new THREE.Mesh(
-          new THREE.BoxGeometry(0.16, 0.16, 0.16),
+          new THREE.BoxGeometry(0.17, 0.17, 0.17),
           new THREE.MeshBasicMaterial({ color: 0x93c5fd }));
-        h.position.set(sx * (ob.sx / 2 + 0.10), 0, sz * (ob.sy / 2 + 0.10));
+        h.position.set(sx * (ob.sx / 2 + 0.09), 0, sz * (ob.sy / 2 + 0.09));
         h.userData.pick = 'obstacleHandle';
         h.userData.id = ob.id;
         h.userData.axis = 'both';
         h.userData.corner = [sx, sz];
-        h.renderOrder = 10;
+        h.renderOrder = 20;
         g.add(h);
       }
+      // top handle: change the height (sz) only
+      const top = new THREE.Mesh(
+        new THREE.BoxGeometry(0.17, 0.17, 0.17),
+        new THREE.MeshBasicMaterial({ color: 0xa7f3d0 }));
+      top.position.set(0, ob.sz / 2 + 0.13, 0);
+      top.userData.pick = 'sizeZ';
+      top.userData.id = ob.id;
+      top.renderOrder = 20;
+      g.add(top);
     }
 
     obstacleObjs[ob.id] = g;
     obstacleGroup.add(g);
   }
 }
-
 
 /* ==========================================================================
    Pulse rings: one thin ring per node that expands and fades, like a sonar
@@ -744,6 +755,8 @@ function animatePulses() {
     }
   }
 }
+
+/* ------------------------------------------------------------ tags/links */
 
 /* ------------------------------------------------------------ tags/links */
 function buildTags() {
@@ -864,6 +877,14 @@ function buildLinks() {
   }
 }
 
+// Move an obstacle's mesh in place while dragging its arrows (no rebuild).
+function moveObstacleMesh(o) {
+  const g = obstacleObjs[o.id];
+  if (!g) return;
+  g.position.set(o.x, o.z, o.y);
+  g.rotation.y = -THREE.MathUtils.degToRad(o.rot || 0);
+}
+
 // Resize an obstacle's mesh in place (used while dragging its handles).
 function resizeObstacleMesh(o) {
   const g = obstacleObjs[o.id];
@@ -880,19 +901,16 @@ function resizeObstacleMesh(o) {
     edges.geometry.dispose();
     edges.geometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(o.sx, o.sz, o.sy));
   }
-  // reposition the gizmo arms and the corner cubes
-  const ox = o.sx / 2 + 0.10, oy = o.sy / 2 + 0.10, oz = o.sz / 2 + 0.10;
+  // reposition the corner cubes and the top (height) cube.
+  // The arrows stay at the obstacle centre — they translate, they do not size.
+  const ox = o.sx / 2 + 0.09, oy = o.sy / 2 + 0.09;
   for (const c of g.children) {
     const kind = c.userData.pick;
-    if (kind === 'gizmo') {
-      for (const arm of c.children) {
-        if (arm.userData.axis === 'x') arm.position.set(ox, 0, 0);
-        else if (arm.userData.axis === 'y') arm.position.set(0, 0, oy);
-        else if (arm.userData.axis === 'z') arm.position.set(0, oz, 0);
-      }
-    } else if (kind === 'obstacleHandle') {
+    if (kind === 'obstacleHandle') {
       const [sx, sz] = c.userData.corner || [1, 1];
       c.position.set(sx * ox, 0, sz * oy);
+    } else if (kind === 'sizeZ') {
+      c.position.set(0, o.sz / 2 + 0.13, 0);
     }
   }
 }
@@ -909,8 +927,8 @@ function liveReadout() {
   } else if (S.selected.type === 'obstacle') {
     const o = S.scene.obstacles.find((x) => x.id === S.selected.id);
     if (!o) return;
-    for (const [id, v] of [['o-x', o.x], ['o-y', o.y], ['o-sx', o.sx],
-                           ['o-sy', o.sy], ['o-sz', o.sz]]) {
+    for (const [id, v] of [['o-x', o.x], ['o-y', o.y], ['o-z', o.z ?? 0],
+                           ['o-sx', o.sx], ['o-sy', o.sy], ['o-sz', o.sz]]) {
       if ($(id)) $(id).value = v.toFixed(2);
     }
   }
@@ -978,7 +996,8 @@ function pick(ev) {
     let o = h.object;
     while (o && !o.userData.pick) o = o.parent;
     if (o.userData.pick === 'obstacleHandle' || o.userData.pick === 'obstacleHeight' ||
-        o.userData.pick === 'gizmoAxis' || o.userData.pick === 'gizmo')
+        o.userData.pick === 'gizmoAxis' || o.userData.pick === 'gizmo' ||
+        o.userData.pick === 'sizeZ')
       return { obj: o, point: h.point, hit: h.object };
   }
 
@@ -1014,7 +1033,7 @@ function bindPointer() {
     const u = p.obj.userData;
     if (u.pick === 'anchor' || u.pick === 'obstacle' ||
         u.pick === 'obstacleHandle' || u.pick === 'obstacleHeight' ||
-        u.pick === 'gizmoAxis') {
+        u.pick === 'gizmoAxis' || u.pick === 'sizeZ') {
       controls.enabled = false;
       const gp = groundPoint(ev);
       S.drag = {
@@ -1074,21 +1093,35 @@ function bindPointer() {
         resizeObstacleMesh(o);
       }
     } else if (S.drag.type === 'gizmoAxis') {
+      // Arrows TRANSLATE the obstacle along one axis.
       const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
       if (o) {
-        // Convert the pointer travel into the obstacle's local frame so the
-        // arrows keep working after the box is rotated.
-        const rot = THREE.MathUtils.degToRad(o.rot || 0);
-        const lx = dx * Math.cos(-rot) - dz * Math.sin(-rot);
-        const lz = dx * Math.sin(-rot) + dz * Math.cos(-rot);
         const axis = S.drag.axis;
-        if (axis === 'x') o.sx = Math.max(0.2, S.drag.orig.sx + lx * 2);
-        else if (axis === 'y') o.sy = Math.max(0.2, S.drag.orig.sy + lz * 2);
-        else if (axis === 'z') {
+        if (axis === 'z') {
+          // vertical: use the pointer travel and the current zoom for scale
           const dy = (S.drag.startClientY ?? ev.clientY) - ev.clientY;
           const scale = 0.01 * Math.max(camera.position.distanceTo(controls.target) / 6, 0.4);
-          o.sz = Math.max(0.2, S.drag.orig.sz + dy * scale);
+          o.z = Math.max(0.05, S.drag.orig.z + dy * scale);
+        } else {
+          // horizontal: convert to the obstacle's local frame so the arrows
+          // keep working after the box has been rotated
+          const rot = THREE.MathUtils.degToRad(o.rot || 0);
+          const lx = dx * Math.cos(-rot) - dz * Math.sin(-rot);
+          const lz = dx * Math.sin(-rot) + dz * Math.cos(-rot);
+          if (axis === 'x') o.x = S.drag.orig.x + lx;
+          else if (axis === 'y') o.y = S.drag.orig.y + lz;
         }
+        S.dirty = true;
+        moveObstacleMesh(o);
+        liveReadout();
+      }
+    } else if (S.drag.type === 'sizeZ') {
+      // top cube RESIZES the height
+      const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
+      if (o) {
+        const dy = (S.drag.startClientY ?? ev.clientY) - ev.clientY;
+        const scale = 0.01 * Math.max(camera.position.distanceTo(controls.target) / 6, 0.4);
+        o.sz = Math.max(0.2, S.drag.orig.sz + dy * scale);
         S.dirty = true;
         resizeObstacleMesh(o);
       }
@@ -1264,6 +1297,8 @@ function showSelection() {
         <label>Size Y (m)<input id="o-sy" type="number" step="0.05" min="0.2" value="${o.sy.toFixed(2)}"></label>
       </div>
       <label>Height Z (m)<input id="o-sz" type="number" step="0.05" min="0.2" value="${o.sz.toFixed(2)}"></label>
+      <label>Centre height Z (m) <span class="muted">(drag the blue arrow)</span>
+        <input id="o-z" type="number" step="0.05" value="${(o.z ?? 0).toFixed(2)}"></label>
       <label>Rotation (°)<input id="o-rot" type="number" step="5" value="${(o.rot || 0).toFixed(0)}"></label>
       <label>Attenuation (0 = transparent, 1 = solid)
         <input id="o-atten" type="range" min="0" max="1" step="0.05" value="${o.atten ?? 1}">
@@ -1279,6 +1314,7 @@ function showSelection() {
     bind('sy', 'o-sy', (v) => o.sy = Math.max(0.2, v));
     bind('sz', 'o-sz', (v) => o.sz = Math.max(0.2, v));
     bind('rot', 'o-rot', (v) => o.rot = v);
+    bind('z', 'o-z', (v) => { o.z = v; moveObstacleMesh(o); });
     $('o-atten').oninput = (e) => {
       o.atten = +e.target.value;
       $('o-atten-v').textContent = o.atten.toFixed(2);
@@ -1526,9 +1562,16 @@ async function loadOta() {
     return;
   }
   const sel = $('ota-file');
-  sel.innerHTML = (otaInfo.firmware || []).length
-    ? otaInfo.firmware.map((f) => `<option value="${esc(f.name)}">${esc(f.name)} — ${(f.size / 1024).toFixed(0)} kB</option>`).join('')
+  const fw = otaInfo.firmware || [];
+  sel.innerHTML = fw.length
+    ? fw.map((f, i) => {
+        const when = f.mtime ? new Date(f.mtime * 1000).toLocaleString() : '';
+        return `<option value="${esc(f.name)}">${i === 0 ? '★ ' : ''}${esc(f.name)} — ` +
+               `${(f.size / 1024).toFixed(0)} kB${when ? ' · ' + esc(when) : ''}</option>`;
+      }).join('')
     : '<option value="">(no .bin in server/firmware/)</option>';
+  // the server sorts newest first, so index 0 is already the latest build
+  if (fw.length) sel.selectedIndex = 0;
 
   const online = (otaInfo.devices || []).filter((d) => d.online).length;
   $('ota-hint').innerHTML =
@@ -1799,13 +1842,6 @@ setInterval(poll, 500);
 
 // Small read-only hook used by the automated UI tests (camera distance,
 // pending zoom momentum, held keys). Harmless in normal use.
-// What would pick() return at these client coordinates? (test/debug helper)
-window.__uwbPickAt = (clientX, clientY) => {
-  const p = pick({ clientX, clientY });
-  if (!p) return null;
-  return { pick: p.obj.userData.pick, id: p.obj.userData.id || null,
-           axis: p.obj.userData.axis || null };
-};
 
 // Screen positions of the selected obstacle's handles (test/debug helper).
 window.__uwbHandles = (id) => {
@@ -1814,7 +1850,7 @@ window.__uwbHandles = (id) => {
   const r = renderer.domElement.getBoundingClientRect();
   const out = [];
   for (const c of g.children) {
-    if (c.userData.pick !== 'obstacleHandle' && c.userData.pick !== 'obstacleHeight') continue;
+    if (c.userData.pick !== 'obstacleHandle' && c.userData.pick !== 'sizeZ') continue;
     const p = new THREE.Vector3();
     c.getWorldPosition(p);
     p.project(camera);
@@ -1825,6 +1861,14 @@ window.__uwbHandles = (id) => {
     });
   }
   return out;
+};
+
+// What would pick() return at these client coordinates? (test/debug helper)
+window.__uwbPickAt = (clientX, clientY) => {
+  const p = pick({ clientX, clientY });
+  if (!p) return null;
+  return { pick: p.obj.userData.pick, id: p.obj.userData.id || null,
+           axis: p.obj.userData.axis || null };
 };
 
 // Pulse ring state (test/debug helper).
@@ -1846,7 +1890,7 @@ window.__uwbProbe = () => ({
   mode: S.mode,
   scene: S.scene,
   anchors: S.scene.anchors.map((a) => [a.id, a.x, a.y]),
-  obstacles: S.scene.obstacles.map((o) => [o.id, o.x, o.y, o.sx, o.sy, o.sz]),
+  obstacles: S.scene.obstacles.map((o) => [o.id, o.x, o.y, o.sx, o.sy, o.sz, o.z ?? 0]),
   handles: Object.keys(obstacleObjs).map((id) => {
     const g = obstacleObjs[id];
     return [id, g.children.map((c) => c.userData.pick || 'mesh')];
