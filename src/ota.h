@@ -223,33 +223,47 @@ inline void otaCheckNow(bool force = false)
             }
             Serial.printf("[ota] writing %d bytes\n", len);
 
+            // Two-phase: drain the socket FIRST, then write. Interleaving
+            // reads from the WiFiClient with flash writes holds the lwIP
+            // mutex across a cache-disabling operation, which is what trips
+            // 'assert failed: xQueueSemaphoreTake queue.c:1554' on core 0.
             WiFiClient *stream = dlHttp.getStreamPtr();
-            uint8_t buf[2048];
-            size_t written = 0;
-            uint32_t lastLog = 0;
-            while (written < (size_t)len) {
-                const size_t avail = stream->available();
-                if (avail) {
-                    const int n = stream->readBytes(buf, min(avail, sizeof(buf)));
-                    if (n > 0) {
-                        if (Update.write(buf, n) != (size_t)n) {
-                            Serial.printf("[ota] write failed at %u: %s\n",
-                                          (unsigned)written, Update.errorString());
-                            break;
-                        }
-                        written += n;
-                        if (written - lastLog >= 262144) {
-                            lastLog = written;
-                            Serial.printf("[ota] progress %u/%d\n",
-                                          (unsigned)written, len);
-                        }
-                    }
-                } else {
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                }
-                if (!dlHttp.connected() && !avail) break;
+            const size_t CHUNK = 4096;
+            uint8_t *mem = (uint8_t *)malloc(CHUNK);
+            if (!mem) {
+                Serial.println(F("[ota] out of memory for the buffer"));
+                dlHttp.end();
+                ota_busy = false;
+                otaReport(false, "no memory");
+                return;
             }
+
+            size_t got = 0;
+            uint32_t lastLog2 = 0;
+            while (got < (size_t)len) {
+                const size_t want = min(CHUNK, (size_t)len - got);
+                if (stream->available() < want) {
+                    if (!dlHttp.connected() && stream->available() == 0) break;
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                const size_t n = stream->readBytes(mem, want);
+                if (n == 0) break;
+                if (Update.write(mem, n) != n) {
+                    Serial.printf("[ota] write failed at %u: %s\n",
+                                  (unsigned)got, Update.errorString());
+                    break;
+                }
+                got += n;
+                if (got - lastLog2 >= 262144) {
+                    lastLog2 = got;
+                    Serial.printf("[ota] progress %u/%d\n", (unsigned)got, len);
+                }
+            }
+            free(mem);
             dlHttp.end();
+
+            size_t written = got;
 
             Serial.printf("[ota] downloaded %u/%d bytes\n", (unsigned)written, len);
             Serial.flush();
