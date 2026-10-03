@@ -237,6 +237,22 @@ static void otaTask(void *)
     }
 }
 
+// The pull check + download MUST NOT run in the Arduino loop task: HTTPUpdate
+// plus HTTPClient need far more than the 8 KB that task has, and the overflow
+// shows up as
+//   assert failed: xQueueSemaphoreTake queue.c:1554
+//   Backtrace: ... |<-CORRUPTED
+// (a corrupted backtrace is the classic stack-overflow signature). Give it a
+// dedicated 16 KB stack instead.
+static void otaPullTask(void *)
+{
+    vTaskDelay(pdMS_TO_TICKS(15000));       // let WiFi settle first
+    for (;;) {
+        otaCheckNow(false);
+        vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_INTERVAL_MS));
+    }
+}
+
 inline void otaBegin()
 {
     if (!cfg.ota_enabled || !net.wifi_up) return;
@@ -245,13 +261,11 @@ inline void otaBegin()
     otaRegister();
     g_ota.begin(cfg.ota_port);
     xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(otaPullTask, "otapull", 16384, nullptr, 1, nullptr, 1);
     started = true;
-    Serial.printf("[ota] push updater on http://%s:%u/update (key required)\n",
+    Serial.printf("[ota] updater on http://%s:%u/update (key required)\n",
                   WiFi.localIP().toString().c_str(), (unsigned)cfg.ota_port);
-    otaCheckNow(true);        // look for a new image right after connecting
 }
 
-inline void otaLoop()
-{
-    otaCheckNow(false);       // periodic pull check
-}
+// Kept for compatibility with the main loop; the tasks do the real work.
+inline void otaLoop() { }

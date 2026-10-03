@@ -1539,13 +1539,17 @@ async function renderDevices() {
         <div class="meta">${rssi} · fw ${esc(d.fw || '?')}</div>
       </div>
       <div class="spacer"></div>
-      <button data-ota="${esc(d.id)}" title="Push firmware to this device">OTA</button>
+      <button data-ota="${esc(d.id)}" title="Queue a firmware update for this device">${o.pending ? '⏳ Update queued' : '⬆ Update'}</button>
+      ${o.pending ? `<button data-cancel="${esc(d.id)}" title="Cancel the queued update">✕</button>` : ''}
       <button data-key="${esc(d.id)}" title="Show / rotate the OTA key">🔑</button>
     </div>`;
   }).join('');
 
   host.querySelectorAll('[data-ota]').forEach((b) => {
     b.onclick = () => pushOta(b.dataset.ota);
+  });
+  host.querySelectorAll('[data-cancel]').forEach((b) => {
+    b.onclick = () => cancelOta(b.dataset.cancel);
   });
   host.querySelectorAll('[data-key]').forEach((b) => {
     b.onclick = async () => {
@@ -1598,22 +1602,35 @@ async function loadOta() {
 async function pushOta(deviceId) {
   const name = $('ota-file')?.value;
   if (!name) { toast('No firmware image on the server.'); return; }
-  const who = deviceId === 'all' ? 'ALL online devices' : deviceId;
-  if (!confirm(`Push ${name} to ${who}?\n\nThe device reboots when the update finishes.`)) return;
+  const who = deviceId === 'all' ? 'ALL devices' : deviceId;
+  if (!confirm(`Queue ${name} for ${who}?\n\nThe device installs it on its next check (within ~1 min) and reboots. Nothing is downloaded until you confirm.`)) return;
 
-  $('ota-result').textContent = `Uploading ${name} to ${who}…`;
-  Audio2.update();
+  $('ota-result').textContent = `Queuing ${name} for ${who}…`;
   try {
-    const r = await (await fetch('/api/v1/ota/push', {
+    const r = await (await fetch('/api/v1/ota/request', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ device_id: deviceId, firmware: name }) })).json();
-    const lines = Object.entries(r.results || {}).map(([k, v]) => `${k}: ${v}`);
-    $('ota-result').innerHTML = lines.map(esc).join('<br>');
-    toast(r.ok ? 'Update pushed.' : 'Update failed — see the result panel.');
+    $('ota-result').innerHTML = r.ok
+      ? `Queued for: ${(r.queued || []).join(', ')} — the device will pull it on its next check.`
+      : `Failed: ${esc(r.error || 'unknown')}`;
+    toast(r.ok ? 'Update queued — device pulls it within a minute.' : 'Queue failed.');
+    Audio2.update();
+    if (r.ok) setTimeout(renderDevices, 500);
   } catch (e) {
-    $('ota-result').textContent = 'Push failed: ' + e;
-    toast('Update failed.');
+    $('ota-result').textContent = 'Request failed: ' + e;
+    toast('Request failed.');
   }
+}
+
+// Cancel a queued update.
+async function cancelOta(deviceId) {
+  try {
+    await fetch('/api/v1/ota/request', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId, cancel: true }) });
+    toast(`Cancelled the queued update for ${deviceId}`);
+    renderDevices();
+  } catch (e) { toast('Cancel failed'); }
 }
 
 /* ==========================================================================

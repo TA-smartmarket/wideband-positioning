@@ -289,8 +289,15 @@ void uplinkTask(void *)
 }
 
 // Queue a batch for the uplink task. Never blocks the ranging loop.
+//
+// The mutex may not exist yet during early boot, and taking a FreeRTOS
+// semaphore before the scheduler is running trips
+//   assert failed: xQueueSemaphoreTake queue.c:1554
+// so bail out instead of crashing.
 void queueRest(const String &body)
 {
+    if (pending_lock == nullptr) return;
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) return;
     if (xSemaphoreTake(pending_lock, 0) == pdTRUE) {
         pending_json = body;
         pending_rest = true;

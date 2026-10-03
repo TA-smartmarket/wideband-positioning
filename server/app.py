@@ -72,6 +72,11 @@ OTA_DIR = os.path.join(os.path.dirname(__file__), "firmware")
 
 
 OTA_TOKENS = {}       # device_id -> token (persisted, see ota_tokens_path)
+# Manual updates: an update is queued per device and only handed out once the
+# operator requests it. Without this the device would pull the newest image on
+# every check (observed: 103 downloads of the same file), which wears the flash
+# for no reason.
+OTA_PENDING = {}      # device_id -> {"firmware": name, "requested": ts}
 OTA_TOKENS_PATH = os.path.join(os.path.dirname(__file__), "ota_tokens.json")
 
 
@@ -994,17 +999,71 @@ def api_ota_check():
     if not fw:
         return jsonify({"ok": True, "update": False, "reason": "no image on server"})
 
-    newest = fw[0]
-    # version is encoded in the file name: uwb-node-1.0.5.bin -> 1.0.5
-    ver = newest["name"].rsplit("-", 1)[-1].replace(".bin", "")
+    # MANUAL MODE: an update is served only when one has been requested for
+    # this device (POST /api/v1/ota/request). Checking is cheap and happens
+    # every minute, but downloading must never happen on its own.
+    with LOCK:
+        pending = OTA_PENDING.get(dev)
+    if not pending:
+        return jsonify({"ok": True, "update": False, "reason": "no update requested",
+                        "current": cur})
+
+    name = pending["firmware"]
+    path = os.path.join(OTA_DIR, name)
+    if not os.path.isfile(path):
+        with LOCK:
+            OTA_PENDING.pop(dev, None)
+        return jsonify({"ok": True, "update": False, "reason": "image missing"})
+
+    ver = name.rsplit("-", 1)[-1].replace(".bin", "")
     if cur and cur == ver:
-        return jsonify({"ok": True, "update": False, "version": ver})
+        # already running it: clear the request so we stop offering it
+        with LOCK:
+            OTA_PENDING.pop(dev, None)
+        return jsonify({"ok": True, "update": False, "version": ver,
+                        "reason": "already installed"})
 
     base = request.host_url.rstrip("/")
     return jsonify({"ok": True, "update": True, "version": ver,
-                    "size": newest["size"],
-                    "url": f"{base}/api/v1/ota/firmware/{newest['name']}",
+                    "size": os.path.getsize(path),
+                    "url": f"{base}/api/v1/ota/firmware/{name}",
                     "current": cur})
+
+
+@APP.route("/api/v1/ota/request", methods=["POST"])
+def api_ota_request():
+    """Queue an update for one device (or all). The device installs it on its
+    next check — nothing is downloaded until this is called.
+
+    body: {"device_id": "anchor-2", "firmware": "uwb-node-1.0.7.bin"}
+          {"device_id": "all",      "firmware": "..."}
+          {"device_id": "anchor-2", "cancel": true}
+    """
+    body = request.get_json(silent=True) or {}
+    target = body.get("device_id", "all")
+    cancel = bool(body.get("cancel"))
+
+    with LOCK:
+        targets = [dk for dk, dc in DEVICES.items()
+                   if dk != "_room" and dc.get("role") in ("tag", "anchor")
+                   and (target == "all" or dk == target)]
+        if not targets:
+            return jsonify({"ok": False, "error": "no matching device"}), 404
+        if cancel:
+            for dk in targets:
+                OTA_PENDING.pop(dk, None)
+            return jsonify({"ok": True, "cancelled": targets})
+
+        name = body.get("firmware")
+        if not name or "/" in name or "\\" in name:
+            return jsonify({"ok": False, "error": "bad firmware name"}), 400
+        if not os.path.isfile(os.path.join(OTA_DIR, name)):
+            return jsonify({"ok": False, "error": f"firmware not found: {name}"}), 404
+        for dk in targets:
+            OTA_PENDING[dk] = {"firmware": name, "requested": now_ms()}
+
+    print(f"[ota] update queued for {targets}: {name}")
+    return jsonify({"ok": True, "queued": targets, "firmware": name})
 
 
 @APP.route("/api/v1/ota/firmware/<path:name>", methods=["GET"])
@@ -1027,6 +1086,8 @@ def api_ota_ack():
     if not dev or not key or key != ota_token(dev):
         return jsonify({"ok": False, "error": "bad key"}), 401
     ok = bool(body.get("ok"))
+    with LOCK:
+        OTA_PENDING.pop(dev, None)     # one shot: never serve it twice
     print(f"[ota] {dev} reported {'success' if ok else 'failure'} "
           f"{body.get('version','')} {body.get('error','')}")
     return jsonify({"ok": True})
@@ -1056,7 +1117,8 @@ def api_ota_list():
             devs.append({"id": dk, "role": dc.get("role"),
                          "online": now_ms() - dc.get("last_seen", 0) < 5000,
                          "ip": st.get("ip"), "fw": st.get("fw"),
-                         "key": ota_token(dk), "port": OTA_PORT})
+                         "key": ota_token(dk), "port": OTA_PORT,
+                         "pending": (OTA_PENDING.get(dk) or {}).get("firmware")})
     return jsonify({"ok": True, "devices": devs, "firmware": firmwares,
                     "port": OTA_PORT})
 
