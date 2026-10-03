@@ -103,6 +103,20 @@ def _save_ota_tokens():
         print(f"[ota] could not save keys: {e}")
 
 
+def version_tuple(v):
+    """'1.0.10' -> (1, 0, 10). Non-numeric parts are ignored."""
+    out = []
+    for part in str(v or "").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out) or (0,)
+
+
+def version_newer(candidate, current):
+    """True only when `candidate` is strictly newer than `current`."""
+    return version_tuple(candidate) > version_tuple(current)
+
+
 def ota_token(device_id, regenerate=False):
     with LOCK:
         if regenerate or device_id not in OTA_TOKENS:
@@ -1016,12 +1030,16 @@ def api_ota_check():
         return jsonify({"ok": True, "update": False, "reason": "image missing"})
 
     ver = name.rsplit("-", 1)[-1].replace(".bin", "")
-    if cur and cur == ver:
-        # already running it: clear the request so we stop offering it
+    # Only ever move FORWARD. A queued request for an older image (e.g. queued
+    # while the device still ran that version, then the device was flashed by
+    # hand) must not downgrade the node: 1.0.8 would have been replaced by
+    # 1.0.7 here. Clear the stale request instead.
+    if cur and not version_newer(ver, cur):
         with LOCK:
             OTA_PENDING.pop(dev, None)
         return jsonify({"ok": True, "update": False, "version": ver,
-                        "reason": "already installed"})
+                        "reason": "already installed" if cur == ver else "not newer",
+                        "current": cur})
 
     base = request.host_url.rstrip("/")
     return jsonify({"ok": True, "update": True, "version": ver,
@@ -1059,11 +1077,21 @@ def api_ota_request():
             return jsonify({"ok": False, "error": "bad firmware name"}), 400
         if not os.path.isfile(os.path.join(OTA_DIR, name)):
             return jsonify({"ok": False, "error": f"firmware not found: {name}"}), 404
+        ver = name.rsplit("-", 1)[-1].replace(".bin", "")
+        skipped = []
         for dk in targets:
+            cur = (STATUS.get(dk, {}) or {}).get("fw") or ""
+            if cur and not version_newer(ver, cur):
+                skipped.append(f"{dk} (runs {cur})")
+                continue
             OTA_PENDING[dk] = {"firmware": name, "requested": now_ms()}
+        if skipped and len(skipped) == len(targets):
+            return jsonify({"ok": False, "firmware": name,
+                            "error": f"not newer than the device firmware: {', '.join(skipped)}"}), 409
 
     print(f"[ota] update queued for {targets}: {name}")
-    return jsonify({"ok": True, "queued": targets, "firmware": name})
+    return jsonify({"ok": True, "queued": targets, "firmware": name,
+                    "skipped": skipped})
 
 
 @APP.route("/api/v1/ota/firmware/<path:name>", methods=["GET"])

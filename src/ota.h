@@ -238,17 +238,26 @@ static void otaTask(void *)
 }
 
 // The pull check + download MUST NOT run in the Arduino loop task: HTTPUpdate
-// plus HTTPClient need far more than the 8 KB that task has, and the overflow
+// pulls in HTTPClient, TLS glue and several String buffers, far more than the
+// 8 KB that task has. Overflowing it does NOT print "stack overflow" — it
 // shows up as
 //   assert failed: xQueueSemaphoreTake queue.c:1554
 //   Backtrace: ... |<-CORRUPTED
-// (a corrupted backtrace is the classic stack-overflow signature). Give it a
-// dedicated 16 KB stack instead.
+// and 16 KB was still not enough. The task now runs with 32 KB and reports its
+// remaining stack once, so the margin is measured rather than assumed.
+#define OTA_PULL_STACK 32768
+
 static void otaPullTask(void *)
 {
     vTaskDelay(pdMS_TO_TICKS(15000));       // let WiFi settle first
+    bool reported = false;
     for (;;) {
         otaCheckNow(false);
+        if (!reported) {
+            reported = true;
+            Serial.printf("[ota] pull task stack headroom: %u bytes free\n",
+                          (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+        }
         vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_INTERVAL_MS));
     }
 }
@@ -261,7 +270,7 @@ inline void otaBegin()
     otaRegister();
     g_ota.begin(cfg.ota_port);
     xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 2, nullptr, 0);
-    xTaskCreatePinnedToCore(otaPullTask, "otapull", 16384, nullptr, 1, nullptr, 1);
+    xTaskCreatePinnedToCore(otaPullTask, "otapull", OTA_PULL_STACK, nullptr, 1, nullptr, 1);
     started = true;
     Serial.printf("[ota] updater on http://%s:%u/update (key required)\n",
                   WiFi.localIP().toString().c_str(), (unsigned)cfg.ota_port);
