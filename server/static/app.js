@@ -29,8 +29,11 @@ const COL = {
 /* ------------------------------------------------------------------ three */
 let renderer, scene3, camera, controls, raycaster;
 let roomGroup, anchorGroup, obstacleGroup, tagGroup, linkGroup, trailGroup;
+let keyLight = null;
 let pickables = [];
 const tagMeshes = {};
+const anchorObjs = {};     // anchor id -> Group (moved directly while dragging)
+const obstacleObjs = {};   // obstacle id -> Group (moved/resized while dragging)
 let ghost = null;
 
 function initThree() {
@@ -43,17 +46,19 @@ function initThree() {
 
   scene3 = new THREE.Scene();
   scene3.background = new THREE.Color(0x0b0e1a);
-  scene3.fog = new THREE.Fog(0x0b0e1a, 14, 40);
+  // Fog is ADAPTIVE (see updateFog): a static far plane made the whole room
+  // disappear as soon as the user zoomed out past it.
+  scene3.fog = new THREE.Fog(0x0b0e1a, 30, 120);
 
-  camera = new THREE.PerspectiveCamera(50, 1, 0.05, 200);
+  camera = new THREE.PerspectiveCamera(50, 1, 0.05, 400);
   camera.position.set(6, 7, 8);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.maxPolarAngle = Math.PI * 0.495;   // never below the floor
-  controls.minDistance = 1.5;
-  controls.maxDistance = 40;
+  controls.minDistance = 0.6;
+  controls.maxDistance = 120;                 // generous: the room can be large
   controls.target.set(2.5, 1, 2);
 
   // lights
@@ -64,6 +69,7 @@ function initThree() {
   key.shadow.mapSize.set(2048, 2048);
   key.shadow.camera.left = -14; key.shadow.camera.right = 14;
   key.shadow.camera.top = 14; key.shadow.camera.bottom = -14;
+  keyLight = key;
   scene3.add(key);
 
   roomGroup = new THREE.Group();
@@ -76,6 +82,8 @@ function initThree() {
 
   raycaster = new THREE.Raycaster();
   addEventListener('resize', resize);
+  bindContextLoss();
+  if (window.ResizeObserver) new ResizeObserver(resize).observe($('viewport'));
   resize();
   bindPointer();
   animate();
@@ -83,21 +91,57 @@ function initThree() {
 
 function resize() {
   const host = $('viewport');
-  const w = host.clientWidth, h = host.clientHeight;
+  const w = Math.max(host.clientWidth, 1), h = Math.max(host.clientHeight, 1);
   renderer.setSize(w, h, false);
-  camera.aspect = w / Math.max(h, 1);
+  renderer.domElement.style.width = '100%';
+  renderer.domElement.style.height = '100%';
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
+}
+
+// If the GPU context is lost (driver reset, too many contexts) show a clear
+// message instead of a silent black viewport, and recover on restore.
+function bindContextLoss() {
+  const canvas = renderer.domElement;
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    toast('Graphics context lost — reloading the view…');
+    setTimeout(() => location.reload(), 1200);
+  });
 }
 
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  updateFog();
   renderer.render(scene3, camera);
+}
+
+// Keep the fog relative to the room and the camera distance so zooming out
+// never swallows the scene, and zooming in never washes it out.
+function updateFog() {
+  if (!scene3.fog) return;
+  const { width: W, depth: D } = S.scene.room;
+  const span = Math.max(W, D, 1);
+  const dist = camera.position.distanceTo(controls.target);
+  const near = Math.max(span * 0.9, dist * 0.9);
+  const far = Math.max(near + span * 2.5, dist * 3.2);
+  scene3.fog.near = near;
+  scene3.fog.far = far;
+  // shadow camera follows the room size so big rooms stay lit correctly
+  if (keyLight) {
+    const half = Math.max(span, dist) * 0.75 + 2;
+    keyLight.shadow.camera.left = -half;
+    keyLight.shadow.camera.right = half;
+    keyLight.shadow.camera.top = half;
+    keyLight.shadow.camera.bottom = -half;
+    keyLight.shadow.camera.updateProjectionMatrix();
+  }
 }
 
 /* ------------------------------------------------------------ room shell */
 function buildRoom() {
-  while (roomGroup.children.length) roomGroup.remove(roomGroup.children[0]);
+  clearGroup(roomGroup);
   const { width: W, depth: D, height: H } = S.scene.room;
 
   // floor
@@ -162,7 +206,8 @@ function label(text, pos, color = 0xffffff, size = 0.16) {
 
 /* --------------------------------------------------------------- anchors */
 function buildAnchors() {
-  while (anchorGroup.children.length) anchorGroup.remove(anchorGroup.children[0]);
+  clearGroup(anchorGroup);
+  for (const k of Object.keys(anchorObjs)) delete anchorObjs[k];
   for (const a of S.scene.anchors) {
     const live = S.state.anchors.find((x) => x.id === a.id);
     const online = live ? live.online : false;
@@ -207,13 +252,15 @@ function buildAnchors() {
 
     g.add(label(a.label || a.id, new THREE.Vector3(0, a.z + 0.32, 0),
                 online ? 0x9ff5cf : 0x93a4c8, 0.13));
+    anchorObjs[a.id] = g;
     anchorGroup.add(g);
   }
 }
 
 /* ------------------------------------------------------------- obstacles */
 function buildObstacles() {
-  while (obstacleGroup.children.length) obstacleGroup.remove(obstacleGroup.children[0]);
+  clearGroup(obstacleGroup);
+  for (const k of Object.keys(obstacleObjs)) delete obstacleObjs[k];
   for (const ob of S.scene.obstacles) {
     const g = new THREE.Group();
     g.position.set(ob.x, ob.z, ob.y);
@@ -261,6 +308,7 @@ function buildObstacles() {
       g.add(up);
     }
 
+    obstacleObjs[ob.id] = g;
     obstacleGroup.add(g);
   }
 }
@@ -319,21 +367,50 @@ function buildTags() {
   buildTrail();
 }
 
+// The trail is updated IN PLACE: rebuilding the Line objects every poll
+// (500 ms) allocated two geometries per second per tag for no reason.
+const trailLines = {};
+
 function buildTrail() {
-  while (trailGroup.children.length) trailGroup.remove(trailGroup.children[0]);
-  if (!S.showTrail) return;
+  if (!S.showTrail) {
+    for (const id of Object.keys(trailLines)) {
+      const l = trailLines[id];
+      trailGroup.remove(l);
+      disposeSubtree(l);
+      delete trailLines[id];
+    }
+    return;
+  }
+
   for (const id of Object.keys(S.trail)) {
     const pts = S.trail[id];
     if (pts.length < 2) continue;
-    const geo = new THREE.BufferGeometry().setFromPoints(
-      pts.map(([x, y]) => new THREE.Vector3(x, 0.9, y)));
-    trailGroup.add(new THREE.Line(geo, new THREE.LineBasicMaterial({
-      color: COL.tag, transparent: true, opacity: 0.55 })));
+
+    let line = trailLines[id];
+    if (!line) {
+      line = new THREE.Line(
+        new THREE.BufferGeometry(),
+        new THREE.LineBasicMaterial({ color: COL.tag, transparent: true, opacity: 0.55 }));
+      line.frustumCulled = false;
+      trailLines[id] = line;
+      trailGroup.add(line);
+    }
+
+    const pos = new Float32Array(pts.length * 3);
+    for (let i = 0; i < pts.length; i++) {
+      pos[i * 3] = pts[i][0];
+      pos[i * 3 + 1] = 0.9;
+      pos[i * 3 + 2] = pts[i][1];
+    }
+    line.geometry.dispose();
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    line.geometry = g;
   }
 }
 
 function buildLinks() {
-  while (linkGroup.children.length) linkGroup.remove(linkGroup.children[0]);
+  clearGroup(linkGroup);
   for (const t of S.state.tags) {
     for (const [aid, info] of Object.entries(t.links || {})) {
       const a = S.scene.anchors.find((x) => x.id === aid);
@@ -355,7 +432,78 @@ function buildLinks() {
   }
 }
 
+// Resize an obstacle's mesh in place (used while dragging its handles).
+function resizeObstacleMesh(o) {
+  const g = obstacleObjs[o.id];
+  if (!g) return;
+  g.position.set(o.x, o.z, o.y);
+  g.rotation.y = -THREE.MathUtils.degToRad(o.rot || 0);
+  const box = g.children[0];
+  const edges = g.children[1];
+  if (box) {
+    box.geometry.dispose();
+    box.geometry = new THREE.BoxGeometry(o.sx, o.sz, o.sy);
+  }
+  if (edges) {
+    edges.geometry.dispose();
+    edges.geometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(o.sx, o.sz, o.sy));
+  }
+  // reposition the corner handles / height cone
+  const handles = g.children.slice(2);
+  let hi = 0;
+  for (const c of handles) {
+    if (c.userData.pick === 'obstacleHandle') {
+      const [dx, dz] = [[-1, -1], [1, -1], [1, 1], [-1, 1]][hi++] || [0, 0];
+      c.position.set(dx * o.sx / 2, 0, dz * o.sy / 2);
+    } else if (c.userData.pick === 'obstacleHeight') {
+      c.position.set(0, o.sz / 2 + 0.14, 0);
+    }
+  }
+}
+
+// Update the inspector numbers live while dragging (no DOM rebuild).
+function liveReadout() {
+  if (!S.selected) return;
+  if (S.selected.type === 'anchor') {
+    const a = S.scene.anchors.find((x) => x.id === S.selected.id);
+    if (a && $('i-x') && $('i-y')) {
+      $('i-x').value = a.x.toFixed(2);
+      $('i-y').value = a.y.toFixed(2);
+    }
+  } else if (S.selected.type === 'obstacle') {
+    const o = S.scene.obstacles.find((x) => x.id === S.selected.id);
+    if (!o) return;
+    for (const [id, v] of [['o-x', o.x], ['o-y', o.y], ['o-sx', o.sx],
+                           ['o-sy', o.sy], ['o-sz', o.sz]]) {
+      if ($(id)) $(id).value = v.toFixed(2);
+    }
+  }
+}
+
 /* ------------------------------------------------------- scene → rebuild */
+
+// Free GPU resources before dropping a subtree. Without this, every rebuild
+// leaked geometries, materials and CanvasTextures; after a few minutes of
+// dragging the WebGL context was lost and the viewport went black.
+function disposeSubtree(node) {
+  node.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    const mats = Array.isArray(o.material) ? o.material : (o.material ? [o.material] : []);
+    for (const m of mats) {
+      if (m.map) m.map.dispose();
+      m.dispose();
+    }
+  });
+}
+
+function clearGroup(g) {
+  while (g.children.length) {
+    const c = g.children[0];
+    g.remove(c);
+    disposeSubtree(c);
+  }
+}
+
 function rebuildAll() {
   buildRoom();
   buildAnchors();
@@ -424,23 +572,27 @@ function bindPointer() {
     if (!gp) return;
     const dx = gp.x - S.drag.startX, dz = gp.z - S.drag.startZ;
 
+    // Move the existing three.js object directly. A full rebuildAll() on every
+    // pointermove recreated every mesh, sprite and texture — that is what made
+    // dragging stutter and eventually killed the WebGL context. The scene is
+    // rebuilt once on pointerup instead.
     if (S.drag.type === 'anchor') {
       const a = S.scene.anchors.find((x) => x.id === S.drag.id);
       if (a) {
         a.x = clamp(S.drag.orig.x + dx, 0, S.scene.room.width);
         a.y = clamp(S.drag.orig.y + dz, 0, S.scene.room.depth);
+        const g = anchorObjs[a.id];
+        if (g) g.position.set(a.x, a.z, a.y);
         S.dirty = true;
-        rebuildAll();
-        if (S.selected) showSelection();
       }
     } else if (S.drag.type === 'obstacle') {
       const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
       if (o) {
         o.x = S.drag.orig.x + dx;
         o.y = S.drag.orig.y + dz;
+        const g = obstacleObjs[o.id];
+        if (g) g.position.set(o.x, o.z, o.y);
         S.dirty = true;
-        rebuildAll();
-        if (S.selected) showSelection();
       }
     } else if (S.drag.type === 'obstacleHandle') {
       const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
@@ -452,24 +604,29 @@ function bindPointer() {
         o.sx = Math.max(0.2, S.drag.orig.sx + cx * lx * 2);
         o.sy = Math.max(0.2, S.drag.orig.sy + cz * lz * 2);
         S.dirty = true;
-        rebuildAll();
-        showSelection();
+        resizeObstacleMesh(o);
       }
     } else if (S.drag.type === 'obstacleHeight') {
       const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
       if (o) {
         o.sz = Math.max(0.2, S.drag.orig.sz - (ev.movementY || 0) * 0.01);
         S.dirty = true;
-        rebuildAll();
-        showSelection();
+        resizeObstacleMesh(o);
       }
     }
+    liveReadout();
   });
 
   el.addEventListener('pointerup', (ev) => {
     const quick = downAt && Math.hypot(ev.clientX - downAt.x, ev.clientY - downAt.y) < 4
                   && performance.now() - downAt.t < 400;
-    if (S.drag) { S.drag = null; controls.enabled = true; return; }
+    if (S.drag) {
+      S.drag = null;
+      controls.enabled = true;
+      rebuildAll();          // one rebuild after the drag, not per pointermove
+      if (S.selected) showSelection();
+      return;
+    }
     if (!quick) { downAt = null; return; }
 
     // placing mode wins over picking: the floor is a valid click target
@@ -553,7 +710,10 @@ function removeSelected() {
 
 function select(type, id) {
   S.selected = type ? { type, id } : null;
-  rebuildAll();
+  // Only the anchor/obstacle groups render selection visuals, so avoid a full
+  // rebuild (which would also recreate the tag meshes and the trail).
+  buildAnchors();
+  buildObstacles();
   showSelection();
 }
 
@@ -688,6 +848,7 @@ async function poll() {
     if (!S.drag) { buildTags(); buildLinks(); }
     updateHud();
     if (S.selected?.type === 'tag') showSelection();
+    updateFog();
   } catch (e) { /* server restarting */ }
 }
 
