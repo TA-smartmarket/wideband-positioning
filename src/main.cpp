@@ -35,6 +35,7 @@ PubSubClient g_mqtt(g_wifi_client);
 WebServer    g_portal(80);
 WebServer    g_ota(3232);
 bool         ota_busy = false;   // set while an OTA download is running
+char         eui_buf[40] = {0};  // this node's EUI, for restarting the radio
 
 
 // ---------------------------------------------------------------------------
@@ -353,6 +354,36 @@ AnchorFix fixes[MAX_ANCHORS];
 // Display power saving (defined with drawUi(); used from the ranging callback)
 void screenWake();
 void screenPowerLoop();
+
+// ---------------------------------------------------------------------------
+// Radio quiesce for OTA.
+//
+// The DW1000 asserts its IRQ line (GPIO34) whenever it has a frame or a
+// timestamp ready. In anchor role the node sits in receive mode permanently,
+// so that interrupt fires constantly; in tag role it fires only around a poll.
+// The library installs the handler WITHOUT IRAM_ATTR, so while a flash write
+// has the instruction cache disabled an interrupt jumps into unmapped code and
+// the crash surfaces as 'Backtrace: ... |<-CORRUPTED'.
+//
+// That is why the tag updated fine over the air while both anchors kept dying
+// at exactly the same point. Detaching the interrupt for the duration of the
+// update removes the trigger.
+// ---------------------------------------------------------------------------
+void otaQuiesceRadio()
+{
+    detachInterrupt(digitalPinToInterrupt(UWB_IRQ));
+    DW1000.idle();
+    Serial.println(F("[ota] radio quiesced (IRQ detached)"));
+}
+
+void otaRestoreRadio()
+{
+    if (cfg.role == ROLE_TAG)
+        DW1000Ranging.startAsTag(eui_buf, uwbModeBytes(cfg.uwb_mode), false);
+    else
+        DW1000Ranging.startAsAnchor(eui_buf, uwbModeBytes(cfg.uwb_mode), false);
+    Serial.println(F("[ota] radio restarted"));
+}
 
 // ---------------------------------------------------------------------------
 // Localisation: bootstrap with the geometric solver, then track with the EKF.
@@ -1115,6 +1146,7 @@ void setup()
 
     char eui[40];
     deviceEui(cfg, eui, sizeof(eui));
+    snprintf(eui_buf, sizeof(eui_buf), "%s", eui);
     Serial.printf("role %s id %u  eui %s\n", roleName(cfg.role), (unsigned)cfg.id, eui);
 
     SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);

@@ -42,6 +42,13 @@
 extern WebServer g_ota;   // defined in main.cpp
 extern bool ota_busy;     // set while an OTA download is in progress
 
+// Defined in main.cpp. The DW1000 IRQ handler is not in IRAM, so an interrupt
+// arriving while a flash write has the instruction cache disabled jumps into
+// unmapped code and corrupts the backtrace. Anchors sit in permanent receive
+// mode, which is why they crashed where the tag did not.
+void otaQuiesceRadio();
+void otaRestoreRadio();
+
 // upload state (single upload at a time)
 static bool ota_rejected = false;
 static bool ota_ok = false;
@@ -77,11 +84,17 @@ inline void otaUploadStart()
         Serial.printf("[ota] push: receiving %s (%u bytes)\n",
                       up.filename.c_str(), (unsigned)up.totalSize);
 
+        // Stop the radio before the first flash erase. The upload handler runs
+        // on the same core as the DW1000 IRQ, so an interrupt during a flash
+        // write is what corrupted the backtrace.
+        otaQuiesceRadio();
+
         const size_t clen = g_ota.clientContentLength();
         size_t target = (clen > 1024) ? clen : up.totalSize;
         if (!Update.begin(target > 1024 ? target : UPDATE_SIZE_UNKNOWN)) {
             Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
             ota_rejected = true;
+            otaRestoreRadio();
         }
     } else if (up.status == UPLOAD_FILE_WRITE) {
         if (ota_rejected) return;
@@ -98,10 +111,12 @@ inline void otaUploadStart()
         } else {
             Serial.printf("[ota] Update.end failed: %s\n", Update.errorString());
             ota_rejected = true;
+            otaRestoreRadio();
         }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
         ota_rejected = true;
+        otaRestoreRadio();
         Serial.println(F("[ota] push aborted"));
     }
 }
@@ -188,6 +203,9 @@ inline void otaCheckNow(bool force = false)
             // itself (see uplinkTask / loop), which needs no scheduler tricks.
             ota_busy = true;
             vTaskDelay(pdMS_TO_TICKS(1500));   // let the others notice and drain
+            // Stop the radio before the download: see otaQuiesceRadio() in
+            // main.cpp for why an anchor could not finish an update.
+            otaQuiesceRadio();
             Serial.printf("[ota] stack before download: %u bytes free\n",
                           (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
@@ -198,6 +216,7 @@ inline void otaCheckNow(bool force = false)
             HTTPClient dlHttp;
             if (!dlHttp.begin(dl)) {
                 Serial.println(F("[ota] cannot open the download URL"));
+                otaRestoreRadio();
                 ota_busy = false;
                 otaReport(false, "begin failed");
                 return;
@@ -209,6 +228,7 @@ inline void otaCheckNow(bool force = false)
             if (code2 != 200 || len <= 0) {
                 Serial.println(F("[ota] download refused"));
                 dlHttp.end();
+                otaRestoreRadio();
                 ota_busy = false;
                 otaReport(false, "http error");
                 return;
@@ -217,6 +237,7 @@ inline void otaCheckNow(bool force = false)
             if (!Update.begin((size_t)len)) {
                 Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
                 dlHttp.end();
+                otaRestoreRadio();
                 ota_busy = false;
                 otaReport(false, Update.errorString());
                 return;
@@ -233,6 +254,7 @@ inline void otaCheckNow(bool force = false)
             if (!mem) {
                 Serial.println(F("[ota] out of memory for the buffer"));
                 dlHttp.end();
+                otaRestoreRadio();
                 ota_busy = false;
                 otaReport(false, "no memory");
                 return;
@@ -276,6 +298,7 @@ inline void otaCheckNow(bool force = false)
             } else {
                 Serial.printf("[ota] FAILED: %s\n", Update.errorString());
                 Update.abort();
+                otaRestoreRadio();
                 ota_busy = false;
                 otaReport(false, Update.errorString());
             }

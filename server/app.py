@@ -117,6 +117,24 @@ def version_newer(candidate, current):
     return version_tuple(candidate) > version_tuple(current)
 
 
+def device_fw_version(ip, timeout=5):
+    """Read the version a device reports about itself (ground truth).
+
+    The server's own STATUS entry is whatever the node last published, which
+    goes stale the moment it reboots into a new image, so it cannot be used to
+    confirm an update. The node's web page always shows the running version.
+    """
+    import re
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{ip}:{OTA_PORT}/", timeout=timeout) as r:
+            html = r.read().decode(errors="replace")
+    except Exception:
+        return None
+    m = re.search(r"firmware\s+(1\.0\.\d+)", html)
+    return m.group(1) if m else None
+
+
 def ota_token(device_id, regenerate=False):
     with LOCK:
         if regenerate or device_id not in OTA_TOKENS:
@@ -1217,17 +1235,39 @@ def api_ota_push():
             except urllib.error.HTTPError as he:
                 results[dk] = f"http {he.code}: {he.read().decode(errors='replace')[:80]}"
             except Exception as e2:
-                # A reset right at the end is normal: the node reboots as soon
-                # as the image is written. Report it as "sent" so the operator
-                # is not misled, and let the version check confirm it.
-                if "10054" in str(e2) or "forcibly closed" in str(e2).lower() or "reset" in str(e2).lower():
-                    results[dk] = "sent (device rebooted; verify with /api/v1/ota)"
-                else:
-                    results[dk] = f"failed: {e2}"
+                # The socket drops both when the node reboots after a good
+                # write AND when the write aborts, so the reset alone proves
+                # nothing. Confirm against the version the device reports
+                # about itself once it is back up.
+                results[dk] = f"connection dropped ({e2}); verifying..."
         except Exception as e:
             results[dk] = f"failed: {e}"
 
-    ok = any(str(v).startswith("200") or str(v).startswith("sent") for v in results.values())
+    # Verification pass: the node needs a few seconds to reboot, then its own
+    # page is the only trustworthy source for the running version.
+    wanted = version_tuple(name.split("-")[-1].replace(".bin", ""))
+    for dk in targets:
+        if not str(results.get(dk, "")).endswith("verifying..."):
+            continue
+        st = STATUS.get(dk, {})
+        ip = st.get("ip")
+        got = None
+        if ip:
+            for _ in range(12):
+                time.sleep(5)
+                got = device_fw_version(ip)
+                if got and version_tuple(got) >= wanted:
+                    break
+        if got and version_tuple(got) >= wanted:
+            results[dk] = f"installed {got}"
+        elif got:
+            results[dk] = (f"NOT installed: device is still {got} "
+                           f"(write aborted; see the serial log)")
+        else:
+            results[dk] = "unreachable after the push — could not verify"
+
+    ok = all(str(v).startswith("200") or str(v).startswith("installed")
+             for v in results.values())
     return jsonify({"ok": ok, "results": results, "firmware": name})
 
 
