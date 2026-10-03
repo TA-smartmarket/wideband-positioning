@@ -180,30 +180,87 @@ inline void otaCheckNow(bool force = false)
             // report ran after a cycle that had nothing to download, so it did
             // not reflect the download path at all.
             ota_busy = true;
-            vTaskDelay(pdMS_TO_TICKS(600));      // let other network work settle
+            // Let the other network tasks drain before flash writes start:
+            // writing disables the instruction cache and any task still
+            // running from flash on the other core faults (CORRUPTED
+            // backtrace). Everything network-related now lives on core 0.
+            vTaskDelay(pdMS_TO_TICKS(1200));
             Serial.printf("[ota] stack before download: %u bytes free\n",
                           (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
-            WiFiClient client;
-            t_httpUpdate_return r = httpUpdate.update(client, dl);
-            ota_busy = false;
-            switch (r) {
-            case HTTP_UPDATE_FAILED:
-                Serial.printf("[ota] pull failed: %s\n",
-                              httpUpdate.getLastErrorString().c_str());
-                otaReport(false, httpUpdate.getLastErrorString());
-                break;
-            case HTTP_UPDATE_NO_UPDATES:
-                Serial.println(F("[ota] no update"));
-                break;
-            case HTTP_UPDATE_OK:
-                Serial.println(F("[ota] pull complete — rebooting"));
+            // Manual, step-by-step download instead of httpUpdate.update():
+            // every phase is logged and the reboot is ours to make, so a
+            // failure names the exact step (the library's own backtraces came
+            // out corrupted and proved useless).
+            HTTPClient dlHttp;
+            if (!dlHttp.begin(dl)) {
+                Serial.println(F("[ota] cannot open the download URL"));
+                ota_busy = false;
+                otaReport(false, "begin failed");
+                return;
+            }
+            dlHttp.setTimeout(20000);
+            const int code2 = dlHttp.GET();
+            const int len = dlHttp.getSize();
+            Serial.printf("[ota] GET -> %d, size %d\n", code2, len);
+            if (code2 != 200 || len <= 0) {
+                Serial.println(F("[ota] download refused"));
+                dlHttp.end();
+                ota_busy = false;
+                otaReport(false, "http error");
+                return;
+            }
+
+            if (!Update.begin((size_t)len)) {
+                Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
+                dlHttp.end();
+                ota_busy = false;
+                otaReport(false, Update.errorString());
+                return;
+            }
+            Serial.printf("[ota] writing %d bytes\n", len);
+
+            WiFiClient *stream = dlHttp.getStreamPtr();
+            uint8_t buf[2048];
+            size_t written = 0;
+            uint32_t lastLog = 0;
+            while (written < (size_t)len) {
+                const size_t avail = stream->available();
+                if (avail) {
+                    const int n = stream->readBytes(buf, min(avail, sizeof(buf)));
+                    if (n > 0) {
+                        if (Update.write(buf, n) != (size_t)n) {
+                            Serial.printf("[ota] write failed at %u: %s\n",
+                                          (unsigned)written, Update.errorString());
+                            break;
+                        }
+                        written += n;
+                        if (written - lastLog >= 262144) {
+                            lastLog = written;
+                            Serial.printf("[ota] progress %u/%d\n",
+                                          (unsigned)written, len);
+                        }
+                    }
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+                if (!dlHttp.connected() && !avail) break;
+            }
+            dlHttp.end();
+
+            Serial.printf("[ota] downloaded %u/%d bytes\n", (unsigned)written, len);
+            if (written == (size_t)len && Update.end(true)) {
+                Serial.println(F("[ota] image written OK — rebooting"));
                 otaReport(true, "");
+                ota_busy = false;
                 delay(300);
                 ESP.restart();
-                break;
+            } else {
+                Serial.printf("[ota] FAILED: %s\n", Update.errorString());
+                Update.abort();
+                ota_busy = false;
+                otaReport(false, Update.errorString());
             }
-            return;
         }
     }
     http.end();
@@ -274,8 +331,8 @@ inline void otaBegin()
     if (started) return;
     otaRegister();
     g_ota.begin(cfg.ota_port);
-    xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 2, nullptr, 0);
-    xTaskCreatePinnedToCore(otaPullTask, "otapull", OTA_PULL_STACK, nullptr, 1, nullptr, 1);
+    xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(otaPullTask, "otapull", OTA_PULL_STACK, nullptr, 2, nullptr, 0);
     started = true;
     Serial.printf("[ota] updater on http://%s:%u/update (key required)\n",
                   WiFi.localIP().toString().c_str(), (unsigned)cfg.ota_port);
