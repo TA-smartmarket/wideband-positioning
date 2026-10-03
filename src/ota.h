@@ -42,6 +42,40 @@
 extern WebServer g_ota;   // defined in main.cpp
 extern bool ota_busy;     // set while an OTA download is in progress
 
+// Every background task we own, so the OTA can park all of them while it
+// writes flash. Suspending them is exactly the right move here: writing flash
+// disables the instruction cache, and any task that keeps running (and touches
+// the network or the filesystem) faults with a corrupted backtrace.
+#define OTA_MAX_TASKS 4
+extern TaskHandle_t ota_suspend_list[OTA_MAX_TASKS];
+extern int          ota_suspend_count;
+extern TaskHandle_t ota_self;          // the pull task (never suspends itself)
+
+static bool taskRegistered(TaskHandle_t h)
+{
+    for (int i = 0; i < ota_suspend_count; i++)
+        if (ota_suspend_list[i] == h) return true;
+    return false;
+}
+
+// Park every registered task except the caller.
+static void otaParkOthers()
+{
+    for (int i = 0; i < ota_suspend_count; i++) {
+        TaskHandle_t h = ota_suspend_list[i];
+        if (h && h != ota_self) vTaskSuspend(h);
+    }
+    vTaskDelay(pdMS_TO_TICKS(120));    // let them actually stop
+}
+
+static void otaResumeOthers()
+{
+    for (int i = 0; i < ota_suspend_count; i++) {
+        TaskHandle_t h = ota_suspend_list[i];
+        if (h && h != ota_self) vTaskResume(h);
+    }
+}
+
 // upload state (single upload at a time)
 static bool ota_rejected = false;
 static bool ota_ok = false;
@@ -180,6 +214,7 @@ inline void otaCheckNow(bool force = false)
             // report ran after a cycle that had nothing to download, so it did
             // not reflect the download path at all.
             ota_busy = true;
+            otaParkOthers();
             // Let the other network tasks drain before flash writes start:
             // writing disables the instruction cache and any task still
             // running from flash on the other core faults (CORRUPTED
@@ -196,6 +231,7 @@ inline void otaCheckNow(bool force = false)
             if (!dlHttp.begin(dl)) {
                 Serial.println(F("[ota] cannot open the download URL"));
                 ota_busy = false;
+                otaResumeOthers();
                 otaReport(false, "begin failed");
                 return;
             }
@@ -207,6 +243,7 @@ inline void otaCheckNow(bool force = false)
                 Serial.println(F("[ota] download refused"));
                 dlHttp.end();
                 ota_busy = false;
+                otaResumeOthers();
                 otaReport(false, "http error");
                 return;
             }
@@ -215,6 +252,7 @@ inline void otaCheckNow(bool force = false)
                 Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
                 dlHttp.end();
                 ota_busy = false;
+                otaResumeOthers();
                 otaReport(false, Update.errorString());
                 return;
             }
@@ -259,6 +297,7 @@ inline void otaCheckNow(bool force = false)
                 Serial.printf("[ota] FAILED: %s\n", Update.errorString());
                 Update.abort();
                 ota_busy = false;
+                otaResumeOthers();
                 otaReport(false, Update.errorString());
             }
         }
@@ -316,6 +355,7 @@ static void otaTask(void *)
 
 static void otaPullTask(void *)
 {
+    ota_self = xTaskGetCurrentTaskHandle();  // never suspend ourselves
     vTaskDelay(pdMS_TO_TICKS(15000));       // let WiFi settle first
     bool reported = false;
     for (;;) {

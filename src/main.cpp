@@ -36,6 +36,11 @@ WebServer    g_portal(80);
 WebServer    g_ota(3232);
 bool         ota_busy = false;   // set while an OTA download is running
 
+// Tasks the OTA parks while it writes flash (see otaParkOthers in src/ota.h).
+TaskHandle_t ota_suspend_list[OTA_MAX_TASKS] = {nullptr, nullptr, nullptr, nullptr};
+int          ota_suspend_count = 0;
+TaskHandle_t ota_self = nullptr;
+
 // ---------------------------------------------------------------------------
 // board pinout (fixed on the Makerfabs ESP32 UWB Pro with Display)
 // ---------------------------------------------------------------------------
@@ -1101,7 +1106,12 @@ void setup()
     // Uplink runs on its own task so an unreachable server can never stall
     // the ranging protocol (see uplinkTask()).
     pending_lock = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(uplinkTask, "uplink", 8192, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(uplinkTask, "uplink", 8192, nullptr, 1,
+                            &ota_suspend_list[ota_suspend_count++], 0);
+    // Park the Arduino loop task too: it drives ranging, telemetry and the
+    // serial menu, all of which would keep hammering the network during an
+    // OTA write.
+    ota_suspend_list[ota_suspend_count++] = xTaskGetCurrentTaskHandle();
 
     if (cfg.role == ROLE_NONE) {
         Serial.println(F("no role configured -> starting setup portal"));
