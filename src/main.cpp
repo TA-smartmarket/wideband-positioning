@@ -34,6 +34,7 @@ WiFiClient   g_wifi_client;
 PubSubClient g_mqtt(g_wifi_client);
 WebServer    g_portal(80);
 WebServer    g_ota(3232);
+bool         ota_busy = false;   // set while an OTA download is running
 
 // ---------------------------------------------------------------------------
 // board pinout (fixed on the Makerfabs ESP32 UWB Pro with Display)
@@ -283,7 +284,8 @@ void uplinkTask(void *)
             xSemaphoreGive(pending_lock);
         }
 
-        if (do_rest && net.wifi_up && cfg.server_url[0]) httpPostJson("/api/v1/telemetry", body);
+        if (do_rest && !ota_busy && net.wifi_up && cfg.server_url[0])
+            httpPostJson("/api/v1/telemetry", body);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -1145,6 +1147,10 @@ void loop()
     wifiLoop();
     otaBegin();
     otaLoop();
+    // While an image is being written, stay off the network stack from this
+    // task: concurrent TCP use during the flash write is what tripped
+    // 'assert failed: xQueueSemaphoreTake' inside lwIP.
+    if (ota_busy) { drawUi(); return; }
     mqttEnsureConnected();
     mqttLoop();
     syncConfigFromServer();

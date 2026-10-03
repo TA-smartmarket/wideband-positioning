@@ -40,6 +40,7 @@
 #include "net.h"
 
 extern WebServer g_ota;   // defined in main.cpp
+extern bool ota_busy;     // set while an OTA download is in progress
 
 // upload state (single upload at a time)
 static bool ota_rejected = false;
@@ -175,8 +176,17 @@ inline void otaCheckNow(bool force = false)
             Serial.printf("[ota] server offers %s — downloading\n", ver.c_str());
             http.end();
 
+            // Measure the free stack AT THE POINT OF USE: the earlier headroom
+            // report ran after a cycle that had nothing to download, so it did
+            // not reflect the download path at all.
+            ota_busy = true;
+            vTaskDelay(pdMS_TO_TICKS(600));      // let other network work settle
+            Serial.printf("[ota] stack before download: %u bytes free\n",
+                          (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+
             WiFiClient client;
             t_httpUpdate_return r = httpUpdate.update(client, dl);
+            ota_busy = false;
             switch (r) {
             case HTTP_UPDATE_FAILED:
                 Serial.printf("[ota] pull failed: %s\n",
@@ -232,7 +242,7 @@ inline void otaReport(bool ok, const String &msg)
 static void otaTask(void *)
 {
     for (;;) {
-        if (cfg.ota_enabled && net.wifi_up) g_ota.handleClient();
+        if (cfg.ota_enabled && net.wifi_up && !ota_busy) g_ota.handleClient();
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
@@ -245,7 +255,7 @@ static void otaTask(void *)
 //   Backtrace: ... |<-CORRUPTED
 // and 16 KB was still not enough. The task now runs with 32 KB and reports its
 // remaining stack once, so the margin is measured rather than assumed.
-#define OTA_PULL_STACK 32768
+#define OTA_PULL_STACK 49152
 
 static void otaPullTask(void *)
 {
@@ -253,11 +263,6 @@ static void otaPullTask(void *)
     bool reported = false;
     for (;;) {
         otaCheckNow(false);
-        if (!reported) {
-            reported = true;
-            Serial.printf("[ota] pull task stack headroom: %u bytes free\n",
-                          (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
-        }
         vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_INTERVAL_MS));
     }
 }
