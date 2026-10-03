@@ -791,8 +791,50 @@ void portalRegister()
 // ---------------------------------------------------------------------------
 // server-pushed config / commands (REST + MQTT both land here)
 // ---------------------------------------------------------------------------
+
+// FNV-1a over the serialized config. Used as a safety net: if the exact same
+// config arrives again after a reboot, we never reboot a second time. This
+// guards against any field that is pushed on every sync (the wifi SSID and the
+// OTA token both did exactly that, which caused an endless reboot loop).
+static uint32_t configHash(JsonObjectConst doc)
+{
+    String s;
+    serializeJson(doc, s);
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < s.length(); i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static uint32_t loadAppliedHash()
+{
+    Preferences p;
+    if (!p.begin("uwbcfg", true)) return 0;
+    uint32_t h = p.getUInt("cfghash", 0);
+    p.end();
+    return h;
+}
+
+static void storeAppliedHash(uint32_t h)
+{
+    Preferences p;
+    if (!p.begin("uwbcfg", false)) return;
+    p.putUInt("cfghash", h);
+    p.end();
+}
+
 void onServerConfig(JsonObjectConst doc)
 {
+    const uint32_t incoming = configHash(doc);
+    if (incoming != 0 && incoming == loadAppliedHash()) {
+        // identical config already applied -> nothing to do, and above all
+        // do NOT reboot again
+        Serial.println("[cfg] unchanged, ignoring");
+        return;
+    }
+
     bool changed = false;
 
     if (doc["role"].is<const char *>()) {
@@ -808,10 +850,22 @@ void onServerConfig(JsonObjectConst doc)
     if (doc["wifi"].is<JsonObjectConst>()) {
         JsonObjectConst w = doc["wifi"].as<JsonObjectConst>();
         if (w["ssid"].is<const char *>()) {
-            snprintf(cfg.wifi_ssid, sizeof(cfg.wifi_ssid), "%s", w["ssid"].as<const char *>());
-            changed = true;
+            const char *v = w["ssid"].as<const char *>();
+            // Only reboot when the value actually differs. Setting `changed`
+            // unconditionally made the node reboot on every config sync, since
+            // the server sends the SSID each time -> infinite reboot loop.
+            if (strcmp(v, cfg.wifi_ssid) != 0) {
+                snprintf(cfg.wifi_ssid, sizeof(cfg.wifi_ssid), "%s", v);
+                changed = true;
+            }
         }
-        if (w["password"].is<const char *>()) snprintf(cfg.wifi_pass, sizeof(cfg.wifi_pass), "%s", w["password"].as<const char *>());
+        if (w["password"].is<const char *>()) {
+            const char *v = w["password"].as<const char *>();
+            if (strcmp(v, cfg.wifi_pass) != 0) {
+                snprintf(cfg.wifi_pass, sizeof(cfg.wifi_pass), "%s", v);
+                changed = true;
+            }
+        }
     }
     if (doc["server"].is<JsonObjectConst>()) {
         JsonObjectConst s = doc["server"].as<JsonObjectConst>();
@@ -857,8 +911,13 @@ void onServerConfig(JsonObjectConst doc)
         if (o["enabled"].is<bool>()) cfg.ota_enabled = o["enabled"].as<bool>();
         if (o["port"].is<int>()) cfg.ota_port = (uint16_t)o["port"].as<int>();
         if (o["token"].is<const char *>()) {
-            snprintf(cfg.ota_token, sizeof(cfg.ota_token), "%s", o["token"].as<const char *>());
-            changed = true;   // a new token needs a reboot to take effect
+            const char *v = o["token"].as<const char *>();
+            // Same trap as the SSID: the token is present in every config
+            // response, so compare first or the node reboots forever.
+            if (strcmp(v, cfg.ota_token) != 0) {
+                snprintf(cfg.ota_token, sizeof(cfg.ota_token), "%s", v);
+                changed = true;
+            }
         }
     }
     if (doc["uwb"].is<JsonObjectConst>()) {
@@ -869,6 +928,7 @@ void onServerConfig(JsonObjectConst doc)
     }
 
     configSave(cfg);
+    storeAppliedHash(incoming);
     Serial.println("[cfg] applied config from server");
     if (changed) { delay(200); ESP.restart(); }
 }

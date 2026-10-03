@@ -131,6 +131,7 @@ function animate() {
   else applyAutoSpin();
   controls.update();
   applyZoom();
+  animatePulses();
   updateFog();
   renderer.render(scene3, camera);
 }
@@ -602,61 +603,145 @@ function buildObstacles() {
     g.add(edges);
 
     if (sel) {
-      // Resize handles.
-      //
-      // They used to sit at the footprint corners at y = 0, i.e. *inside* the
-      // box body. The raycaster therefore always hit the box face first, so
-      // dragging moved the obstacle instead of resizing it — the resize
-      // "didn't work". Handles are now larger and pushed OUTSIDE the box, and
-      // pick() gives them priority.
-      const out = 0.16;                 // offset beyond the surface
-      const R = 0.13;                   // handle radius (bigger = easier to grab)
+      // Blender-style 3-axis gizmo: one arrow per axis.
+      //   X arrow (red)   -> drag left/right   (width)
+      //   Y arrow (green) -> drag forward/back (depth)
+      //   Z arrow (blue)  -> drag up/down      (height)
+      // Each arrow has a shaft plus a cone tip; the whole group is the pick
+      // target so the hit area is generous. Handles are placed OUTSIDE the
+      // body, otherwise the box face wins the raycast.
+      const gz = new THREE.Group();
+      gz.userData.pick = 'gizmo';
+      gz.userData.id = ob.id;
 
-      const mkHandle = (x, z, kind, axis) => {
-        const h = new THREE.Mesh(
-          new THREE.SphereGeometry(R, 16, 14),
-          new THREE.MeshBasicMaterial({ color: kind === 'edge' ? 0x93c5fd : COL.sel }));
-        h.position.set(x, 0, z);
-        h.userData.pick = 'obstacleHandle';
-        h.userData.id = ob.id;
-        h.userData.axis = axis;         // 'both' | 'x' | 'y'
-        h.userData.corner = [Math.sign(x) || 1, Math.sign(z) || 1];
-        h.renderOrder = 10;
-        return h;
+      const armLen = 0.55;
+      const armR = 0.028;
+      const tipR = 0.085, tipH = 0.22;
+
+      const axisGroup = (dir, color, name) => {
+        const a = new THREE.Group();
+        const shaft = new THREE.Mesh(
+          new THREE.CylinderGeometry(armR, armR, armLen, 10),
+          new THREE.MeshBasicMaterial({ color }));
+        shaft.position.y = armLen / 2;
+        const tip = new THREE.Mesh(
+          new THREE.ConeGeometry(tipR, tipH, 14),
+          new THREE.MeshBasicMaterial({ color }));
+        tip.position.y = armLen + tipH / 2;
+        a.add(shaft, tip);
+        a.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+        a.userData.pick = 'gizmoAxis';
+        a.userData.axis = name;
+        a.userData.id = ob.id;
+        a.traverse((o) => { o.userData.pick = 'gizmoAxis'; o.userData.axis = name; o.userData.id = ob.id; });
+        return a;
       };
 
-      const hx = ob.sx / 2 + out, hy = ob.sy / 2 + out;
-      // corners -> resize both axes
-      for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]])
-        g.add(mkHandle(sx * hx, sz * hy, 'corner', 'both'));
-      // edge midpoints -> resize one axis only
-      g.add(mkHandle(0, -hy, 'edge', 'y'));
-      g.add(mkHandle(0, hy, 'edge', 'y'));
-      g.add(mkHandle(-hx, 0, 'edge', 'x'));
-      g.add(mkHandle(hx, 0, 'edge', 'x'));
+      // offset the gizmo so it sits just outside the box surface
+      const ox = ob.sx / 2 + 0.10, oy = ob.sy / 2 + 0.10, oz = ob.sz / 2 + 0.10;
+      const ax = axisGroup(new THREE.Vector3(1, 0, 0), 0xff6b6b, 'x');
+      ax.position.set(ox, 0, 0);
+      const ay = axisGroup(new THREE.Vector3(0, 0, 1), 0x6bff9c, 'y');
+      ay.position.set(0, 0, oy);
+      const az = axisGroup(new THREE.Vector3(0, 1, 0), 0x6bb5ff, 'z');
+      az.position.set(0, oz, 0);
+      gz.add(ax, ay, az);
+      g.add(gz);
 
-      // height cone, lifted clear of the top face AND offset from the edge
-      // handles so it never overlaps them in screen space
-      const up = new THREE.Mesh(
-        new THREE.ConeGeometry(0.11, 0.26, 14),
-        new THREE.MeshBasicMaterial({ color: 0xa7f3d0 }));
-      up.position.set(0, ob.sz / 2 + 0.30, 0);
-      up.userData.pick = 'obstacleHeight';
-      up.userData.id = ob.id;
-      up.renderOrder = 10;
-      g.add(up);
-      // thin vertical guide so the cone reads as "height" (decoration only —
-      // the cone itself is the grab target)
-      const guide = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints([
-          new THREE.Vector3(0, ob.sz / 2, 0),
-          new THREE.Vector3(0, ob.sz / 2 + 0.30, 0)]),
-        new THREE.LineBasicMaterial({ color: 0xa7f3d0, transparent: true, opacity: 0.8 }));
-      g.add(guide);
+      // corner cubes: drag to scale two axes at once (kept for convenience)
+      for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        const h = new THREE.Mesh(
+          new THREE.BoxGeometry(0.16, 0.16, 0.16),
+          new THREE.MeshBasicMaterial({ color: 0x93c5fd }));
+        h.position.set(sx * (ob.sx / 2 + 0.10), 0, sz * (ob.sy / 2 + 0.10));
+        h.userData.pick = 'obstacleHandle';
+        h.userData.id = ob.id;
+        h.userData.axis = 'both';
+        h.userData.corner = [sx, sz];
+        h.renderOrder = 10;
+        g.add(h);
+      }
     }
 
     obstacleObjs[ob.id] = g;
     obstacleGroup.add(g);
+  }
+}
+
+
+/* ==========================================================================
+   Pulse rings: one thin ring per node that expands and fades, like a sonar
+   ping. Cheap by design — a handful of meshes share two geometries, nothing is
+   allocated per frame, and the whole effect is skipped when rendering is
+   paused.
+   ========================================================================== */
+const PULSE_MAX = 2.6;          // metres: how far the ring travels
+const PULSE_PERIOD = 2.4;       // seconds per ping
+const PULSE_THICK = 0.012;      // ring thickness in metres (thin!)
+
+const pulseGeo = new THREE.RingGeometry(1.0, 1.0 + PULSE_THICK, 72);
+const pulses = [];              // { mesh, group, phase }
+
+function makePulse(color) {
+  const mat = new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity: 0.5,
+    side: THREE.DoubleSide, depthWrite: false });
+  const m = new THREE.Mesh(pulseGeo, mat);
+  m.rotation.x = -Math.PI / 2;   // lie flat on the floor
+  m.renderOrder = 5;
+  return m;
+}
+
+// Ensure each anchor and tag has a small pool of pulse rings.
+function ensurePulses() {
+  const want = [];
+  for (const a of S.scene.anchors) want.push(['anchor', a.id, a.x, a.y, a.z, 0x6ee7b7]);
+  for (const t of S.state.tags || []) want.push(['tag', t.id, t.x, t.y, t.z ?? 0.9, 0xffd166]);
+
+  // drop pulses for things that vanished
+  const keys = new Set(want.map((w) => w[0] + ':' + w[1]));
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    if (!keys.has(pulses[i].key)) {
+      pulses[i].group.remove(pulses[i].mesh);
+      pulses[i].mesh.material.dispose();
+      pulses.splice(i, 1);
+    }
+  }
+  // add missing ones
+  for (const [kind, id, x, y, z, color] of want) {
+    const key = kind + ':' + id;
+    if (pulses.some((p) => p.key === key)) continue;
+    const group = kind === 'anchor' ? anchorGroup : tagGroup;
+    const mesh = makePulse(color);
+    mesh.position.set(x, 0.03, y);
+    group.add(mesh);
+    pulses.push({ key, mesh, group, phase: Math.random() * PULSE_PERIOD });
+  }
+}
+
+// Animate: expand + fade, looping. Runs every frame but touches only a few
+// floats per ring.
+let pulseT = 0;
+function animatePulses() {
+  if (!pulses.length) return;
+  pulseT += frameDt;
+  for (const p of pulses) {
+    const t = ((pulseT + p.phase) % PULSE_PERIOD) / PULSE_PERIOD;   // 0..1
+    const r = 0.12 + t * PULSE_MAX;
+    p.mesh.scale.set(r, r, r);
+    p.mesh.material.opacity = 0.45 * (1 - t) * (1 - t);
+  }
+  // keep them under the node even while it moves
+  for (const p of pulses) {
+    if (p.key.startsWith('tag:')) {
+      const id = p.key.slice(4);
+      const t = (S.state.tags || []).find((x) => x.id === id);
+      if (t) p.mesh.position.set(t.x, 0.03, t.y);
+    } else {
+      const id = p.key.slice(7);
+      const a = S.scene.anchors.find((x) => x.id === id);
+      if (a) p.mesh.position.set(a.x, 0.03, a.y);
+    }
   }
 }
 
@@ -669,7 +754,7 @@ function buildTags() {
     if (!mesh) {
       mesh = new THREE.Group();
       const body = new THREE.Mesh(
-        new THREE.SphereGeometry(0.16, 20, 16),
+        new THREE.SphereGeometry(0.11, 20, 16),
         new THREE.MeshStandardMaterial({ color: COL.tag, emissive: 0x8a6a10,
                                          emissiveIntensity: 0.9, roughness: 0.35 }));
       body.castShadow = true;
@@ -678,7 +763,7 @@ function buildTags() {
       mesh.add(body);
       // uncertainty ring, scaled from the EKF sigma
       const ring = new THREE.Mesh(
-        new THREE.RingGeometry(0.9, 1.0, 48),
+        new THREE.RingGeometry(0.9, 0.93, 64),
         new THREE.MeshBasicMaterial({ color: COL.tag, transparent: true, opacity: 0.35,
                                       side: THREE.DoubleSide }));
       ring.rotation.x = -Math.PI / 2;
@@ -694,7 +779,7 @@ function buildTags() {
     if (ring) {
       const r = Math.max(0.25, Math.min(t.sigma || 0.3, 3) * 1.6);
       ring.scale.set(r, r, r);
-      ring.material.opacity = t.online ? 0.4 : 0.15;
+      ring.material.opacity = t.online ? 0.30 : 0.12;
     }
     mesh.visible = true;
 
@@ -795,27 +880,19 @@ function resizeObstacleMesh(o) {
     edges.geometry.dispose();
     edges.geometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(o.sx, o.sz, o.sy));
   }
-  // reposition the handles / height cone / guide
+  // reposition the gizmo arms and the corner cubes
+  const ox = o.sx / 2 + 0.10, oy = o.sy / 2 + 0.10, oz = o.sz / 2 + 0.10;
   for (const c of g.children) {
     const kind = c.userData.pick;
-    if (kind === 'obstacleHandle') {
-      const [sx, sz] = c.userData.corner;
-      const out = 0.16;
-      const edge = c.userData.axis === 'x' || c.userData.axis === 'y';
-      c.position.set(
-        edge && c.userData.axis === 'y' ? 0 : sx * (o.sx / 2 + out),
-        0,
-        edge && c.userData.axis === 'x' ? 0 : sz * (o.sy / 2 + out));
-    } else if (kind === 'obstacleHeight') {
-      if (c.isLine) {
-        const p = c.geometry.attributes.position;
-        p.setXYZ(0, 0, o.sz / 2, 0);
-        p.setXYZ(1, 0, o.sz / 2 + 0.30, 0);
-        p.needsUpdate = true;
-        c.geometry.computeBoundingSphere();
-      } else {
-        c.position.set(0, o.sz / 2 + 0.30, 0);
+    if (kind === 'gizmo') {
+      for (const arm of c.children) {
+        if (arm.userData.axis === 'x') arm.position.set(ox, 0, 0);
+        else if (arm.userData.axis === 'y') arm.position.set(0, 0, oy);
+        else if (arm.userData.axis === 'z') arm.position.set(0, oz, 0);
       }
+    } else if (kind === 'obstacleHandle') {
+      const [sx, sz] = c.userData.corner || [1, 1];
+      c.position.set(sx * ox, 0, sz * oy);
     }
   }
 }
@@ -869,6 +946,7 @@ function rebuildAll() {
   buildObstacles();
   buildTags();
   buildLinks();
+  ensurePulses();
   buildPalette();
 }
 
@@ -899,7 +977,8 @@ function pick(ev) {
   for (const h of usable) {
     let o = h.object;
     while (o && !o.userData.pick) o = o.parent;
-    if (o.userData.pick === 'obstacleHandle' || o.userData.pick === 'obstacleHeight')
+    if (o.userData.pick === 'obstacleHandle' || o.userData.pick === 'obstacleHeight' ||
+        o.userData.pick === 'gizmoAxis' || o.userData.pick === 'gizmo')
       return { obj: o, point: h.point, hit: h.object };
   }
 
@@ -934,7 +1013,8 @@ function bindPointer() {
 
     const u = p.obj.userData;
     if (u.pick === 'anchor' || u.pick === 'obstacle' ||
-        u.pick === 'obstacleHandle' || u.pick === 'obstacleHeight') {
+        u.pick === 'obstacleHandle' || u.pick === 'obstacleHeight' ||
+        u.pick === 'gizmoAxis') {
       controls.enabled = false;
       const gp = groundPoint(ev);
       S.drag = {
@@ -990,6 +1070,25 @@ function bindPointer() {
           o.sx = Math.max(0.2, S.drag.orig.sx + cx * lx * 2);
         if (axis === 'both' || axis === 'y')
           o.sy = Math.max(0.2, S.drag.orig.sy + cz * lz * 2);
+        S.dirty = true;
+        resizeObstacleMesh(o);
+      }
+    } else if (S.drag.type === 'gizmoAxis') {
+      const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
+      if (o) {
+        // Convert the pointer travel into the obstacle's local frame so the
+        // arrows keep working after the box is rotated.
+        const rot = THREE.MathUtils.degToRad(o.rot || 0);
+        const lx = dx * Math.cos(-rot) - dz * Math.sin(-rot);
+        const lz = dx * Math.sin(-rot) + dz * Math.cos(-rot);
+        const axis = S.drag.axis;
+        if (axis === 'x') o.sx = Math.max(0.2, S.drag.orig.sx + lx * 2);
+        else if (axis === 'y') o.sy = Math.max(0.2, S.drag.orig.sy + lz * 2);
+        else if (axis === 'z') {
+          const dy = (S.drag.startClientY ?? ev.clientY) - ev.clientY;
+          const scale = 0.01 * Math.max(camera.position.distanceTo(controls.target) / 6, 0.4);
+          o.sz = Math.max(0.2, S.drag.orig.sz + dy * scale);
+        }
         S.dirty = true;
         resizeObstacleMesh(o);
       }
@@ -1257,7 +1356,7 @@ async function poll() {
   try {
     const r = await fetch('/api/v1/state');
     S.state = await r.json();
-    if (!S.drag) { buildTags(); buildLinks(); updateAnchorLabels(); }
+    if (!S.drag) { buildTags(); buildLinks(); updateAnchorLabels(); ensurePulses(); }
     updateHud();
     renderTagList();
     cueTransitions();
@@ -1727,6 +1826,15 @@ window.__uwbHandles = (id) => {
   }
   return out;
 };
+
+// Pulse ring state (test/debug helper).
+window.__uwbPulse = () => pulses.map((p) => ({
+  key: p.key,
+  scale: +p.mesh.scale.x.toFixed(3),
+  opacity: +p.mesh.material.opacity.toFixed(3),
+  pos: [+p.mesh.position.x.toFixed(2), +p.mesh.position.z.toFixed(2)],
+  visible: p.mesh.visible,
+}));
 
 window.__uwbProbe = () => ({
   dist: camera.position.distanceTo(controls.target),
