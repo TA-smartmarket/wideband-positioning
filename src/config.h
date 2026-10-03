@@ -11,7 +11,7 @@
 #include <Preferences.h>
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.0"
+#define FW_VERSION      "1.0.4"
 #ifndef MAX_DEVICES
 #define MAX_DEVICES     10      // ids 1..10 for both roles
 #endif
@@ -69,6 +69,12 @@ struct Config {
     // Positions of every anchor, pushed by the server so a tag can solve its
     // own position without asking the server. Encoded "id:x,y;id:x,y".
     char     anchor_map[192] = "";
+
+    // Display power saving. The OLED is the only always-on consumer on the
+    // board; turning it off keeps WiFi, ranging and telemetry running.
+    //   0 = always on, 1 = dim after screen_timeout_s, 2 = off after it
+    uint8_t  screen_mode = 1;
+    uint16_t screen_timeout_s = 60;   // 0 = never sleep
 
     // OTA (over-the-air update)
     // The device runs a web updater while it is on the network. A signed-in
@@ -193,6 +199,8 @@ inline void configLoad(Config &c)
     c.range_filter = p.getBool("rfilt", true);
     c.update_ms = p.getUShort("upd", 200);
     p.getString("amap", c.anchor_map, sizeof(c.anchor_map));
+    c.screen_mode = p.getUChar("scr_mode", 1);
+    c.screen_timeout_s = p.getUShort("scr_to", 60);
     c.ota_enabled = p.getBool("ota_en", true);
     c.ota_port = p.getUShort("ota_port", 3232);
     p.getString("ota_tok", c.ota_token, sizeof(c.ota_token));
@@ -225,6 +233,8 @@ inline void configSave(const Config &c)
     p.putBool("rfilt", c.range_filter);
     p.putUShort("upd", c.update_ms);
     p.putString("amap", c.anchor_map);
+    p.putUChar("scr_mode", c.screen_mode);
+    p.putUShort("scr_to", c.screen_timeout_s);
     p.putBool("ota_en", c.ota_enabled);
     p.putUShort("ota_port", c.ota_port);
     p.putString("ota_tok", c.ota_token);

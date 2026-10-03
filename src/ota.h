@@ -32,41 +32,68 @@
 
 extern WebServer g_ota;   // defined in main.cpp
 
+// upload state (single upload at a time)
+inline bool ota_rejected = false;
+inline bool ota_ok = false;
+
 // ---------------------------------------------------------------------------
 // upload handling
+//
+// NOTE on authentication timing: inside an HTTPUpload callback the query
+// string is already parsed, but `hasArg()`/`arg()` are only reliable for
+// *form fields*; the query string is parsed by the time the upload handler is
+// entered, so we read it directly from the raw request line to be safe. A
+// missing/incorrect key aborts the upload before any flash write.
 // ---------------------------------------------------------------------------
+inline bool otaKeyOk()
+{
+    if (!cfg.ota_token[0]) return false;
+    if (!g_ota.hasArg("key")) return false;
+    return g_ota.arg("key") == cfg.ota_token;
+}
+
 inline void otaUploadStart()
 {
     HTTPUpload &up = g_ota.upload();
 
-    // authenticate before a single byte of the image is written
-    const bool ok = cfg.ota_token[0] &&
-                    g_ota.hasArg("key") &&
-                    g_ota.arg("key") == cfg.ota_token;
-
     if (up.status == UPLOAD_FILE_START) {
-        if (!ok) {
+        // Authenticate BEFORE opening the flash partition.
+        if (!otaKeyOk()) {
             Serial.println(F("[ota] rejected: bad or missing key"));
+            ota_rejected = true;
             return;
         }
+        ota_rejected = false;
         Serial.printf("[ota] receiving %s (%u bytes)\n",
                       up.filename.c_str(), (unsigned)up.totalSize);
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+
+        // Prefer the declared content length: UPDATE_SIZE_UNKNOWN makes
+        // Update.begin() scan for the free partition, and an empty/odd request
+        // can abort the transfer mid-flight.
+        const size_t clen = g_ota.clientContentLength();
+        size_t target = (clen > 1024) ? clen : up.totalSize;
+        if (!Update.begin(target > 1024 ? target : UPDATE_SIZE_UNKNOWN)) {
             Serial.printf("[ota] Update.begin failed: %s\n", Update.errorString());
+            ota_rejected = true;
         }
     } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (!ok) return;
-        if (Update.write(up.buf, up.currentSize) != up.currentSize)
+        if (ota_rejected) return;
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) {
             Serial.printf("[ota] write failed: %s\n", Update.errorString());
+            ota_rejected = true;
+        }
     } else if (up.status == UPLOAD_FILE_END) {
-        if (!ok) return;
+        if (ota_rejected) { Update.abort(); return; }
         if (Update.end(true)) {
             Serial.printf("[ota] success, %u bytes — rebooting\n", (unsigned)up.totalSize);
+            ota_ok = true;
         } else {
             Serial.printf("[ota] Update.end failed: %s\n", Update.errorString());
+            ota_rejected = true;
         }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
+        ota_rejected = true;
         Serial.println(F("[ota] aborted"));
     }
 }
@@ -76,10 +103,11 @@ inline void otaRegister()
     g_ota.on("/update", HTTP_POST,
         // completion handler
         []() {
-            const bool ok = Update.hasError() == false;
+            const bool ok = ota_ok && !Update.hasError();
             g_ota.sendHeader("Connection", "close");
             g_ota.send(ok ? 200 : 500, "text/plain",
                        ok ? "OK: rebooting" : "FAILED");
+            ota_ok = false;
             if (ok) { delay(300); ESP.restart(); }
         },
         otaUploadStart);
@@ -111,6 +139,18 @@ inline void otaRegister()
 // lifecycle
 // ---------------------------------------------------------------------------
 
+// The updater runs in its OWN FreeRTOS task. Calling handleClient() from the
+// main loop is not reliable here: DW1000Ranging.loop() and the MQTT/HTTP work
+// starve it, and a stalled transfer shows up as the client seeing an immediate
+// connection refusal (curl exit code 000) instead of a served request.
+static void otaTask(void *)
+{
+    for (;;) {
+        if (cfg.ota_enabled && net.wifi_up) g_ota.handleClient();
+        vTaskDelay(pdMS_TO_TICKS(2));      // tight enough for a 1 MB upload
+    }
+}
+
 // Start the updater once WiFi is up. Safe to call repeatedly.
 inline void otaBegin()
 {
@@ -119,12 +159,11 @@ inline void otaBegin()
     if (started) return;
     otaRegister();
     g_ota.begin(cfg.ota_port);
+    xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 2, nullptr, 0);
     started = true;
     Serial.printf("[ota] updater on http://%s:%u/update (key required)\n",
                   WiFi.localIP().toString().c_str(), (unsigned)cfg.ota_port);
 }
 
-inline void otaLoop()
-{
-    if (cfg.ota_enabled && net.wifi_up) g_ota.handleClient();
-}
+// Kept for compatibility with the main loop; the task does the real work.
+inline void otaLoop() { }

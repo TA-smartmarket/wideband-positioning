@@ -47,6 +47,8 @@ BASE_CFG = {
     "room": {"width": 5.0, "height": 4.0},
     "uwb": {"mode": "longdata_range_lowpower",
             "range_filter": True, "update_ms": 200},
+    # OLED power saving on the node (the device stays online)
+    "display": {"mode": "dim", "timeout_s": 60},
 }
 
 DEVICES = {}          # device_id -> config dict (merged)
@@ -991,6 +993,7 @@ def api_ota_push():
         key = ota_token(dk)
         url = f"http://{ip}:{OTA_PORT}/update?key={key}"
         try:
+            import urllib.error
             import urllib.request
             with open(path, "rb") as fh:
                 data = fh.read()
@@ -1003,12 +1006,27 @@ def api_ota_push():
             ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
             req = urllib.request.Request(url, data=body_bytes, method="POST")
             req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                results[dk] = f"{resp.status} {resp.read().decode(errors='replace')[:80]}"
+            # No Expect: 100-continue — the ESP32 web server does not answer it
+            # and the connection would be dropped mid-upload.
+            req.add_header("Expect", "")
+            req.add_header("Connection", "close")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    results[dk] = f"{resp.status} {resp.read().decode(errors='replace')[:80]}"
+            except urllib.error.HTTPError as he:
+                results[dk] = f"http {he.code}: {he.read().decode(errors='replace')[:80]}"
+            except Exception as e2:
+                # A reset right at the end is normal: the node reboots as soon
+                # as the image is written. Report it as "sent" so the operator
+                # is not misled, and let the version check confirm it.
+                if "10054" in str(e2) or "forcibly closed" in str(e2).lower() or "reset" in str(e2).lower():
+                    results[dk] = "sent (device rebooted; verify with /api/v1/ota)"
+                else:
+                    results[dk] = f"failed: {e2}"
         except Exception as e:
             results[dk] = f"failed: {e}"
 
-    ok = any(str(v).startswith("200") for v in results.values())
+    ok = any(str(v).startswith("200") or str(v).startswith("sent") for v in results.values())
     return jsonify({"ok": ok, "results": results, "firmware": name})
 
 

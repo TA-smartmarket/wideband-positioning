@@ -73,6 +73,24 @@
       <label><input id="trail" type="checkbox" checked> Show movement trail</label>
       <label><input id="spin" type="checkbox"> Slow auto-orbit when idle</label>
 
+      <h3 style="margin-top:16px">Device screen (OLED)</h3>
+      <p class="muted">Saves power on the node. It keeps ranging, serving this
+         page and sending telemetry while the screen is dimmed or off.</p>
+      <label>Mode
+        <select id="scr-mode">
+          <option value="always">Always on</option>
+          <option value="dim">Dim when idle</option>
+          <option value="off">Off when idle</option>
+        </select>
+      </label>
+      <label>Idle timeout (seconds, 0 = never)
+        <input id="scr-timeout" type="number" min="0" step="5" value="60">
+      </label>
+      <div class="row btns">
+        <button id="scr-apply" class="primary">Apply to all devices</button>
+      </div>
+      <div id="scr-result" class="muted" style="margin-top:8px"></div>
+
       <h3 style="margin-top:16px">OTA firmware</h3>
       <p class="muted" id="ota-hint">Loading…</p>
       <label>Firmware image

@@ -1617,6 +1617,35 @@ async function pushOta(deviceId) {
 }
 
 /* ==========================================================================
+   Device screen (OLED) power policy — pushed to every device as a normal
+   config update, so the node dims/blanks its panel while staying online.
+   ========================================================================== */
+async function applyScreenPolicy() {
+  const mode = $('scr-mode').value;
+  const timeout_s = Math.max(0, parseInt($('scr-timeout').value || '0', 10));
+  const ids = (S.state.devices || []).map((d) => d.id);
+  if (!ids.length) { toast('No device known yet.'); return; }
+
+  $('scr-result').textContent = `Sending to ${ids.length} device(s)…`;
+  let ok = 0;
+  for (const id of ids) {
+    const [role, num] = id.split('-');
+    try {
+      const r = await fetch('/api/v1/config', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role, id: parseInt(num, 10),
+                               display: { mode, timeout_s } }),
+      });
+      if (r.ok) ok++;
+    } catch (e) { /* keep going */ }
+  }
+  $('scr-result').textContent =
+    `Applied to ${ok}/${ids.length} device(s): screen ${mode}, timeout ${timeout_s}s.`;
+  toast(`Screen policy sent (${mode}, ${timeout_s}s)`);
+  Audio2.update();
+}
+
+/* ==========================================================================
    API tab — endpoints come from the server, so they never go stale
    ========================================================================== */
 let apiInfo = null;
@@ -1790,6 +1819,7 @@ function initUi() {
   $('theme-toggle').onclick = () =>
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
   $('ota-push-all').onclick = () => pushOta('all');
+  $('scr-apply').onclick = applyScreenPolicy;
 
   addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {

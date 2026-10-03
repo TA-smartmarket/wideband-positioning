@@ -307,6 +307,40 @@ fallback ke REST.
 
 ---
 
+## 🔋 Hemat daya: layar OLED node
+
+Layar OLED adalah konsumen daya terbesar yang selalu menyala di board. Sekarang
+bisa dimatikan **tanpa memutus apa pun** — node tetap ranging, tetap melayani
+web UI, dan tetap mengirim telemetri.
+
+Tiga mode:
+
+| Mode | Perilaku |
+|---|---|
+| `always` | layar selalu menyala |
+| `dim` | **redup** (kontras rendah) setelah idle — default |
+| `off` | **mati total** (panel off, `SSD1306_DISPLAYOFF`) setelah idle |
+
+Timeout idle diatur dalam detik (`0` = tidak pernah tidur, default 60 s).
+Layar **otomatis bangun** saat ada aktivitas: input serial, jarak baru terukur,
+atau pesan MQTT/REST.
+
+**Cara mengatur:**
+
+1. **Web UI** → tab **Setup → Device screen (OLED)** → pilih mode + timeout →
+   **Apply to all devices**. Dikirim sebagai config biasa (retained MQTT), jadi
+   node menerapkannya sendiri.
+2. **Serial menu:**
+   ```
+   screen on            layar selalu nyala
+   screen dim           redup setelah timeout
+   screen off           mati setelah timeout
+   screen auto 120      ubah timeout idle jadi 120 detik
+   ```
+3. **REST:** `PUT /api/v1/config` dengan `{"role":"anchor","id":2,"display":{"mode":"off","timeout_s":120}}`
+
+---
+
 ## 🔄 OTA (update firmware dari server)
 
 Firmware **tidak perlu dicabut** lagi. Setiap node menjalankan web updater

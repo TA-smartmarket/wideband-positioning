@@ -334,6 +334,10 @@ void publishTelemetry()
 // ---------------------------------------------------------------------------
 AnchorFix fixes[MAX_ANCHORS];
 
+// Display power saving (defined with drawUi(); used from the ranging callback)
+void screenWake();
+void screenPowerLoop();
+
 // ---------------------------------------------------------------------------
 // Localisation: bootstrap with the geometric solver, then track with the EKF.
 //
@@ -482,6 +486,8 @@ void newRange()
     // a negative distance is meaningless and breaks the solver.
     if (range <= 0.01f) return;
 
+    screenWake();               // a live measurement wakes the panel
+
     if (cfg.role == ROLE_TAG) pushRange(other, me, range, rx, fp, q);
     else                      pushRange(me, other, range, rx, fp, q);
 
@@ -527,8 +533,67 @@ void inactiveDevice(DW1000Device *d)
 // ---------------------------------------------------------------------------
 unsigned long last_ui = 0;
 
+// ---------------------------------------------------------------------------
+// Display power saving
+//
+// The OLED is the only always-on consumer besides the radio, so it can be
+// dimmed or switched off entirely. The node keeps ranging, serving the web UI
+// and pushing telemetry the whole time — only the panel sleeps.
+//
+//   mode 0 : always on
+//   mode 1 : dim after screen_timeout_s  (low contrast, still readable)
+//   mode 2 : off after screen_timeout_s  (panel off, SSD1306_DISPLAYOFF)
+//
+// Any activity (serial input, a new range, an MQTT/REST message) wakes it.
+// ---------------------------------------------------------------------------
+bool          screen_off = false;
+bool          screen_dim = false;
+unsigned long last_activity_ms = 0;
+
+void screenSetBrightness(uint8_t contrast)
+{
+    display.ssd1306_command(SSD1306_SETCONTRAST);
+    display.ssd1306_command(contrast);
+}
+
+// Wake the panel; called from anywhere that counts as activity.
+void screenWake()
+{
+    last_activity_ms = millis();
+    if (screen_off) {
+        display.ssd1306_command(SSD1306_DISPLAYON);
+        screenSetBrightness(0xCF);
+        screen_off = false;
+        screen_dim = false;
+        last_ui = 0;                 // force a redraw
+    } else if (screen_dim) {
+        screenSetBrightness(0xCF);
+        screen_dim = false;
+        last_ui = 0;
+    }
+}
+
+// Apply the configured policy. Called from the main loop.
+void screenPowerLoop()
+{
+    if (cfg.screen_mode == 0 || cfg.screen_timeout_s == 0) return;
+    if (screen_off || screen_dim) return;
+    if (millis() - last_activity_ms < (unsigned long)cfg.screen_timeout_s * 1000UL) return;
+
+    if (cfg.screen_mode == 2) {
+        display.ssd1306_command(SSD1306_DISPLAYOFF);
+        screen_off = true;
+        Serial.println(F("[oled] display off (device stays online)"));
+    } else {
+        screenSetBrightness(0x0A);    // very dim but still visible
+        screen_dim = true;
+        Serial.println(F("[oled] display dimmed"));
+    }
+}
+
 void drawUi()
 {
+    if (screen_off) return;           // nothing to draw while the panel sleeps
     if (millis() - last_ui < 400) return;
     last_ui = millis();
 
@@ -626,6 +691,8 @@ void printHelp()
         "  room <w> <h>         room size in metres\n"
         "  mode <name>          uwb phy mode (see 'show')\n"
         "  filter on|off        range smoothing filter\n"
+        "  screen on|dim|off    OLED power saving (device stays online)\n"
+        "  screen auto <sec>    idle seconds before dim/off (0 = never)\n"
         "  rate <ms>            telemetry interval\n"
         "  save                 persist to NVS\n"
         "  reboot               restart\n"
@@ -650,6 +717,10 @@ void printConfig()
     Serial.printf("room       : %.2f x %.2f m\n", cfg.room_w, cfg.room_h);
     Serial.printf("uwb mode   : %s\n", uwbModeName(cfg.uwb_mode));
     Serial.printf("filter     : %s\n", cfg.range_filter ? "on" : "off");
+    Serial.printf("screen     : %s after %us\n",
+                  cfg.screen_mode == 0 ? "always on" :
+                  (cfg.screen_mode == 1 ? "dim" : "off"),
+                  (unsigned)cfg.screen_timeout_s);
     Serial.printf("rate       : %u ms\n", (unsigned)cfg.update_ms);
     Serial.printf("wifi state : %s\n", net.wifi_up ? WiFi.localIP().toString().c_str() : "down");
 }
@@ -658,6 +729,8 @@ void handleSerial()
 {
     static char buf[128];
     static uint8_t len = 0;
+
+    if (Serial.available()) screenWake();   // typing wakes the panel
 
     while (Serial.available()) {
         char c = Serial.read();
@@ -712,6 +785,25 @@ void handleSerial()
         else if (!strcmp(cmd, "mode") && a1) {
             cfg.uwb_mode = uwbModeFromName(a1);
             Serial.printf("mode = %s (save + reboot to apply)\n", uwbModeName(cfg.uwb_mode));
+        }
+        else if (!strcmp(cmd, "screen")) {
+            // screen on | dim | off | auto <seconds>
+            if (a1 && !strcmp(a1, "on")) {
+                cfg.screen_mode = 0;
+                screenWake();
+                Serial.println(F("screen: always on"));
+            } else if (a1 && !strcmp(a1, "dim")) {
+                cfg.screen_mode = 1;
+                Serial.println(F("screen: dims after the timeout"));
+            } else if (a1 && !strcmp(a1, "off")) {
+                cfg.screen_mode = 2;
+                Serial.println(F("screen: turns off after the timeout"));
+            } else if (a1 && !strcmp(a1, "auto") && a2) {
+                cfg.screen_timeout_s = (uint16_t)atoi(a2);
+                Serial.printf("screen: timeout %us\n", (unsigned)cfg.screen_timeout_s);
+            } else {
+                Serial.println(F("usage: screen on|dim|off|auto <seconds>"));
+            }
         }
         else if (!strcmp(cmd, "filter") && a1) cfg.range_filter = !strcmp(a1, "on");
         else if (!strcmp(cmd, "rate") && a1) cfg.update_ms = (uint16_t)atoi(a1);
@@ -906,6 +998,15 @@ void onServerConfig(JsonObjectConst doc)
             changed = true;
         }
     }
+    if (doc["display"].is<JsonObjectConst>()) {
+        JsonObjectConst d = doc["display"].as<JsonObjectConst>();
+        if (d["mode"].is<const char *>()) {
+            const char *m = d["mode"].as<const char *>();
+            cfg.screen_mode = !strcmp(m, "off") ? 2 : (!strcmp(m, "always") ? 0 : 1);
+            screenWake();
+        }
+        if (d["timeout_s"].is<int>()) cfg.screen_timeout_s = (uint16_t)d["timeout_s"].as<int>();
+    }
     if (doc["ota"].is<JsonObjectConst>()) {
         JsonObjectConst o = doc["ota"].as<JsonObjectConst>();
         if (o["enabled"].is<bool>()) cfg.ota_enabled = o["enabled"].as<bool>();
@@ -1015,6 +1116,7 @@ void loop()
     if (cfg.role == ROLE_NONE) { delay(10); return; }
 
     DW1000Ranging.loop();
+    screenPowerLoop();
     wifiLoop();
     otaBegin();
     otaLoop();
