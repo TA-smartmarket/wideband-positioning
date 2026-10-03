@@ -71,10 +71,38 @@ OTA_PORT = 3232       # must match the firmware default
 OTA_DIR = os.path.join(os.path.dirname(__file__), "firmware")
 
 
+OTA_TOKENS = {}       # device_id -> token (persisted, see ota_tokens_path)
+OTA_TOKENS_PATH = os.path.join(os.path.dirname(__file__), "ota_tokens.json")
+
+
+def _load_ota_tokens():
+    """Tokens must survive a server restart: the device keeps the key it was
+    given, so a new random key after every restart would make every push fail
+    with 401/rejected even though nothing changed on the device."""
+    global OTA_TOKENS
+    try:
+        with open(OTA_TOKENS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            OTA_TOKENS = {str(k): str(v) for k, v in data.items()}
+            print(f"[ota] loaded {len(OTA_TOKENS)} device key(s)")
+    except (OSError, ValueError):
+        pass          # first run
+
+
+def _save_ota_tokens():
+    try:
+        with open(OTA_TOKENS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(OTA_TOKENS, fh, indent=2)
+    except OSError as e:
+        print(f"[ota] could not save keys: {e}")
+
+
 def ota_token(device_id, regenerate=False):
     with LOCK:
         if regenerate or device_id not in OTA_TOKENS:
             OTA_TOKENS[device_id] = secrets.token_urlsafe(18)
+            _save_ota_tokens()
         return OTA_TOKENS[device_id]
 
 
@@ -931,6 +959,79 @@ def load_scene(path=None):
         pass          # no saved scene yet -> defaults
 
 
+
+@APP.route("/api/v1/ota/check", methods=["GET"])
+def api_ota_check():
+    """The device asks whether a newer image is available.
+
+    Query: device=<role-id>&key=<token>
+    Reply: {"ok":true,"update":bool,"url":"...","version":"..."}
+
+    Pull is the primary update path: the ESP32 web server cannot accept a ~1 MB
+    multipart body (it buffers the request in RAM and drops it before the
+    handler runs), so the device downloads the image instead.
+    """
+    dev = request.args.get("device", "")
+    key = request.args.get("key", "")
+    if not dev:
+        return jsonify({"ok": False, "error": "device required"}), 400
+    if not key or key != ota_token(dev):
+        return jsonify({"ok": False, "error": "bad key"}), 401
+
+    with LOCK:
+        st = STATUS.get(dev, {})
+    cur = st.get("fw") or ""
+
+    fw = []
+    if os.path.isdir(OTA_DIR):
+        for f in os.listdir(OTA_DIR):
+            if f.endswith(".bin"):
+                p = os.path.join(OTA_DIR, f)
+                fw.append({"name": f, "size": os.path.getsize(p),
+                           "mtime": int(os.path.getmtime(p))})
+        fw.sort(key=lambda x: x["mtime"], reverse=True)
+
+    if not fw:
+        return jsonify({"ok": True, "update": False, "reason": "no image on server"})
+
+    newest = fw[0]
+    # version is encoded in the file name: uwb-node-1.0.5.bin -> 1.0.5
+    ver = newest["name"].rsplit("-", 1)[-1].replace(".bin", "")
+    if cur and cur == ver:
+        return jsonify({"ok": True, "update": False, "version": ver})
+
+    base = request.host_url.rstrip("/")
+    return jsonify({"ok": True, "update": True, "version": ver,
+                    "size": newest["size"],
+                    "url": f"{base}/api/v1/ota/firmware/{newest['name']}",
+                    "current": cur})
+
+
+@APP.route("/api/v1/ota/firmware/<path:name>", methods=["GET"])
+def api_ota_firmware(name):
+    """Serve a firmware image for the device to pull."""
+    if "/" in name or "\\" in name or not name.endswith(".bin"):
+        return jsonify({"ok": False, "error": "bad name"}), 400
+    path = os.path.join(OTA_DIR, name)
+    if not os.path.isfile(path):
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return send_from_directory(OTA_DIR, name, mimetype="application/octet-stream")
+
+
+@APP.route("/api/v1/ota/ack", methods=["POST"])
+def api_ota_ack():
+    """Device reports the outcome of a pull (the success case reboots, so this
+    usually only arrives for failures)."""
+    body = request.get_json(silent=True) or {}
+    dev, key = body.get("device"), body.get("key")
+    if not dev or not key or key != ota_token(dev):
+        return jsonify({"ok": False, "error": "bad key"}), 401
+    ok = bool(body.get("ok"))
+    print(f"[ota] {dev} reported {'success' if ok else 'failure'} "
+          f"{body.get('version','')} {body.get('error','')}")
+    return jsonify({"ok": True})
+
+
 @APP.route("/api/v1/ota", methods=["GET"])
 def api_ota_list():
     """Devices eligible for an update, their IP, key and the firmware available
@@ -1120,6 +1221,7 @@ def main():
 
     print(f"[server] http://0.0.0.0:{args.port}" + ("  (token auth)" if args.token else ""))
     load_scene()
+    _load_ota_tokens()
     if args.mqtt:
         mqtt_start()
 

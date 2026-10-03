@@ -11,7 +11,7 @@
 #include <Preferences.h>
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.4"
+#define FW_VERSION      "1.0.6"
 #ifndef MAX_DEVICES
 #define MAX_DEVICES     10      // ids 1..10 for both roles
 #endif

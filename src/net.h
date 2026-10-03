@@ -204,13 +204,18 @@ inline void portalStart()
     Serial.printf("[ap] setup portal at http://192.168.4.1  (ssid %s)\n", SSID_AP);
 }
 
+// Close the portal AND drop the access point. Previously the WebServer was
+// stopped but the soft-AP stayed up, so "UWB-Setup" kept broadcasting forever
+// even after the node had joined the real network.
 inline void portalStop()
 {
-    if (!net.portal_on) return;
-    g_portal.stop();
+    if (!net.portal_on && WiFi.getMode() != WIFI_AP && WiFi.getMode() != WIFI_AP_STA) return;
+    if (net.portal_on) g_portal.stop();
     WiFi.softAPdisconnect(true);
+    // back to plain station mode once we are on the network
+    if (net.wifi_up) WiFi.mode(WIFI_STA);
     net.portal_on = false;
-    Serial.println("[ap] portal closed");
+    Serial.println("[ap] portal closed, access point down");
 }
 
 inline void portalLoop()
@@ -241,13 +246,18 @@ inline void wifiLoop()
             net.wifi_up = false;
             Serial.println("[wifi] lost");
         }
+        // Safety net: if the soft-AP is still broadcasting (e.g. it was started
+        // before WiFi came up), take it down now. Otherwise "UWB-Setup" lingers
+        // on the air forever after the node has joined the real network.
+        if (WiFi.getMode() == WIFI_AP_STA || WiFi.getMode() == WIFI_AP)
+            portalStop();
         return;
     }
     if (WiFi.status() == WL_CONNECTED) {
         net.wifi_up = true;
         fails = 0;
         Serial.printf("[wifi] connected, ip %s\n", WiFi.localIP().toString().c_str());
-        if (net.portal_on) portalStop();     // reached the network, close the portal
+        portalStop();                        // reached the network, drop the AP
         syncConfigFromServer(true);
         return;
     }

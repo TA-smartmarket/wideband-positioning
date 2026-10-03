@@ -326,7 +326,11 @@ void publishTelemetry()
     if (!net.mqtt_up || !cfg.mqtt_enabled) queueRest(body);
     else queueRest("");          // nothing pending, keeps the slot clear
 
-    range_count = 0;
+    // NOTE: the range buffer is NOT cleared here. It used to be, which emptied
+    // `range_count` every telemetry cycle (~1 s). drawUi() then hit its
+    // "no range yet..." branch on the next frame, so the OLED flickered
+    // between the distance and that placeholder forever. Staleness is handled
+    // per record via the timestamp instead (see drawUi).
 }
 
 // ---------------------------------------------------------------------------
@@ -486,8 +490,10 @@ void newRange()
     // a negative distance is meaningless and breaks the solver.
     if (range <= 0.01f) return;
 
-    screenWake();               // a live measurement wakes the panel
-
+    // A live measurement is NOT treated as activity for the display: ranging
+    // runs continuously, so waking on it kept the screen on forever and the
+    // dim/off timeout never fired. The panel wakes on serial input and on
+    // server traffic instead (see handleSerial / onServerConfig).
     if (cfg.role == ROLE_TAG) pushRange(other, me, range, rx, fp, q);
     else                      pushRange(me, other, range, rx, fp, q);
 
@@ -642,8 +648,20 @@ void drawUi()
         return;
     }
 
-    // most recent range, large
-    const RangeRec &r = ranges[range_count - 1];
+    // most recent range, large. Records are kept across telemetry cycles, so
+    // ignore anything older than a few seconds instead of showing a stale
+    // number as if it were live.
+    int8_t newest = -1;
+    for (uint8_t i = 0; i < range_count; i++)
+        if (newest < 0 || ranges[i].ts > ranges[newest].ts) newest = i;
+    if (newest < 0 || (millis() - ranges[newest].ts) > 5000UL) {
+        display.setCursor(0, 28);
+        display.print(F("no range yet..."));
+        display.display();
+        return;
+    }
+
+    const RangeRec &r = ranges[newest];
     display.setTextSize(2);
     display.setCursor(0, 14);
     display.print(r.range, 2);

@@ -11,3 +11,4 @@ server/mqtt_probe.py
 server/scene.json
 server/firmware/*.bin
 server/*.json
+server/ota_tokens.json
