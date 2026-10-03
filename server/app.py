@@ -1078,20 +1078,30 @@ def api_ota_request():
         if not os.path.isfile(os.path.join(OTA_DIR, name)):
             return jsonify({"ok": False, "error": f"firmware not found: {name}"}), 404
         ver = name.rsplit("-", 1)[-1].replace(".bin", "")
-        skipped = []
+        skipped, queued, already = [], [], []
         for dk in targets:
             cur = (STATUS.get(dk, {}) or {}).get("fw") or ""
             if cur and not version_newer(ver, cur):
                 skipped.append(f"{dk} (runs {cur})")
                 continue
+            # Idempotent: pressing the button repeatedly must not build a queue.
+            # A device already waiting for this exact image is left alone.
+            pend = OTA_PENDING.get(dk)
+            if pend and pend.get("firmware") == name:
+                already.append(dk)
+                continue
             OTA_PENDING[dk] = {"firmware": name, "requested": now_ms()}
-        if skipped and len(skipped) == len(targets):
+            queued.append(dk)
+
+        if skipped and not queued and not already:
             return jsonify({"ok": False, "firmware": name,
                             "error": f"not newer than the device firmware: {', '.join(skipped)}"}), 409
 
-    print(f"[ota] update queued for {targets}: {name}")
-    return jsonify({"ok": True, "queued": targets, "firmware": name,
-                    "skipped": skipped})
+    print(f"[ota] queued {queued}, already pending {already}, skipped {skipped} ({name})")
+    return jsonify({"ok": True, "queued": queued, "already": already,
+                    "skipped": skipped, "firmware": name,
+                    "pending": {dk: (OTA_PENDING.get(dk) or {}).get("firmware")
+                                for dk in targets}})
 
 
 @APP.route("/api/v1/ota/firmware/<path:name>", methods=["GET"])

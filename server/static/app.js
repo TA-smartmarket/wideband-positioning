@@ -1539,7 +1539,7 @@ async function renderDevices() {
         <div class="meta">${rssi} · fw ${esc(d.fw || '?')}</div>
       </div>
       <div class="spacer"></div>
-      <button data-ota="${esc(d.id)}" title="Queue a firmware update for this device">${o.pending ? '⏳ Update queued' : '⬆ Update'}</button>
+      <button data-ota="${esc(d.id)}" ${o.pending ? 'disabled' : ''} title="${o.pending ? 'Already waiting for ' + esc(o.pending) : 'Queue a firmware update for this device'}">${o.pending ? '⏳ Queued' : '⬆ Update'}</button>
       ${o.pending ? `<button data-cancel="${esc(d.id)}" title="Cancel the queued update">✕</button>` : ''}
       <button data-key="${esc(d.id)}" title="Show / rotate the OTA key">🔑</button>
     </div>`;
@@ -1602,25 +1602,64 @@ async function loadOta() {
 async function pushOta(deviceId) {
   const name = $('ota-file')?.value;
   if (!name) { toast('No firmware image on the server.'); return; }
-  const who = deviceId === 'all' ? 'ALL devices' : deviceId;
-  if (!confirm(`Queue ${name} for ${who}?\n\nThe device installs it on its next check (within ~1 min) and reboots. Nothing is downloaded until you confirm.`)) return;
 
-  $('ota-result').textContent = `Queuing ${name} for ${who}…`;
+  // Fool protection: one request in flight at a time, and the button reports
+  // the result immediately. Repeated clicking cannot build a queue (the server
+  // is idempotent per device+image too).
+  if (otaRequestInFlight) return;
+  otaRequestInFlight = true;
+
+  const who = deviceId === 'all' ? 'all devices' : deviceId;
+  if (!confirm(`Queue ${name} for ${who}?\n\nThe device installs it on its next check (within ~1 min) and reboots.\nNothing is downloaded until you confirm.`)) {
+    otaRequestInFlight = false;
+    return;
+  }
+
+  setOtaBusy(true, `Queuing ${name} for ${who}…`);
   try {
     const r = await (await fetch('/api/v1/ota/request', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ device_id: deviceId, firmware: name }) })).json();
-    $('ota-result').innerHTML = r.ok
-      ? `Queued for: ${(r.queued || []).join(', ')} — the device will pull it on its next check.`
-      : `Failed: ${esc(r.error || 'unknown')}`;
-    toast(r.ok ? 'Update queued — device pulls it within a minute.' : 'Queue failed.');
-    Audio2.update();
-    if (r.ok) setTimeout(renderDevices, 500);
+
+    if (!r.ok) {
+      $('ota-result').innerHTML = `<span class="bad">Failed: ${esc(r.error || 'unknown')}</span>`;
+      toast('Queue failed.');
+    } else {
+      const q = (r.queued || []), a = (r.already || []), sk = (r.skipped || []);
+      const parts = [];
+      if (q.length) parts.push(`<span class="good">queued: ${q.join(', ')}</span>`);
+      if (a.length) parts.push(`already waiting: ${a.join(', ')}`);
+      if (sk.length) parts.push(`<span class="warn">not newer: ${sk.join(', ')}</span>`);
+      $('ota-result').innerHTML = parts.join('<br>') ||
+        'Nothing to do — the device already runs this image.';
+      toast(q.length ? `Queued on ${q.length} device(s) — installs within a minute.`
+                     : 'Already queued / nothing to do.');
+      Audio2.update();
+    }
   } catch (e) {
     $('ota-result').textContent = 'Request failed: ' + e;
     toast('Request failed.');
+  } finally {
+    otaRequestInFlight = false;
+    setOtaBusy(false);
+    renderDevices();          // reflect the new pending state right away
+    loadOta();
   }
 }
+
+// Show progress on the buttons themselves so a click always has feedback.
+function setOtaBusy(busy, label) {
+  for (const id of ['ota-push-all']) {
+    const b = $(id);
+    if (!b) continue;
+    b.disabled = busy;
+    b.textContent = busy ? '⏳ Working…' : '⬆ Queue update for all';
+  }
+  document.querySelectorAll('[data-ota]').forEach((b) => { b.disabled = busy; });
+  if (busy && label) $('ota-result').textContent = label;
+}
+
+let otaRequestInFlight = false;
 
 // Cancel a queued update.
 async function cancelOta(deviceId) {
