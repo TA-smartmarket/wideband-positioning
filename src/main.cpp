@@ -22,6 +22,7 @@
 #include "solver.h"
 #include "ekf.h"
 #include "net.h"
+#include "ota.h"
 
 // ---------------------------------------------------------------------------
 // globals (declared extern in net.h)
@@ -32,6 +33,7 @@ Net    net;
 WiFiClient   g_wifi_client;
 PubSubClient g_mqtt(g_wifi_client);
 WebServer    g_portal(80);
+WebServer    g_ota(3232);
 
 // ---------------------------------------------------------------------------
 // board pinout (fixed on the Makerfabs ESP32 UWB Pro with Display)
@@ -71,6 +73,8 @@ struct PosRec {
     float x, y;
     float confidence;
     bool  ambiguous;
+    bool  geometry_ok;
+    float geometry_slack;
 };
 PosRec positions[MAX_TAGS];
 uint8_t pos_count = 0;
@@ -235,6 +239,8 @@ String buildTelemetry()
             jsonPutFloat(o, "y", positions[i].y);
             jsonPutFloat(o, "confidence", positions[i].confidence);
             o["ambiguous"] = positions[i].ambiguous;
+            o["geometry_ok"] = positions[i].geometry_ok;
+            jsonPutFloat(o, "geometry_slack", positions[i].geometry_slack);
             o["source"] = "device";
         }
     }
@@ -338,6 +344,27 @@ AnchorFix fixes[MAX_ANCHORS];
 // ---------------------------------------------------------------------------
 Ekf tag_ekf;
 float ekf_last_solve_ms = 0;
+uint8_t ekf_rejects = 0;      // consecutive cycles with no accepted measurement
+
+// Triangle-inequality test on the collected fixes. A violation means at least
+// one anchor is measuring a reflection (NLOS) rather than the direct path.
+// Mirrors geometry_check() in server/app.py.
+float geometrySlack(const AnchorFix *f, uint8_t n)
+{
+    float worst = 0.0f;
+    for (uint8_t i = 0; i < n; i++) {
+        for (uint8_t j = i + 1; j < n; j++) {
+            const float dx = f[j].x - f[i].x, dy = f[j].y - f[i].y;
+            const float d = sqrtf(dx * dx + dy * dy);
+            if (d < 1e-6f) continue;
+            if (f[i].range + f[j].range < d)
+                worst = fmaxf(worst, d - (f[i].range + f[j].range));
+            else if (fabsf(f[i].range - f[j].range) > d)
+                worst = fmaxf(worst, fabsf(f[i].range - f[j].range) - d);
+        }
+    }
+    return worst;
+}
 
 void solveLocally()
 {
@@ -380,24 +407,58 @@ void solveLocally()
         if (ekfUpdateRange(tag_ekf, fixes[i].x, fixes[i].y, fixes[i].range))
             used++;
 
-    // no measurement was accepted this cycle -> the estimate is coasting
-    if (used == 0 && tag_ekf.updates > 0) {
-        // keep publishing the prediction, but with reduced confidence
+    // Self-healing: if every measurement keeps being rejected the filter has
+    // lost the track (its covariance is at the cap). Restart it from the
+    // current geometry instead of coasting on a stale estimate. Mirrors the
+    // EKF_REJECTS logic in server/app.py.
+    if (used == 0) {
+        ekf_rejects++;
+        if (ekf_rejects >= 8) {
+            Position p = solvePosition(fixes, n, cfg.room_w, cfg.room_h);
+            if (p.valid) {
+                ekfInit(tag_ekf, p.x, p.y);
+                ekf_rejects = 0;
+                for (uint8_t i = 0; i < n; i++)
+                    if (ekfUpdateRange(tag_ekf, fixes[i].x, fixes[i].y, fixes[i].range))
+                        used++;
+            }
+        }
+    } else {
+        ekf_rejects = 0;
     }
 
     float px, py, vx, vy;
     ekfPosition(tag_ekf, px, py, vx, vy);
+
+    // Never publish a position outside the room: with two anchors an
+    // inconsistent range pair can throw the estimate far away. Mirrors the
+    // clamp in server/app.py.
+    const float margin = 0.5f;
+    const float cx = fminf(fmaxf(px, -margin), cfg.room_w + margin);
+    const float cy = fminf(fmaxf(py, -margin), cfg.room_h + margin);
+    if (fabsf(cx - px) > 1e-6f || fabsf(cy - py) > 1e-6f) {
+        tag_ekf.x[0] = cx; tag_ekf.x[1] = cy;
+        tag_ekf.x[2] *= 0.2f; tag_ekf.x[3] *= 0.2f;
+        if (tag_ekf.P[0][0] < 0.5f) tag_ekf.P[0][0] = 0.5f;
+        if (tag_ekf.P[1][1] < 0.5f) tag_ekf.P[1][1] = 0.5f;
+        px = cx; py = cy;
+    }
+
     const float sigma = ekfPositionSigma(tag_ekf);
+    const float slack = geometrySlack(fixes, n);
 
     snprintf(positions[0].id, sizeof(positions[0].id), "%s", me);
     positions[0].x = px;
     positions[0].y = py;
     positions[0].confidence = 1.0f / (1.0f + sigma);   // 0..1, from the covariance
     positions[0].ambiguous = false;                     // EKF resolves the mirror
+    positions[0].geometry_ok = (slack <= 0.0f);
+    positions[0].geometry_slack = slack;
     pos_count = 1;
 
-    Serial.printf("[ekf] x %.2f y %.2f v(%.2f,%.2f) sigma %.2f used %u/%u\n",
-                  px, py, vx, vy, sigma, used, n);
+    Serial.printf("[ekf] x %.2f y %.2f v(%.2f,%.2f) sigma %.2f used %u/%u%s\n",
+                  px, py, vx, vy, sigma, used, n,
+                  positions[0].geometry_ok ? "" : "  NLOS-geometry!");
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +852,15 @@ void onServerConfig(JsonObjectConst doc)
             changed = true;
         }
     }
+    if (doc["ota"].is<JsonObjectConst>()) {
+        JsonObjectConst o = doc["ota"].as<JsonObjectConst>();
+        if (o["enabled"].is<bool>()) cfg.ota_enabled = o["enabled"].as<bool>();
+        if (o["port"].is<int>()) cfg.ota_port = (uint16_t)o["port"].as<int>();
+        if (o["token"].is<const char *>()) {
+            snprintf(cfg.ota_token, sizeof(cfg.ota_token), "%s", o["token"].as<const char *>());
+            changed = true;   // a new token needs a reboot to take effect
+        }
+    }
     if (doc["uwb"].is<JsonObjectConst>()) {
         JsonObjectConst u = doc["uwb"].as<JsonObjectConst>();
         if (u["mode"].is<const char *>()) cfg.uwb_mode = uwbModeFromName(u["mode"].as<const char *>());
@@ -886,6 +956,8 @@ void loop()
 
     DW1000Ranging.loop();
     wifiLoop();
+    otaBegin();
+    otaLoop();
     mqttEnsureConnected();
     mqttLoop();
     syncConfigFromServer();

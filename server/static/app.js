@@ -17,6 +17,7 @@ const S = {
   dirty: false,
   trail: {},
   showTrail: true,
+  autoSpin: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -85,6 +86,11 @@ function initThree() {
   scene3.add(roomGroup, anchorGroup, obstacleGroup, tagGroup, linkGroup, trailGroup);
 
   raycaster = new THREE.Raycaster();
+  // CRITICAL: the default Line threshold is 1 world unit, so a thin guide line
+  // (the obstacle height guide) swallowed every click within a metre — that is
+  // why resize handles could never be grabbed. Shrink it to a few centimetres.
+  raycaster.params.Line.threshold = 0.02;
+  raycaster.params.Points.threshold = 0.02;
   addEventListener('resize', resize);
   bindContextLoss();
   bindTouchZoom(renderer.domElement);
@@ -119,11 +125,29 @@ function bindContextLoss() {
 function animate() {
   requestAnimationFrame(animate);
   frameDt = clock.getDelta();
+  if (!renderOn) return;          // paused: skip all per-frame work
   applyKeyboardMove();
+  if (intro) applyIntro();
+  else applyAutoSpin();
   controls.update();
   applyZoom();
   updateFog();
   renderer.render(scene3, camera);
+}
+
+// Optional slow orbit when the user is idle — pure eye candy, off by default.
+let lastInteraction = performance.now();
+function applyAutoSpin() {
+  if (!S.autoSpin) return;
+  if (performance.now() - lastInteraction < 4000) return;
+  const a = frameDt * 0.12;
+  const t = controls.target;
+  const d = camera.position.clone().sub(t);
+  const cos = Math.cos(a), sin = Math.sin(a);
+  const x = d.x * cos - d.z * sin;
+  const z = d.x * sin + d.z * cos;
+  camera.position.set(t.x + x, camera.position.y, t.z + z);
+  camera.lookAt(t);
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +250,7 @@ function isTyping() {
 
 function bindKeyboard() {
   addEventListener('keydown', (e) => {
+    lastInteraction = performance.now();
     if (isTyping()) return;
     const k = e.key.toLowerCase();
     if (['w', 'a', 's', 'd', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft',
@@ -307,13 +332,55 @@ function buildRoom() {
   floor.userData.pick = 'floor';
   roomGroup.add(floor);
 
-  // grid on the floor
-  const grid = new THREE.GridHelper(Math.max(W, D) * 1.2, Math.round(Math.max(W, D) * 2),
+  // 1 m grid, aligned with the world origin (0,0) so it doubles as a ruler
+  const grid = new THREE.GridHelper(Math.max(W, D) * 1.2, Math.round(Math.max(W, D) * 1.2),
                                     0x33406b, 0x222b45);
   grid.position.set(W / 2, 0.005, D / 2);
   roomGroup.add(grid);
 
-  // walls (translucent so the room stays readable from any angle)
+  // ---- coordinate system: X axis (red), Y axis (green), origin marker ----
+  const axes = new THREE.Group();
+  const axisLen = Math.max(W, D) * 0.35 + 0.6;
+
+  const mkAxis = (from, to, color) => {
+    const geo = new THREE.BufferGeometry().setFromPoints([from, to]);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.95 }));
+    line.userData.pick = 'axis';
+    return line;
+  };
+  const X = new THREE.Vector3(1, 0, 0), Y = new THREE.Vector3(0, 0, 1);
+  axes.add(mkAxis(new THREE.Vector3(0, 0.02, 0), X.clone().multiplyScalar(axisLen), 0xff6b6b));
+  axes.add(mkAxis(new THREE.Vector3(0, 0.02, 0), Y.clone().multiplyScalar(axisLen), 0x6bff9c));
+
+  // arrow heads
+  const head = (dir, color) => {
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.18, 12),
+                                new THREE.MeshBasicMaterial({ color }));
+    cone.position.copy(dir.clone().multiplyScalar(axisLen));
+    cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    cone.userData.pick = 'axis';
+    return cone;
+  };
+  axes.add(head(X, 0xff6b6b));
+  axes.add(head(Y, 0x6bff9c));
+
+  // origin dot
+  const origin = new THREE.Mesh(new THREE.SphereGeometry(0.055, 14, 12),
+                                new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  origin.position.set(0, 0.02, 0);
+  origin.userData.pick = 'axis';
+  axes.add(origin);
+
+  axes.add(label('X →', new THREE.Vector3(axisLen * 0.72, 0.14, 0.16), 0xff9a9a, 0.13));
+  axes.add(label('Y →', new THREE.Vector3(0.16, 0.14, axisLen * 0.72), 0x9affc0, 0.13));
+  axes.add(label('0,0', new THREE.Vector3(-0.02, 0.10, -0.22), 0xd8e0ff, 0.12));
+  roomGroup.add(axes);
+
+  // ---- rulers along two edges -------------------------------------------
+  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(W, 0, 0), 'x'));
+  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, 0, D), 'y'));
+
+  // ---- walls (translucent so the room stays readable from any angle) -----
   const wallMat = new THREE.MeshStandardMaterial({
     color: 0x38507f, transparent: true, opacity: 0.16,
     side: THREE.DoubleSide, roughness: 1.0 });
@@ -328,37 +395,95 @@ function buildRoom() {
   mk(0.06, H, D, 0, H / 2, D / 2);          // x = 0
   mk(0.06, H, D, W, H / 2, D / 2);          // x = W
 
-  // dimension labels
-  label(`W ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -0.45), 0x93a4c8);
-  label(`D ${D.toFixed(2)} m`, new THREE.Vector3(-0.45, 0.12, D / 2), 0x93a4c8);
+  // dimension labels (the rulers already carry per-metre numbers)
+  label(`width ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -0.62), 0xa8b8dc);
+  label(`depth ${D.toFixed(2)} m`, new THREE.Vector3(-0.62, 0.12, D / 2), 0xa8b8dc);
 
   controls.target.set(W / 2, 0.8, D / 2);
   updateHud();
 }
 
 function label(text, pos, color = 0xffffff, size = 0.16) {
-  const c = document.createElement('canvas');
-  const ctx = c.getContext('2d');
-  const font = `bold 48px system-ui, sans-serif`;
-  ctx.font = font;
-  c.width = Math.ceil(ctx.measureText(text).width) + 24;
-  c.height = 64;
-  const g = c.getContext('2d');
-  g.font = font;
-  g.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
-  g.textBaseline = 'middle';
-  g.fillText(text, 12, 32);
-  const tex = new THREE.CanvasTexture(c);
-  tex.minFilter = THREE.LinearFilter;
-  const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false,
-                                                          transparent: true }));
-  spr.scale.set(c.width / 64 * size, c.height / 64 * size, 1);
+  const canvas = document.createElement('canvas');
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({
+    transparent: true, depthTest: false }));
   spr.position.copy(pos);
+  spr.userData.labelSize = size;
+  spr.userData.labelColor = color;
   spr.userData.pick = 'label';
+  // Reuse the same canvas + texture when the text changes (the anchor labels
+  // update every poll, so allocating a texture each time leaked GPU memory).
+  spr.userData.setText = (t, col) => {
+    if (col !== undefined) spr.userData.labelColor = col;
+    if (spr.userData.text === t && spr.userData.col === spr.userData.labelColor) return;
+    spr.userData.text = t;
+    spr.userData.col = spr.userData.labelColor;
+
+    const g = canvas.getContext('2d');
+    const font = 'bold 40px system-ui, sans-serif';
+    g.font = font;
+    const lines = String(t).split('\n');
+    const w = Math.ceil(Math.max(...lines.map((l) => g.measureText(l).width))) + 24;
+    const lh = 48;
+    const h = lh * lines.length;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    g.clearRect(0, 0, w, h);
+    g.font = font;
+    g.fillStyle = `#${spr.userData.labelColor.toString(16).padStart(6, '0')}`;
+    g.textBaseline = 'middle';
+    lines.forEach((l, i) => g.fillText(l, 12, lh * i + lh / 2));
+
+    if (!spr.material.map) {
+      spr.material.map = new THREE.CanvasTexture(canvas);
+      spr.material.map.minFilter = THREE.LinearFilter;
+    } else {
+      spr.material.map.needsUpdate = true;
+    }
+    const s = spr.userData.labelSize;
+    spr.scale.set(w / 64 * s, h / 64 * s, 1);
+  };
+  spr.userData.setText(text);
   return spr;
 }
 
-/* --------------------------------------------------------------- anchors */
+/* ------------------------------------------------------------- rulers */
+/* --- anchors  + measuring rulers ----------------------------------------- */
+// A measuring ruler along one room edge: a baseline with 0.5 m ticks and a
+// numeric label every metre, so distances in the 3D view can be read off
+// directly instead of guessed.
+function makeRuler(from, to) {
+  const g = new THREE.Group();
+  const len = from.distanceTo(to);
+  const dir = new THREE.Vector3().subVectors(to, from).normalize();
+  const side = new THREE.Vector3(-dir.z, 0, dir.x);      // outward on the floor
+
+  g.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([from, to]),
+    new THREE.LineBasicMaterial({ color: 0x8fa6d8, transparent: true, opacity: 0.9 })));
+
+  const tickMat = new THREE.LineBasicMaterial({ color: 0x8fa6d8, transparent: true, opacity: 0.75 });
+  const majorMat = new THREE.LineBasicMaterial({ color: 0xc7d6ff });
+
+  const ticks = Math.round(len * 2);                      // every 0.5 m
+  for (let i = 0; i <= ticks; i++) {
+    const t = i / 2;                                      // metres
+    const p = from.clone().addScaledVector(dir, t);
+    const major = Math.abs(t - Math.round(t)) < 1e-6;     // whole metre
+    const h = major ? 0.17 : 0.09;
+    const a = p.clone().addScaledVector(side, 0.02);
+    const b = p.clone().addScaledVector(side, h);
+    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]),
+                         major ? majorMat : tickMat));
+    if (major && i > 0) {
+      const lp = p.clone().addScaledVector(side, h + 0.12);
+      lp.y = 0.10;
+      g.add(label(`${t} m`, lp, 0xb9c8ee, 0.105));
+    }
+  }
+  return g;
+}
+
 function buildAnchors() {
   clearGroup(anchorGroup);
   for (const k of Object.keys(anchorObjs)) delete anchorObjs[k];
@@ -404,10 +529,45 @@ function buildAnchors() {
       g.add(halo);
     }
 
-    g.add(label(a.label || a.id, new THREE.Vector3(0, a.z + 0.32, 0),
-                online ? 0x9ff5cf : 0x93a4c8, 0.13));
+    g.add(anchorLabel(a, live));
     anchorObjs[a.id] = g;
     anchorGroup.add(g);
+  }
+}
+
+// Anchor label: name on the first line, live values underneath
+// (position always, plus the current range/RSSI when the device reports them).
+function anchorLabel(a, live) {
+  const online = live ? live.online : false;
+  const spr = label(a.label || a.id, new THREE.Vector3(0, a.z + 0.42, 0),
+                    online ? 0x9ff5cf : 0x93a4c8, 0.125);
+  spr.userData.anchorId = a.id;
+  return spr;
+}
+
+// Live text for every anchor label, refreshed from /api/v1/state.
+function updateAnchorLabels() {
+  for (const a of S.scene.anchors) {
+    const g = anchorObjs[a.id];
+    if (!g) continue;
+    const spr = g.children.find((c) => c.userData && c.userData.setText && c.userData.anchorId);
+    if (!spr) continue;
+
+    const live = S.state.anchors.find((x) => x.id === a.id);
+    const online = live ? live.online : false;
+
+    // live range to the tag, if any link exists
+    let rng = null;
+    for (const t of S.state.tags || []) {
+      const l = (t.links || {})[a.id];
+      if (l && t.ranges && t.ranges[a.id] !== undefined) { rng = t.ranges[a.id]; break; }
+    }
+
+    const lines = [`${a.label || a.id}  (${a.x.toFixed(2)}, ${a.y.toFixed(2)})`];
+    if (!online) lines.push('offline');
+    else if (rng !== null) lines.push(`${rng.toFixed(2)} m`);
+    else lines.push('online');
+    spr.userData.setText(lines.join('\n'), online ? 0x9ff5cf : 0x93a4c8);
   }
 }
 
@@ -442,24 +602,57 @@ function buildObstacles() {
     g.add(edges);
 
     if (sel) {
-      // resize handles on the horizontal footprint corners
-      for (const [dx, dz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      // Resize handles.
+      //
+      // They used to sit at the footprint corners at y = 0, i.e. *inside* the
+      // box body. The raycaster therefore always hit the box face first, so
+      // dragging moved the obstacle instead of resizing it — the resize
+      // "didn't work". Handles are now larger and pushed OUTSIDE the box, and
+      // pick() gives them priority.
+      const out = 0.16;                 // offset beyond the surface
+      const R = 0.13;                   // handle radius (bigger = easier to grab)
+
+      const mkHandle = (x, z, kind, axis) => {
         const h = new THREE.Mesh(
-          new THREE.SphereGeometry(0.07, 12, 12),
-          new THREE.MeshBasicMaterial({ color: COL.sel }));
-        h.position.set(dx * ob.sx / 2, 0, dz * ob.sy / 2);
+          new THREE.SphereGeometry(R, 16, 14),
+          new THREE.MeshBasicMaterial({ color: kind === 'edge' ? 0x93c5fd : COL.sel }));
+        h.position.set(x, 0, z);
         h.userData.pick = 'obstacleHandle';
         h.userData.id = ob.id;
-        h.userData.corner = [dx, dz];
-        g.add(h);
-      }
+        h.userData.axis = axis;         // 'both' | 'x' | 'y'
+        h.userData.corner = [Math.sign(x) || 1, Math.sign(z) || 1];
+        h.renderOrder = 10;
+        return h;
+      };
+
+      const hx = ob.sx / 2 + out, hy = ob.sy / 2 + out;
+      // corners -> resize both axes
+      for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]])
+        g.add(mkHandle(sx * hx, sz * hy, 'corner', 'both'));
+      // edge midpoints -> resize one axis only
+      g.add(mkHandle(0, -hy, 'edge', 'y'));
+      g.add(mkHandle(0, hy, 'edge', 'y'));
+      g.add(mkHandle(-hx, 0, 'edge', 'x'));
+      g.add(mkHandle(hx, 0, 'edge', 'x'));
+
+      // height cone, lifted clear of the top face AND offset from the edge
+      // handles so it never overlaps them in screen space
       const up = new THREE.Mesh(
-        new THREE.ConeGeometry(0.08, 0.2, 12),
-        new THREE.MeshBasicMaterial({ color: COL.sel }));
-      up.position.set(0, ob.sz / 2 + 0.14, 0);
+        new THREE.ConeGeometry(0.11, 0.26, 14),
+        new THREE.MeshBasicMaterial({ color: 0xa7f3d0 }));
+      up.position.set(0, ob.sz / 2 + 0.30, 0);
       up.userData.pick = 'obstacleHeight';
       up.userData.id = ob.id;
+      up.renderOrder = 10;
       g.add(up);
+      // thin vertical guide so the cone reads as "height" (decoration only —
+      // the cone itself is the grab target)
+      const guide = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(0, ob.sz / 2, 0),
+          new THREE.Vector3(0, ob.sz / 2 + 0.30, 0)]),
+        new THREE.LineBasicMaterial({ color: 0xa7f3d0, transparent: true, opacity: 0.8 }));
+      g.add(guide);
     }
 
     obstacleObjs[ob.id] = g;
@@ -602,15 +795,27 @@ function resizeObstacleMesh(o) {
     edges.geometry.dispose();
     edges.geometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(o.sx, o.sz, o.sy));
   }
-  // reposition the corner handles / height cone
-  const handles = g.children.slice(2);
-  let hi = 0;
-  for (const c of handles) {
-    if (c.userData.pick === 'obstacleHandle') {
-      const [dx, dz] = [[-1, -1], [1, -1], [1, 1], [-1, 1]][hi++] || [0, 0];
-      c.position.set(dx * o.sx / 2, 0, dz * o.sy / 2);
-    } else if (c.userData.pick === 'obstacleHeight') {
-      c.position.set(0, o.sz / 2 + 0.14, 0);
+  // reposition the handles / height cone / guide
+  for (const c of g.children) {
+    const kind = c.userData.pick;
+    if (kind === 'obstacleHandle') {
+      const [sx, sz] = c.userData.corner;
+      const out = 0.16;
+      const edge = c.userData.axis === 'x' || c.userData.axis === 'y';
+      c.position.set(
+        edge && c.userData.axis === 'y' ? 0 : sx * (o.sx / 2 + out),
+        0,
+        edge && c.userData.axis === 'x' ? 0 : sz * (o.sy / 2 + out));
+    } else if (kind === 'obstacleHeight') {
+      if (c.isLine) {
+        const p = c.geometry.attributes.position;
+        p.setXYZ(0, 0, o.sz / 2, 0);
+        p.setXYZ(1, 0, o.sz / 2 + 0.30, 0);
+        p.needsUpdate = true;
+        c.geometry.computeBoundingSphere();
+      } else {
+        c.position.set(0, o.sz / 2 + 0.30, 0);
+      }
     }
   }
 }
@@ -679,10 +884,29 @@ function pick(ev) {
   const hits = raycaster.intersectObjects(
     [...anchorGroup.children, ...obstacleGroup.children,
      ...tagGroup.children, ...roomGroup.children], true);
-  for (const h of hits) {
+
+  // Walls are translucent decoration: they must never swallow a click, which
+  // is what happened in the Top view (the ray entered through the ceiling).
+  const usable = hits.filter((h) => {
     let o = h.object;
     while (o && !o.userData.pick) o = o.parent;
-    if (o && o.userData.pick) return { obj: o, point: h.point, hit: h.object };
+    return o && o.userData.pick && o.userData.pick !== 'wall';
+  });
+
+  // Resize handles win over everything else: they are small and often overlap
+  // the obstacle body, so a plain "first hit wins" test would make resizing
+  // impossible (the body would be grabbed instead).
+  for (const h of usable) {
+    let o = h.object;
+    while (o && !o.userData.pick) o = o.parent;
+    if (o.userData.pick === 'obstacleHandle' || o.userData.pick === 'obstacleHeight')
+      return { obj: o, point: h.point, hit: h.object };
+  }
+
+  for (const h of usable) {
+    let o = h.object;
+    while (o && !o.userData.pick) o = o.parent;
+    if (o.userData.pick) return { obj: o, point: h.point, hit: h.object };
   }
   return null;
 }
@@ -698,7 +922,10 @@ function bindPointer() {
   const el = renderer.domElement;
   let downAt = null;
 
-  el.addEventListener('wheel', onWheel, { passive: false });
+  const bump = () => { lastInteraction = performance.now(); };
+  el.addEventListener('wheel', (e) => { bump(); onWheel(e); }, { passive: false });
+  el.addEventListener('pointerdown', bump);
+  el.addEventListener('pointermove', bump);
   el.addEventListener('pointerdown', (ev) => {
     if (ev.button !== 0) return;
     downAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
@@ -711,8 +938,9 @@ function bindPointer() {
       controls.enabled = false;
       const gp = groundPoint(ev);
       S.drag = {
-        type: u.pick, id: u.id, corner: u.corner,
+        type: u.pick, id: u.id, corner: u.corner, axis: u.axis,
         startX: gp ? gp.x : 0, startZ: gp ? gp.z : 0,
+        startClientY: ev.clientY, startClientX: ev.clientX,
         orig: JSON.parse(JSON.stringify(
           u.pick === 'anchor'
             ? S.scene.anchors.find((a) => a.id === u.id)
@@ -756,15 +984,23 @@ function bindPointer() {
         const lx = dx * Math.cos(-rot) - dz * Math.sin(-rot);
         const lz = dx * Math.sin(-rot) + dz * Math.cos(-rot);
         const [cx, cz] = S.drag.corner;
-        o.sx = Math.max(0.2, S.drag.orig.sx + cx * lx * 2);
-        o.sy = Math.max(0.2, S.drag.orig.sy + cz * lz * 2);
+        const axis = S.drag.axis || 'both';
+        // edge handles resize one axis; corner handles resize both
+        if (axis === 'both' || axis === 'x')
+          o.sx = Math.max(0.2, S.drag.orig.sx + cx * lx * 2);
+        if (axis === 'both' || axis === 'y')
+          o.sy = Math.max(0.2, S.drag.orig.sy + cz * lz * 2);
         S.dirty = true;
         resizeObstacleMesh(o);
       }
     } else if (S.drag.type === 'obstacleHeight') {
       const o = S.scene.obstacles.find((x) => x.id === S.drag.id);
       if (o) {
-        o.sz = Math.max(0.2, S.drag.orig.sz - (ev.movementY || 0) * 0.01);
+        // movementY is unreliable (0 for touch and synthetic events), so use
+        // the actual pointer travel since the drag started.
+        const dy = (S.drag.startClientY ?? ev.clientY) - ev.clientY;
+        const scale = 0.01 * Math.max(camera.position.distanceTo(controls.target) / 6, 0.4);
+        o.sz = Math.max(0.2, S.drag.orig.sz + dy * scale);
         S.dirty = true;
         resizeObstacleMesh(o);
       }
@@ -775,11 +1011,31 @@ function bindPointer() {
   el.addEventListener('pointerup', (ev) => {
     const quick = downAt && Math.hypot(ev.clientX - downAt.x, ev.clientY - downAt.y) < 4
                   && performance.now() - downAt.t < 400;
+
     if (S.drag) {
+      const dragged = !quick;      // a real move, not just a click
       S.drag = null;
       controls.enabled = true;
-      rebuildAll();          // one rebuild after the drag, not per pointermove
-      if (S.selected) showSelection();
+      if (dragged) {
+        rebuildAll();              // one rebuild after the drag, not per move
+        if (S.selected) showSelection();
+        downAt = null;
+        return;
+      }
+      // A click on a body selects it (this is what makes the resize handles
+      // appear). Previously every pointerdown entered drag mode and pointerup
+      // bailed out, so objects could never be selected by clicking.
+      const p = pick(ev);
+      if (p) {
+        const u = p.obj.userData;
+        if (u.pick === 'anchor') select('anchor', u.id);
+        else if (u.pick === 'obstacle') select('obstacle', u.id);
+        else if (u.pick === 'tag') select('tag', u.id);
+        else select(null, null);
+      } else {
+        select(null, null);
+      }
+      downAt = null;
       return;
     }
     if (!quick) { downAt = null; return; }
@@ -942,7 +1198,8 @@ function showSelection() {
         <tr><td>Confidence</td><td>${((t.confidence ?? 0) * 100).toFixed(0)}%</td></tr>
         <tr><td>Status</td><td>${t.online ? 'live' : 'offline'}</td></tr>
       </table>
-      <h4>Links</h4>${linksTable(t)}`;
+      <h4>Links</h4>${linksTable(t)}
+      ${t.geometry_ok === false ? `<p class="bad" style="font-size:12px">⚠ Range measurements are geometrically inconsistent by ${(t.geometry_slack || 0).toFixed(2)} m — one or more anchors are likely measuring a reflection (NLOS), not the direct path.</p>` : ''}`;
   }
 }
 
@@ -1000,8 +1257,10 @@ async function poll() {
   try {
     const r = await fetch('/api/v1/state');
     S.state = await r.json();
-    if (!S.drag) { buildTags(); buildLinks(); }
+    if (!S.drag) { buildTags(); buildLinks(); updateAnchorLabels(); }
     updateHud();
+    renderTagList();
+    cueTransitions();
     if (S.selected?.type === 'tag') showSelection();
     updateFog();
   } catch (e) { /* server restarting */ }
@@ -1010,10 +1269,19 @@ async function poll() {
 function updateHud() {
   const live = S.state.tags?.filter((t) => t.online).length || 0;
   const anc = S.state.anchors?.filter((a) => a.online).length || 0;
+  const tag = S.state.tags?.[0];
+  const coord = tag && tag.online
+    ? `<span class="sep"></span><span class="mono">tag (${tag.x.toFixed(2)}, ${tag.y.toFixed(2)}) m</span>`
+    : '';
+  // Geometry warning: ranges that violate the triangle inequality mean at
+  // least one anchor is measuring a reflection (NLOS), not the direct path.
+  const geoWarn = (tag && tag.online && tag.geometry_ok === false)
+    ? `<span class="sep"></span><span class="warn" title="Range measurements are geometrically inconsistent — likely NLOS reflections. Slack: ${(tag.geometry_slack || 0).toFixed(2)} m">⚠ NLOS ${(tag.geometry_slack || 0).toFixed(2)} m</span>`
+    : '';
   $('hud').innerHTML =
     `<span class="dot ${anc ? 'on' : 'off'}"></span>${anc} anchor${anc === 1 ? '' : 's'} online` +
     `<span class="sep"></span><span class="dot ${live ? 'on' : 'off'}"></span>` +
-    `${live} tag${live === 1 ? '' : 's'} live` +
+    `${live} tag${live === 1 ? '' : 's'} live` + coord + geoWarn +
     (S.state.nlos_enabled === false ? '<span class="sep"></span><span class="warn">NLOS off</span>' : '');
 }
 
@@ -1036,7 +1304,304 @@ function toast(msg) {
 }
 
 /* ------------------------------------------------------------------- init */
+/* ==========================================================================
+   Sound: tiny synthesised cues (no assets to ship). A soft blip when a device
+   comes online, a two-tone chime for an update push, a low tone for a lost
+   link. All optional and off until the user enables it.
+   ========================================================================== */
+const Audio2 = (() => {
+  let ctx = null;
+  let enabled = true;
+
+  const ensure = () => {
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ctx = new AC();
+    }
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  };
+
+  // one shaped tone
+  const tone = (freq, dur, type = 'sine', gain = 0.06, slideTo = null) => {
+    if (!enabled) return;
+    const c = ensure();
+    if (!c) return;
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, c.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, c.currentTime + dur);
+    g.gain.setValueAtTime(0.0001, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(gain, c.currentTime + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    o.connect(g).connect(c.destination);
+    o.start();
+    o.stop(c.currentTime + dur + 0.02);
+  };
+
+  return {
+    get enabled() { return enabled; },
+    set enabled(v) { enabled = v; if (v) ensure(); },
+    online()  { tone(660, 0.10, 'triangle', 0.05); setTimeout(() => tone(990, 0.12, 'triangle', 0.04), 90); },
+    offline() { tone(220, 0.22, 'sawtooth', 0.035, 140); },
+    update()  { tone(440, 0.09, 'square', 0.035); setTimeout(() => tone(880, 0.14, 'square', 0.03), 100); },
+    nlos()    { tone(300, 0.18, 'sine', 0.03, 200); },
+    boot()    { tone(523, 0.10, 'sine', 0.04); setTimeout(() => tone(784, 0.14, 'sine', 0.035), 110);
+                setTimeout(() => tone(1046, 0.20, 'sine', 0.03), 230); },
+  };
+})();
+
+/* ==========================================================================
+   Tabs
+   ========================================================================== */
+function setTab(name) {
+  document.querySelectorAll('#tabs button').forEach((b) =>
+    b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('#panel section[data-panel]').forEach((s) =>
+    (s.hidden = s.dataset.panel !== name));
+  if (name === 'devices') renderDevices();
+  if (name === 'api') renderApi();
+  if (name === 'setup') loadOta();
+}
+
+/* ==========================================================================
+   Devices panel — IP, signal, firmware, per-device OTA key
+   ========================================================================== */
+async function renderDevices() {
+  const host = $('devicelist');
+  const devs = S.state.devices || [];
+  if (!devs.length) { host.innerHTML = '<p class="muted">No device has reported yet.</p>'; return; }
+
+  let ota = { devices: [] };
+  try { ota = await (await fetch('/api/v1/ota')).json(); } catch (e) { /* offline */ }
+  const keyOf = (id) => (ota.devices || []).find((d) => d.id === id) || {};
+
+  host.innerHTML = devs.map((d) => {
+    const o = keyOf(d.id);
+    const rssi = (d.rssi === null || d.rssi === undefined) ? '—' : `${d.rssi} dBm`;
+    return `<div class="dev">
+      <span class="dot ${d.online ? 'on' : 'off'}"></span>
+      <div>
+        <div class="name">${esc(d.id)} <span class="pill">${esc(d.role || '')}</span></div>
+        <div class="ip">${esc(d.ip || 'no ip yet')}</div>
+        <div class="meta">${rssi} · fw ${esc(d.fw || '?')}</div>
+      </div>
+      <div class="spacer"></div>
+      <button data-ota="${esc(d.id)}" title="Push firmware to this device">OTA</button>
+      <button data-key="${esc(d.id)}" title="Show / rotate the OTA key">🔑</button>
+    </div>`;
+  }).join('');
+
+  host.querySelectorAll('[data-ota]').forEach((b) => {
+    b.onclick = () => pushOta(b.dataset.ota);
+  });
+  host.querySelectorAll('[data-key]').forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.key;
+      const o = keyOf(id);
+      const rotate = confirm(`Key for ${id}:\n\n${o.key || '(unknown)'}\n\nRotate it? The device picks up the new key on its next config sync.`);
+      if (!rotate) return;
+      try {
+        const r = await (await fetch('/api/v1/ota/key', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_id: id }) })).json();
+        toast(`New key for ${id}: ${r.key}`);
+        renderDevices();
+      } catch (e) { toast('Key rotation failed'); }
+    };
+  });
+}
+
+/* ==========================================================================
+   OTA — list server-side images and push them
+   ========================================================================== */
+let otaInfo = { firmware: [], devices: [] };
+
+async function loadOta() {
+  try {
+    otaInfo = await (await fetch('/api/v1/ota')).json();
+  } catch (e) {
+    $('ota-hint').textContent = 'Server OTA endpoint unreachable.';
+    return;
+  }
+  const sel = $('ota-file');
+  sel.innerHTML = (otaInfo.firmware || []).length
+    ? otaInfo.firmware.map((f) => `<option value="${esc(f.name)}">${esc(f.name)} — ${(f.size / 1024).toFixed(0)} kB</option>`).join('')
+    : '<option value="">(no .bin in server/firmware/)</option>';
+
+  const online = (otaInfo.devices || []).filter((d) => d.online).length;
+  $('ota-hint').innerHTML =
+    `Server folder <code>server/firmware/</code> · port <b>${otaInfo.port || 3232}</b> · ` +
+    `${online} device${online === 1 ? '' : 's'} online.<br>` +
+    `Each device carries its own key; updates are refused without it.`;
+}
+
+async function pushOta(deviceId) {
+  const name = $('ota-file')?.value;
+  if (!name) { toast('No firmware image on the server.'); return; }
+  const who = deviceId === 'all' ? 'ALL online devices' : deviceId;
+  if (!confirm(`Push ${name} to ${who}?\n\nThe device reboots when the update finishes.`)) return;
+
+  $('ota-result').textContent = `Uploading ${name} to ${who}…`;
+  Audio2.update();
+  try {
+    const r = await (await fetch('/api/v1/ota/push', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId, firmware: name }) })).json();
+    const lines = Object.entries(r.results || {}).map(([k, v]) => `${k}: ${v}`);
+    $('ota-result').innerHTML = lines.map(esc).join('<br>');
+    toast(r.ok ? 'Update pushed.' : 'Update failed — see the result panel.');
+  } catch (e) {
+    $('ota-result').textContent = 'Push failed: ' + e;
+    toast('Update failed.');
+  }
+}
+
+/* ==========================================================================
+   API tab — endpoints come from the server, so they never go stale
+   ========================================================================== */
+let apiInfo = null;
+
+async function renderApi() {
+  const host = $('apilist');
+  try {
+    apiInfo = await (await fetch('/api/v1/meta')).json();
+  } catch (e) { host.innerHTML = '<p class="muted">Server unreachable.</p>'; return; }
+
+  host.innerHTML = apiInfo.endpoints.map((e) => `
+    <div class="ep">
+      ${e.methods.map((m) => `<span class="m ${m}">${m}</span>`).join('')}
+      <span class="p">${esc(e.path)}</span>
+      ${e.doc ? `<div class="d">${esc(e.doc)}</div>` : ''}
+    </div>`).join('');
+
+  const base = (S.scene && S.state && S.state.site) || 'uwb/home';
+  $('mqtttopics').innerHTML = `
+    <tr><th>Topic</th><th>Dir</th></tr>
+    <tr><td><code>uwb/home/telemetry</code></td><td>device → server</td></tr>
+    <tr><td><code>uwb/home/range</code></td><td>device → server</td></tr>
+    <tr><td><code>uwb/home/status/&lt;id&gt;</code></td><td>device → server</td></tr>
+    <tr><td><code>uwb/home/config/&lt;id&gt;</code></td><td>server → device</td></tr>
+    <tr><td><code>uwb/home/cmd/&lt;id&gt;</code></td><td>server → device</td></tr>
+    <tr><td><code>uwb/home/state</code></td><td>server → all</td></tr>`;
+}
+
+/* ==========================================================================
+   Theme
+   ========================================================================== */
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('uwb-theme', theme); } catch (e) {}
+  $('theme-toggle').textContent = theme === 'light' ? '🌙' : '☀';
+  if (scene3) {
+    const light = theme === 'light';
+    scene3.background = new THREE.Color(light ? 0xeef2fb : 0x0b0e1a);
+    if (scene3.fog) scene3.fog.color = scene3.background;
+    if (roomGroup) buildRoom();
+  }
+}
+
+/* ==========================================================================
+   Render toggle — pausing the loop saves a lot of CPU/GPU on a laptop when
+   the view is only being watched. Default: rendering ON.
+   ========================================================================== */
+let renderOn = true;
+
+function toggleRender() {
+  renderOn = !renderOn;
+  const b = $('render-toggle');
+  b.textContent = renderOn ? '⏸' : '▶';
+  b.classList.toggle('on', !renderOn);
+  toast(renderOn ? 'Rendering resumed' : 'Rendering paused (Space to resume)');
+}
+
+/* ==========================================================================
+   Tags panel
+   ========================================================================== */
+function renderTagList() {
+  const host = $('taglist');
+  const tags = S.state.tags || [];
+  if (!tags.length) { host.innerHTML = '<p class="muted">No tag reporting yet.</p>'; return; }
+  host.innerHTML = tags.map((t) => `
+    <div class="dev">
+      <span class="dot ${t.online ? 'on' : 'off'}"></span>
+      <div>
+        <div class="name">${esc(t.id)}</div>
+        <div class="meta mono">(${t.x.toFixed(2)}, ${t.y.toFixed(2)}) m · σ ${(t.sigma || 0).toFixed(2)}</div>
+        <div class="meta">${esc(t.ip || 'no ip yet')} · conf ${((t.confidence || 0) * 100).toFixed(0)}%</div>
+      </div>
+    </div>`).join('');
+}
+
+/* ==========================================================================
+   Sound cues: track online/offline transitions so a beep only fires on change
+   ========================================================================== */
+const wasOnline = {};
+
+function cueTransitions() {
+  for (const d of S.state.devices || []) {
+    const prev = wasOnline[d.id];
+    if (prev === undefined) { wasOnline[d.id] = d.online; continue; }
+    if (prev !== d.online) {
+      wasOnline[d.id] = d.online;
+      if (d.online) Audio2.online(); else Audio2.offline();
+    }
+  }
+  // NLOS warning tone, only on the rising edge
+  const tag = S.state.tags?.[0];
+  const bad = tag && tag.online && tag.geometry_ok === false;
+  if (bad && !cueTransitions._nlos) { Audio2.nlos(); }
+  cueTransitions._nlos = !!bad;
+}
+
+/* ==========================================================================
+   Intro: fade the boot overlay, chime, and sweep the camera in with a spin.
+   Runs once per page load.
+   ========================================================================== */
+function playIntro() {
+  const boot = $('boot');
+  setTimeout(() => {
+    boot.classList.add('gone');
+    Audio2.boot();
+  }, 900);
+
+  // camera sweep: start wide and high, settle into the home view
+  const home = {
+    pos: camera.position.clone(),
+    target: controls.target.clone(),
+  };
+  const start = home.pos.clone().multiplyScalar(2.1);
+  start.y = Math.max(home.pos.y * 2.4, 12);
+  const t0 = performance.now();
+  const dur = 2100;
+  intro = { home, start, t0, dur };
+}
+
+let intro = null;
+
+function applyIntro() {
+  if (!intro) return;
+  const p = Math.min((performance.now() - intro.t0) / intro.dur, 1);
+  const e = 1 - Math.pow(1 - p, 3);            // ease-out cubic
+  // position: lerp from the wide start to home, plus one full rotation
+  const pos = intro.start.clone().lerp(intro.home.pos, e);
+  const ang = (1 - e) * Math.PI * 1.35;        // spin ~240 degrees
+  const t = intro.home.target;
+  const dx = pos.x - t.x, dz = pos.z - t.z;
+  const c = Math.cos(ang), s = Math.sin(ang);
+  camera.position.set(t.x + dx * c - dz * s, pos.y, t.z + dx * s + dz * c);
+  camera.lookAt(t);
+  if (p >= 1) { intro = null; rememberHome(); }
+}
+
 function initUi() {
+  // tabs
+  document.querySelectorAll('#tabs button').forEach((b) => {
+    b.onclick = () => setTab(b.dataset.tab);
+  });
+
   ['r-w', 'r-d', 'r-h'].forEach((id) => {
     $(id).onchange = () => {
       S.scene.room.width = Math.max(0.5, +$('r-w').value);
@@ -1051,12 +1616,24 @@ function initUi() {
   $('reload').onclick = loadScene;
   $('nlos').onchange = (e) => { S.nlos = e.target.checked; setDirty(); };
   $('trail').onchange = (e) => { S.showTrail = e.target.checked; buildTrail(); };
+  $('spin').onchange = (e) => { S.autoSpin = e.target.checked; };
   $('view-top').onclick = () => setView('top');
   $('view-iso').onclick = () => setView('iso');
   $('view-home').onclick = resetView;
   $('zoom-in').onclick = () => zoomBy(-1);
   $('zoom-out').onclick = () => zoomBy(1);
   $('trail-clear').onclick = () => { S.trail = {}; buildTrail(); };
+  $('render-toggle').onclick = toggleRender;
+  $('sound-toggle').onclick = () => {
+    Audio2.enabled = !Audio2.enabled;
+    $('sound-toggle').textContent = Audio2.enabled ? '🔊' : '🔇';
+    $('sound-toggle').classList.toggle('on', !Audio2.enabled);
+    if (Audio2.enabled) Audio2.online();
+  };
+  $('theme-toggle').onclick = () =>
+    applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+  $('ota-push-all').onclick = () => pushOta('all');
+
   addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (document.activeElement.tagName !== 'INPUT') { removeSelected(); e.preventDefault(); }
@@ -1066,6 +1643,7 @@ function initUi() {
     if (e.key === '+' || e.key === '=') zoomBy(-1);
     if (e.key === '-' || e.key === '_') zoomBy(1);
     if (e.key === 'h' || e.key === 'H') resetView();
+    if (e.key === ' ') { toggleRender(); e.preventDefault(); }
   });
   addEventListener('beforeunload', (e) => {
     if (S.dirty) { e.preventDefault(); e.returnValue = ''; }
@@ -1115,16 +1693,54 @@ function zoomBy(notches) {
 
 initThree();
 initUi();
-loadScene().then(() => setView('iso'));
+loadScene().then(() => { setView('iso'); playIntro(); });
+applyTheme(localStorage.getItem('uwb-theme') || 'dark');
 poll();
 setInterval(poll, 500);
 
 // Small read-only hook used by the automated UI tests (camera distance,
 // pending zoom momentum, held keys). Harmless in normal use.
+// What would pick() return at these client coordinates? (test/debug helper)
+window.__uwbPickAt = (clientX, clientY) => {
+  const p = pick({ clientX, clientY });
+  if (!p) return null;
+  return { pick: p.obj.userData.pick, id: p.obj.userData.id || null,
+           axis: p.obj.userData.axis || null };
+};
+
+// Screen positions of the selected obstacle's handles (test/debug helper).
+window.__uwbHandles = (id) => {
+  const g = obstacleObjs[id];
+  if (!g) return [];
+  const r = renderer.domElement.getBoundingClientRect();
+  const out = [];
+  for (const c of g.children) {
+    if (c.userData.pick !== 'obstacleHandle' && c.userData.pick !== 'obstacleHeight') continue;
+    const p = new THREE.Vector3();
+    c.getWorldPosition(p);
+    p.project(camera);
+    out.push({
+      kind: c.userData.pick, axis: c.userData.axis || null,
+      x: r.left + (p.x + 1) / 2 * r.width,
+      y: r.top + (1 - p.y) / 2 * r.height,
+    });
+  }
+  return out;
+};
+
 window.__uwbProbe = () => ({
   dist: camera.position.distanceTo(controls.target),
   zoomAccum,
   keys: [...heldKeys],
   target: [controls.target.x, controls.target.y, controls.target.z],
   pos: [camera.position.x, camera.position.y, camera.position.z],
+  selected: S.selected,
+  mode: S.mode,
+  scene: S.scene,
+  anchors: S.scene.anchors.map((a) => [a.id, a.x, a.y]),
+  obstacles: S.scene.obstacles.map((o) => [o.id, o.x, o.y, o.sx, o.sy, o.sz]),
+  handles: Object.keys(obstacleObjs).map((id) => {
+    const g = obstacleObjs[id];
+    return [id, g.children.map((c) => c.userData.pick || 'mesh')];
+  }),
 });

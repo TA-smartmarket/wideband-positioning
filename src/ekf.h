@@ -133,6 +133,13 @@ inline void ekfPredict(Ekf &e, float dt)
     for (int i = 0; i < EKF_N; i++)
         for (int j = 0; j < EKF_N; j++)
             e.P[i][j] = FPFt[i][j] + Q[i][j];
+
+    // Bound the covariance. When measurements keep being rejected (heavy NLOS
+    // reflections) P grows without limit, sigma becomes meaningless and the
+    // reported confidence collapses. Keep it interpretable instead.
+    const float cap[EKF_N] = {25.0f, 25.0f, 9.0f, 9.0f};
+    for (int i = 0; i < EKF_N; i++)
+        if (e.P[i][i] > cap[i]) e.P[i][i] = cap[i];
 }
 
 // ---------------------------------------------------------------------------

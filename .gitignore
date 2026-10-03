@@ -9,3 +9,5 @@ server/mqtt_probe.py
 .vscode/
 
 server/scene.json
+server/firmware/*.bin
+server/*.json

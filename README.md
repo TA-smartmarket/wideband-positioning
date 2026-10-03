@@ -307,25 +307,100 @@ fallback ke REST.
 
 ---
 
+## 🔄 OTA (update firmware dari server)
+
+Firmware **tidak perlu dicabut** lagi. Setiap node menjalankan web updater
+sendiri begitu tersambung jaringan:
+
+```
+POST http://<ip-node>:3232/update?key=<key-per-device>   (multipart, .bin)
+```
+
+**Model keamanan** — server membuat **key unik per device**
+(`secrets.token_urlsafe`), menyimpannya, lalu mengirimkannya ke node lewat
+channel config yang biasa. Node **menolak** upload apa pun tanpa key itu, jadi
+host lain di LAN tidak bisa menulis ulang firmware. Key tersimpan di NVS;
+`reset` pada serial menghapusnya sekaligus menonaktifkan OTA sampai server
+memprovision ulang.
+
+Dari web UI → tab **Setup → OTA firmware**:
+
+1. Taruh image di `server/firmware/` (mis. `uwb-node-1.0.0.bin`).
+   Folder ini di-`.gitignore` karena isinya binary besar.
+2. Pilih image → **⬆ Push to all online** (atau tombol **OTA** per device di
+   tab **Devices**).
+3. Node menerima, menulis partisi OTA, lalu reboot. Progress terlihat di panel
+   hasil.
+
+Lewat CLI:
+
+```bash
+# lihat device + key-nya
+curl -s localhost:8080/api/v1/ota | python -m json.tool
+
+# push ke satu device (atau "all")
+curl -X POST localhost:8080/api/v1/ota/push -H 'Content-Type: application/json' \
+     -d '{"device_id":"anchor-2","firmware":"uwb-node-1.0.0.bin"}'
+
+# rotasi key (device ambil key baru saat config sync berikutnya)
+curl -X POST localhost:8080/api/v1/ota/key -H 'Content-Type: application/json' \
+     -d '{"device_id":"anchor-2"}'
+```
+
+Atau langsung ke node (berguna saat server mati):
+
+```bash
+curl -F "firmware=@firmware.bin" "http://192.168.0.109:3232/update?key=<key>"
+```
+
+Halaman status node juga tersedia di `http://<ip-node>:3232/`.
+
+> Catatan: token di query string bisa tercatat di log. Untuk jaringan yang
+> tidak dipercaya, taruh di belakang reverse proxy TLS.
+
+---
+
 ## 🖥️ Web UI 3D (editor ruangan + live tracking)
 
-Buka `http://<server>:8080` — tampil **ruangan 3D interaktif** (Three.js):
+Buka `http://<server>:8080`. Ada **4 tab**:
+
+| Tab | Isi |
+|---|---|
+| **Live** | inspector objek + daftar tag (posisi, σ, IP, confidence) |
+| **Setup** | ukuran ruangan, NLOS, trail, auto-orbit, **OTA firmware** |
+| **Devices** | tiap node: IP, RSSI, firmware, tombol **OTA** + **🔑 key** |
+| **API** | daftar endpoint REST (dibaca live dari `/api/v1/meta`) + topik MQTT |
+
+Semua **dinamis**: anchor yang baru masuk otomatis muncul di daftar device,
+dapat key OTA sendiri, dan langsung ditempatkan di sudut ruangan yang masih
+kosong di 3D view (tinggal digeser ke posisi sebenarnya). Tidak perlu restart
+server atau ubah kode.
+
+Tombol di viewport: **⌂** reset view · **3D** / **Top** · **＋** **－** zoom ·
+**⏸** pause render (hemat CPU, default aktif) · **🔊** suara · **☀** tema
+terang/gelap · **⟲** hapus trail.
+
+Suara (Web Audio, tanpa file aset): blip saat device online, nada turun saat
+terputus, chime saat update firmware di-push, dan peringatan saat geometri
+NLOS terdeteksi.
+
+Saat halaman dibuka: overlay boot + kamera menyapu masuk dengan satu putaran.
 
 | Aksi | Cara |
 |---|---|
 | Putar kamera | drag area kosong (1 jari di HP) |
 | **Zoom** | scroll (1 notch ≈ 8%) · **＋/－** · pinch di HP · `+`/`-` |
 | **Keliling ruangan** | **WASD** / **panah** · `Q`/`E` turun/naik · **Shift** = cepat |
-| **Balik ke viewport awal** | tombol **⌂ Reset view** atau tekan **H** |
+| **Balik ke viewport awal** | tombol **⌂** atau tekan **H** |
+| **Pause render** | tombol **⏸** atau **Space** |
 | Pindah anchor | drag bola hijau — otomatis dikunci di dalam ruangan |
-| Ubah ukuran ruangan | isi Width/Depth/Height di panel kanan |
+| Ubah ukuran ruangan | isi Width/Depth/Height di tab Setup |
 | Tambah anchor / obstacle | tombol **Anchor** / **Obstacle**, lalu klik lantai |
 | Geser obstacle | drag badannya |
-| Ubah ukuran obstacle | drag **handle bola di sudut** |
-| Ubah tinggi obstacle | drag **cone di atas** |
+| Ubah ukuran obstacle | drag **bola di sudut** (dua sumbu) atau **bola di tepi** (satu sumbu) |
+| Ubah tinggi obstacle | drag **cone hijau di atas** |
 | Hapus | pilih lalu `Delete` (atau tombol Delete di inspector) |
 | Simpan | **💾 Save room & anchors** — langsung di-push ke device via MQTT |
-| View | **⌂ Reset** / **3D** / **Top** / **Clear trail** |
 
 Di HP: **1 jari** = putar, **2 jari** = geser + pinch zoom. Layout otomatis
 bertumpuk (viewport di atas, panel di bawah) di layar sempit.

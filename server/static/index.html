@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -10,16 +10,29 @@
 </script>
 </head>
 <body>
+<!-- boot overlay: plays once on load -->
+<div id="boot">
+  <div class="boot-inner">
+    <div class="boot-logo">◈</div>
+    <div class="boot-title">UWB POSITIONING</div>
+    <div class="boot-sub">initialising spatial grid…</div>
+    <div class="boot-bar"><span></span></div>
+  </div>
+</div>
+
 <div id="app">
   <div id="viewport">
     <div id="hud"></div>
     <div id="viewbar">
-      <button id="view-home" title="Back to the default view (Home)">⌂ Reset view</button>
+      <button id="view-home" title="Back to the default view (H)">⌂</button>
       <button id="view-iso" title="Perspective view">3D</button>
       <button id="view-top" title="Top-down view">Top</button>
       <button id="zoom-in" title="Zoom in (+)">＋</button>
       <button id="zoom-out" title="Zoom out (−)">－</button>
-      <button id="trail-clear" title="Clear the movement trail">Clear trail</button>
+      <button id="render-toggle" title="Pause/resume rendering to save CPU" class="on">⏸</button>
+      <button id="sound-toggle" title="Sound cues on/off">🔊</button>
+      <button id="theme-toggle" title="Light/dark theme">☀</button>
+      <button id="trail-clear" title="Clear the movement trail">⟲</button>
     </div>
     <div id="palette"></div>
     <div id="toast"></div>
@@ -28,11 +41,28 @@
   <aside id="panel">
     <header>
       <h1>📡 UWB Positioning</h1>
-      <p class="sub">Drag anchors to the corners, add walls, then Save —
-         the server uses your room to correct NLOS measurements.</p>
+      <p class="sub" id="site-line">real-time tag tracking</p>
     </header>
 
-    <section>
+    <nav id="tabs">
+      <button data-tab="live" class="active">Live</button>
+      <button data-tab="setup">Setup</button>
+      <button data-tab="devices">Devices</button>
+      <button data-tab="api">API</button>
+    </nav>
+
+    <!-- ---------------------------------------------------------- LIVE -->
+    <section data-panel="live">
+      <h3>Inspector</h3>
+      <div id="inspector">
+        <p class="muted">Nothing selected.<br>Click an anchor, obstacle or the tag.</p>
+      </div>
+      <h3 style="margin-top:16px">Tags</h3>
+      <div id="taglist"><p class="muted">No tag reporting yet.</p></div>
+    </section>
+
+    <!-- --------------------------------------------------------- SETUP -->
+    <section data-panel="setup" hidden>
       <h3>Room <span class="pill">metres</span></h3>
       <div class="row">
         <label>Width (X)<input id="r-w" type="number" step="0.1" min="0.5"></label>
@@ -41,23 +71,43 @@
       <label>Height (Z)<input id="r-h" type="number" step="0.1" min="0.5"></label>
       <label><input id="nlos" type="checkbox"> Obstacle-aware NLOS correction</label>
       <label><input id="trail" type="checkbox" checked> Show movement trail</label>
+      <label><input id="spin" type="checkbox"> Slow auto-orbit when idle</label>
+
+      <h3 style="margin-top:16px">OTA firmware</h3>
+      <p class="muted" id="ota-hint">Loading…</p>
+      <label>Firmware image
+        <select id="ota-file"></select>
+      </label>
+      <div class="row btns">
+        <button id="ota-push-all" class="primary">⬆ Push to all online</button>
+      </div>
+      <div id="ota-result" class="muted" style="margin-top:8px"></div>
     </section>
 
-    <section>
-      <h3>Inspector</h3>
-      <div id="inspector">
-        <p class="muted">Nothing selected.<br>Click an anchor, obstacle or the tag.</p>
-      </div>
+    <!-- ------------------------------------------------------- DEVICES -->
+    <section data-panel="devices" hidden>
+      <h3>Connected devices</h3>
+      <div id="devicelist"><p class="muted">No device has reported yet.</p></div>
+      <p class="hint">IP and signal come from each node's status report, so the
+         list updates by itself as anchors join or leave.</p>
+    </section>
+
+    <!-- ----------------------------------------------------------- API -->
+    <section data-panel="api" hidden>
+      <h3>REST API</h3>
+      <p class="muted">Served live from the server (<code>/api/v1/meta</code>).</p>
+      <div id="apilist"><p class="muted">Loading…</p></div>
+      <h3 style="margin-top:16px">MQTT topics</h3>
+      <table class="kv" id="mqtttopics"></table>
     </section>
 
     <footer>
       <button id="save" class="primary full">💾 Save room &amp; anchors</button>
       <button id="reload" class="full" style="margin-top:8px">↺ Reload from server</button>
-      <p class="hint"><b>WASD / arrows</b> = move around · <b>Q/E</b> = down/up ·
-         <b>Shift</b> = fast · <b>H</b> = reset view<br>
-         Drag = move object · corner handles = resize · Delete = remove ·
-         Esc = deselect · drag empty space = orbit · scroll / pinch = zoom<br>
-         Phone: 1 finger = orbit, 2 fingers = pan &amp; pinch zoom</p>
+      <p class="hint"><b>WASD / arrows</b> move · <b>Q/E</b> down/up ·
+         <b>Shift</b> fast · <b>H</b> reset view · <b>Space</b> pause render<br>
+         Drag an object to move · corner handles resize · Delete removes ·
+         scroll / pinch zooms</p>
     </footer>
   </aside>
 </div>

@@ -25,6 +25,7 @@ import copy
 import json
 import math
 import os
+import secrets
 import threading
 import time
 
@@ -59,6 +60,22 @@ SCENE = scene_mod.default_scene()   # room + anchors + obstacles (3D editor)
 NLOS = {}             # (anchor_id, tag_id) -> {"blocked","atten","sigma","bias"}
 NLOS_ENABLED = True   # inflate sigma / bias for blocked paths
 
+# --- OTA -------------------------------------------------------------------
+# Each device gets its own key. It is generated here, stored with the device
+# config and pushed to the node through the normal config channel; the device
+# refuses any firmware upload that does not carry it.
+OTA_TOKENS = {}       # device_id -> token
+OTA_PORT = 3232       # must match the firmware default
+OTA_DIR = os.path.join(os.path.dirname(__file__), "firmware")
+
+
+def ota_token(device_id, regenerate=False):
+    with LOCK:
+        if regenerate or device_id not in OTA_TOKENS:
+            OTA_TOKENS[device_id] = secrets.token_urlsafe(18)
+        return OTA_TOKENS[device_id]
+
+
 APP = Flask(__name__)
 
 
@@ -75,6 +92,41 @@ def touch_device(cfg):
     dev.update(cfg)
     dev["last_seen"] = now_ms()
     return dev
+
+
+def auto_place_anchor(device_id, height=2.2):
+    """Put a newly seen anchor in the next free room corner.
+
+    Corners are tried in a fixed order; the first one that is not taken (by an
+    existing anchor) wins. Nothing is pushed to the device here — this only
+    makes the node visible in the 3D editor so the operator can drag it to the
+    true position and Save. Dynamic: adding an anchor never needs a code change
+    or a server restart.
+    """
+    global SCENE
+    with LOCK:
+        room = SCENE["room"]
+        w, d = room["width"], room["depth"]
+        corners = [(0.0, 0.0), (w, 0.0), (w, d), (0.0, d),
+                   (w / 2, 0.0), (w, d / 2), (w / 2, d), (0.0, d / 2)]
+        taken = [(a["x"], a["y"]) for a in SCENE["anchors"] if a["id"] != device_id]
+        pos = None
+        for c in corners:
+            if all(abs(c[0] - t[0]) > 0.3 or abs(c[1] - t[1]) > 0.3 for t in taken):
+                pos = c
+                break
+        if pos is None:
+            # more anchors than corners: spread them along the ceiling edge
+            n = len(taken)
+            pos = ((n % 6) * (w / 6) + w / 12, d if n % 2 else 0.0)
+
+        entry = next((a for a in SCENE["anchors"] if a["id"] == device_id), None)
+        if entry is None:
+            entry = {"id": device_id, "label": device_id, "x": pos[0], "y": pos[1], "z": height}
+            SCENE["anchors"].append(entry)
+            print(f"[scene] new anchor {device_id} auto-placed at "
+                  f"({pos[0]:.1f}, {pos[1]:.1f}) — drag it to the real corner in the UI")
+        SCENE = scene_mod.normalise_scene(SCENE)
 
 
 def merged_config(role, did):
@@ -97,6 +149,8 @@ def merged_config(role, did):
         cfg["device_id"] = key
         cfg["role"] = role
         cfg["id"] = did
+        # OTA credentials: the device needs its key to accept an update
+        cfg["ota"] = {"enabled": True, "port": OTA_PORT, "token": ota_token(key)}
         # anchors[] array so a tag can solve locally too
         anchors = []
         for dk, dc in DEVICES.items():
@@ -107,7 +161,8 @@ def merged_config(role, did):
         cfg["anchors"] = anchors
         if not known:
             # strip everything the device already knows locally
-            return {"device_id": key, "role": role, "id": did, "anchors": anchors}
+            return {"device_id": key, "role": role, "id": did, "anchors": anchors,
+                    "ota": {"enabled": True, "port": OTA_PORT, "token": ota_token(key)}}
         # never push empty credentials back — that would wipe the device
         if not cfg["wifi"]["ssid"]:
             cfg.pop("wifi", None)
@@ -237,6 +292,14 @@ class TagEKF:
              [0, q * dt3 / 2, 0, q * dt2]]
         self.P = [[FPFt[i][j] + Q[i][j] for j in range(4)] for i in range(4)]
 
+        # Bound the covariance: when measurements are rejected for a long time
+        # (heavy NLOS) P grows without limit and sigma became meaningless
+        # (observed 11 m). Cap the position/velocity variance so confidence
+        # stays interpretable and the filter cannot "give up" on the room.
+        for i, cap in ((0, 25.0), (1, 25.0), (2, 9.0), (3, 9.0)):
+            if self.P[i][i] > cap:
+                self.P[i][i] = cap
+
     # one scalar range measurement to anchor (ax, ay); returns True if accepted
     # sigma_r may be overridden per measurement (NLOS paths are noisier).
     def update_range(self, ax, ay, rng, gate_sigma=3.0, sigma_r=None):
@@ -274,7 +337,8 @@ class TagEKF:
         return math.sqrt(max(self.P[0][0], 0.0) + max(self.P[1][1], 0.0))
 
 
-EKF = {}      # tag_id -> TagEKF
+EKF = {}        # tag_id -> TagEKF
+EKF_REJECTS = {}  # tag_id -> consecutive rejected cycles
 
 
 def anchor_xyz(device_id, fallback_id=None):
@@ -290,6 +354,31 @@ def anchor_xyz(device_id, fallback_id=None):
             p = dev.get("position", {})
             return p.get("x", 0.0), p.get("y", 0.0), p.get("z", 2.2)
     return None
+
+
+def geometry_check(fixes):
+    """Detect range pairs that are geometrically impossible.
+
+    For two anchors the triangle inequality must hold:
+        |r1 - r2| <= d <= r1 + r2
+    Violations mean at least one range is wrong (usually NLOS: the signal
+    bounced, so the measured distance is longer than the straight line).
+    Returns (ok, slack) where slack is how far outside the bound we are.
+    """
+    if len(fixes) < 2:
+        return True, 0.0
+    worst = 0.0
+    for i in range(len(fixes)):
+        for j in range(i + 1, len(fixes)):
+            (x1, y1, r1), (x2, y2, r2) = fixes[i], fixes[j]
+            d = math.hypot(x2 - x1, y2 - y1)
+            if d < 1e-6:
+                continue
+            if r1 + r2 < d:
+                worst = max(worst, d - (r1 + r2))
+            elif abs(r1 - r2) > d:
+                worst = max(worst, abs(r1 - r2) - d)
+    return worst <= 0.0, worst
 
 
 def recompute_positions():
@@ -364,8 +453,42 @@ def recompute_positions():
 
         NLOS.update({(a, tag): info for a, info in link_info.items()})
 
+        # Self-healing: if every measurement keeps being rejected (heavy NLOS
+        # reflections), the filter has lost the track and its covariance is at
+        # the cap. Restart it from the current geometry instead of coasting on
+        # a stale estimate forever.
+        if used == 0:
+            EKF_REJECTS[tag] = EKF_REJECTS.get(tag, 0) + 1
+            if EKF_REJECTS[tag] >= 8:
+                sol = solve_2d(fixes, room["width"], room["depth"])
+                if sol:
+                    EKF[tag] = TagEKF(sol["x"], sol["y"])
+                    EKF_REJECTS[tag] = 0
+                    used = sum(1 for (_a, ax, ay, _az, rng2d) in links
+                               if EKF[tag].update_range(ax, ay, rng2d))
+        else:
+            EKF_REJECTS[tag] = 0
+
         px, py, vx, vy = EKF[tag].position()
+
+        # Never report a position outside the room: with only two anchors an
+        # inconsistent range pair can push the estimate far away (observed
+        # x = -38 m). Clamp to the room rectangle and, if we had to clamp,
+        # drop the velocity so the filter does not keep flying outward.
+        margin = 0.5
+        cx = min(max(px, -margin), room["width"] + margin)
+        cy = min(max(py, -margin), room["depth"] + margin)
+        if abs(cx - px) > 1e-6 or abs(cy - py) > 1e-6:
+            EKF[tag].x[0], EKF[tag].x[1] = cx, cy
+            EKF[tag].x[2] *= 0.2
+            EKF[tag].x[3] *= 0.2
+            EKF[tag].P[0][0] = max(EKF[tag].P[0][0], 0.5)
+            EKF[tag].P[1][1] = max(EKF[tag].P[1][1], 0.5)
+            px, py = cx, cy
+
         sigma = EKF[tag].sigma()
+
+        ok_geo, slack = geometry_check(fixes)
 
         out[tag] = {
             "ts": now, "src": "server", "id": tag,
@@ -373,6 +496,7 @@ def recompute_positions():
             "vx": vx, "vy": vy,
             "confidence": 1.0 / (1.0 + sigma),
             "sigma": sigma, "ambiguous": False,
+            "geometry_ok": ok_geo, "geometry_slack": slack,
             "updates": EKF[tag].updates, "used": used,
             "ranges": {a: RANGES[(a, tag)]["range"] for a in anchors_used},
             "links": link_info,
@@ -410,6 +534,11 @@ def ingest_telemetry(payload, source):
                     cfg["last_seen"] = now_ms()
                     cfg["_auto"] = True        # seen, but not configured yet
                     DEVICES[did] = cfg
+                    # A brand-new anchor is placed automatically in the next
+                    # free room corner, so it shows up in the 3D view at once.
+                    # The operator can then drag it to the real position.
+                    if role_guess == "anchor":
+                        auto_place_anchor(did)
         if payload.get("status"):
             handle_status(payload["device_id"], payload["status"])
 
@@ -454,6 +583,8 @@ def ingest_telemetry(payload, source):
             TAG_POS[tag] = {"x": sol["x"], "y": sol["y"],
                             "vx": sol.get("vx", 0.0), "vy": sol.get("vy", 0.0),
                             "sigma": sol.get("sigma", 0.0),
+                            "geometry_ok": sol.get("geometry_ok", True),
+                            "geometry_slack": sol.get("geometry_slack", 0.0),
                             "conf": sol["confidence"], "amb": sol["ambiguous"],
                             "ts": sol["ts"], "src": "server"}
     broadcast_state()
@@ -478,7 +609,9 @@ def build_state():
             "label": sa.get("label", dk) if sa else dk,
             "x": pos.get("x", 0.0), "y": pos.get("y", 0.0), "z": pos.get("z", 2.2),
             "online": now - dc.get("last_seen", 0) < 5000,
-            "last_seen": dc.get("last_seen", 0)})
+            "last_seen": dc.get("last_seen", 0),
+            **{k: STATUS.get(dk, {}).get(k) for k in ("ip", "rssi", "fw", "uptime_s")
+               if STATUS.get(dk, {}).get(k) is not None}})
 
     # anchors that exist in the scene but have not reported yet
     for aid, sa in scene_anchors.items():
@@ -493,9 +626,14 @@ def build_state():
                      "z": p.get("z", scene_mod.DEFAULT_TAG_Z),
                      "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
                      "sigma": p.get("sigma", 0.0),
+                     "geometry_ok": p.get("geometry_ok", True),
+                     "geometry_slack": p.get("geometry_slack", 0.0),
                      "confidence": p["conf"], "ambiguous": p["amb"],
                      "online": now - p["ts"] < STALE_MS, "last_seen": p["ts"],
                      "source": p.get("src", "server"),
+                     "ip": STATUS.get(tag, {}).get("ip"),
+                     "rssi": STATUS.get(tag, {}).get("rssi"),
+                     "fw": STATUS.get(tag, {}).get("fw"),
                      "ranges": {a: r["range"] for (a, t), r in RANGES.items()
                                 if t == tag},
                      "links": p.get("links", {})})
@@ -508,10 +646,24 @@ def build_state():
                       "blocked": bool(info.get("blocked", False)),
                       "obstacles": info.get("obstacles", [])})
 
+    devices = []
+    for dk, dc in DEVICES.items():
+        if dk == "_room" or dc.get("role") not in ("tag", "anchor"):
+            continue
+        st = STATUS.get(dk, {})
+        devices.append({
+            "id": dk, "role": dc.get("role"),
+            "online": now - dc.get("last_seen", 0) < 5000,
+            "last_seen": dc.get("last_seen", 0),
+            "ip": st.get("ip"), "rssi": st.get("rssi"), "fw": st.get("fw"),
+            "uptime_s": st.get("uptime_s"),
+        })
+
     return {"site": BASE_CFG["site"], "ts": now, "room": room,
             "obstacles": obstacles,
             "nlos_enabled": NLOS_ENABLED,
-            "anchors": anchors, "tags": tags, "links": links}
+            "anchors": anchors, "tags": tags, "links": links,
+            "devices": devices}
 
 
 STATE = {"site": "home", "ts": 0, "room": dict(scene_mod.DEFAULT_ROOM),
@@ -657,7 +809,12 @@ def api_config_put():
                      json.dumps(devcfg), retained=True)
     except Exception:
         pass
-    EKF.clear()          # geometry changed -> restart the filters
+    # geometry changed -> discard ranges measured against the old geometry
+    with LOCK:
+        RANGES.clear()
+        NLOS.clear()
+    EKF.clear()
+    EKF_REJECTS.clear()
     broadcast_state()
     return jsonify({"ok": True, "config": devcfg})
 
@@ -728,8 +885,15 @@ def api_scene_put():
         mqtt_publish(cfg["mqtt"]["base_topic"] + f"/config/{did}",
                      json.dumps(devcfg), retained=True)
 
-    # anchors moved -> existing EKF states are stale, restart the filters
+    # Anchors moved -> everything measured against the OLD geometry is invalid.
+    # Keeping those ranges (they live up to STALE_MS) mixed old distances with
+    # new anchor positions, which produced a bogus first fix and then the EKF
+    # tracked that wrong point: the "tag drifts when I edit an anchor" report.
+    with LOCK:
+        RANGES.clear()
+        NLOS.clear()
     EKF.clear()
+    EKF_REJECTS.clear()
     recompute_positions()
     broadcast_state()
     return jsonify({"ok": True, "scene": SCENE, "pushed": pushed})
@@ -763,6 +927,121 @@ def load_scene(path=None):
               f"({len(SCENE['anchors'])} anchors, {len(SCENE['obstacles'])} obstacles)")
     except (OSError, ValueError):
         pass          # no saved scene yet -> defaults
+
+
+@APP.route("/api/v1/ota", methods=["GET"])
+def api_ota_list():
+    """Devices eligible for an update, their IP, key and the firmware available
+    on the server. The key is shown so an operator can also curl the device
+    directly; keep this endpoint behind --token on untrusted networks."""
+    firmwares = []
+    if os.path.isdir(OTA_DIR):
+        for f in sorted(os.listdir(OTA_DIR)):
+            if f.endswith(".bin"):
+                p = os.path.join(OTA_DIR, f)
+                firmwares.append({"name": f, "size": os.path.getsize(p),
+                                  "mtime": int(os.path.getmtime(p))})
+    with LOCK:
+        devs = []
+        for dk, dc in DEVICES.items():
+            if dk == "_room" or dc.get("role") not in ("tag", "anchor"):
+                continue
+            st = STATUS.get(dk, {})
+            devs.append({"id": dk, "role": dc.get("role"),
+                         "online": now_ms() - dc.get("last_seen", 0) < 5000,
+                         "ip": st.get("ip"), "fw": st.get("fw"),
+                         "key": ota_token(dk), "port": OTA_PORT})
+    return jsonify({"ok": True, "devices": devs, "firmware": firmwares,
+                    "port": OTA_PORT})
+
+
+@APP.route("/api/v1/ota/push", methods=["POST"])
+def api_ota_push():
+    """Push a firmware image to one device (or all online devices).
+
+    body: {"device_id": "anchor-2", "firmware": "firmware.bin"}
+          {"device_id": "all",      "firmware": "firmware.bin"}
+    """
+    body = request.get_json(silent=True) or {}
+    name = body.get("firmware")
+    target = body.get("device_id", "all")
+    if not name or "/" in name or "\\" in name:
+        return jsonify({"ok": False, "error": "bad firmware name"}), 400
+    path = os.path.join(OTA_DIR, name)
+    if not os.path.isfile(path):
+        return jsonify({"ok": False, "error": f"firmware not found: {name}"}), 404
+
+    with LOCK:
+        targets = [dk for dk, dc in DEVICES.items()
+                   if dk != "_room" and dc.get("role") in ("tag", "anchor")
+                   and (target == "all" or dk == target)]
+    if not targets:
+        return jsonify({"ok": False, "error": "no matching device"}), 404
+
+    results = {}
+    for dk in targets:
+        st = STATUS.get(dk, {})
+        ip = st.get("ip")
+        if not ip:
+            results[dk] = "no ip (device has not reported its status yet)"
+            continue
+        key = ota_token(dk)
+        url = f"http://{ip}:{OTA_PORT}/update?key={key}"
+        try:
+            import urllib.request
+            with open(path, "rb") as fh:
+                data = fh.read()
+            # multipart/form-data so the firmware sees a normal file upload
+            boundary = "----uwbota" + secrets.token_hex(8)
+            body_bytes = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="firmware"; filename="{name}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(url, data=body_bytes, method="POST")
+            req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                results[dk] = f"{resp.status} {resp.read().decode(errors='replace')[:80]}"
+        except Exception as e:
+            results[dk] = f"failed: {e}"
+
+    ok = any(str(v).startswith("200") for v in results.values())
+    return jsonify({"ok": ok, "results": results, "firmware": name})
+
+
+@APP.route("/api/v1/ota/key", methods=["POST"])
+def api_ota_key():
+    """Rotate a device's key (the device picks the new one up on next config)."""
+    body = request.get_json(silent=True) or {}
+    did = body.get("device_id")
+    if not did:
+        return jsonify({"ok": False, "error": "device_id required"}), 400
+    tok = ota_token(did, regenerate=True)
+    # push the new config straight away
+    role, _, num = did.partition("-")
+    try:
+        devcfg = merged_config(role or "anchor", int(num) if num.isdigit() else 1)
+        mqtt_publish(cfg["mqtt"]["base_topic"] + f"/config/{did}",
+                     json.dumps(devcfg), retained=True)
+    except Exception:
+        pass
+    return jsonify({"ok": True, "device_id": did, "key": tok})
+
+
+@APP.route("/api/v1/meta", methods=["GET"])
+def api_meta():
+    """Self-describing API list, so the web UI never hardcodes endpoints."""
+    eps = []
+    for rule in sorted(APP.url_map.iter_rules(), key=lambda r: str(r)):
+        if not str(rule).startswith("/api/"):
+            continue
+        eps.append({
+            "path": str(rule),
+            "methods": sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS")),
+            "doc": (APP.view_functions[rule.endpoint].__doc__ or "").strip().split("\n")[0],
+        })
+    return jsonify({"ok": True, "endpoints": eps, "fw_version": "1.0.0",
+                    "ota_port": OTA_PORT, "sites": [BASE_CFG["site"]]})
 
 
 @APP.route("/api/v1/devices", methods=["GET"])
