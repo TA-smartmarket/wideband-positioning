@@ -57,8 +57,12 @@ function initThree() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.maxPolarAngle = Math.PI * 0.495;   // never below the floor
-  controls.minDistance = 0.6;
-  controls.maxDistance = 120;                 // generous: the room can be large
+  controls.minDistance = 0.8;
+  controls.maxDistance = 60;
+  // OrbitControls' built-in zoom treats raw deltaY as an exponent, so a single
+  // mouse notch (deltaY 100) jumped a huge distance while a trackpad (many
+  // small events) piled up. Zoom is handled manually below instead.
+  controls.enableZoom = false;
   controls.target.set(2.5, 1, 2);
 
   // lights
@@ -83,6 +87,8 @@ function initThree() {
   raycaster = new THREE.Raycaster();
   addEventListener('resize', resize);
   bindContextLoss();
+  bindTouchZoom(renderer.domElement);
+  bindKeyboard();
   if (window.ResizeObserver) new ResizeObserver(resize).observe($('viewport'));
   resize();
   bindPointer();
@@ -112,9 +118,157 @@ function bindContextLoss() {
 
 function animate() {
   requestAnimationFrame(animate);
+  frameDt = clock.getDelta();
+  applyKeyboardMove();
   controls.update();
+  applyZoom();
   updateFog();
   renderer.render(scene3, camera);
+}
+
+// ---------------------------------------------------------------------------
+// Zoom: one wheel notch moves the camera by a fixed ~8 % of the current
+// distance, no matter what the device reports. Trackpads send many small
+// events, mice send one big one; both are normalised and clamped, then eased
+// over a few frames so the motion feels smooth instead of snappy.
+// ---------------------------------------------------------------------------
+const ZOOM_STEP = 0.085;      // distance change per "notch"
+const ZOOM_UNIT = 120;        // normalised delta that counts as one notch
+let zoomAccum = 0;
+let zoomFocus = null;
+
+function normalizeWheel(ev) {
+  let d = ev.deltaY;
+  if (ev.deltaMode === 1) d *= 16;        // deltaMode: lines
+  else if (ev.deltaMode === 2) d *= 400;  // deltaMode: pages
+  return Math.max(-200, Math.min(200, d));
+}
+
+function onWheel(ev) {
+  ev.preventDefault();
+  zoomAccum += normalizeWheel(ev);
+  // remember what is under the cursor so zooming in feels anchored
+  const gp = groundPoint(ev);
+  if (gp) zoomFocus = gp;
+}
+
+function applyZoom() {
+  if (!zoomAccum) return;
+  // at most one notch per frame -> smooth, never a jump
+  const step = Math.max(-1, Math.min(1, zoomAccum / ZOOM_UNIT));
+  zoomAccum -= step * ZOOM_UNIT;
+  if (Math.abs(zoomAccum) < 1) zoomAccum = 0;
+
+  const dist = camera.position.distanceTo(controls.target);
+  if (dist < 1e-4) return;
+
+  const factor = Math.exp(step * ZOOM_STEP);          // >1 = zoom out
+  let newDist = dist * factor;
+  newDist = Math.max(controls.minDistance, Math.min(controls.maxDistance, newDist));
+
+  // zoom-to-cursor: only when pulling closer, nudge the orbit target toward
+  // the point under the pointer so it stays put on screen
+  const k = 1 - newDist / dist;
+  if (k > 0 && zoomFocus) {
+    controls.target.lerp(zoomFocus, Math.min(k * 0.5, 0.25));
+  }
+
+  const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+  camera.position.copy(controls.target).addScaledVector(dir, newDist);
+}
+
+/* ---------------------------------------------------------------------------
+   Touch: two-finger pinch drives the same zoomAccum as the wheel, so phones
+   and tablets get identical, controlled zoom. One-finger rotate and two-finger
+   pan are handled by OrbitControls.
+   --------------------------------------------------------------------------- */
+let pinchPrev = 0;
+
+function touchDistance(a, b) {
+  return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+}
+
+function bindTouchZoom(el) {
+  el.addEventListener('touchstart', (ev) => {
+    pinchPrev = ev.touches.length === 2 ? touchDistance(ev.touches[0], ev.touches[1]) : 0;
+  }, { passive: true });
+
+  el.addEventListener('touchmove', (ev) => {
+    if (ev.touches.length !== 2 || !pinchPrev) return;
+    ev.preventDefault();                       // never zoom the page itself
+    const d = touchDistance(ev.touches[0], ev.touches[1]);
+    if (d < 1) return;
+    // pinch out (d grows) => zoom in => negative step
+    const notches = -Math.log(d / pinchPrev) / ZOOM_STEP;
+    zoomAccum += notches * ZOOM_UNIT;
+    pinchPrev = d;
+  }, { passive: false });
+
+  el.addEventListener('touchend', () => { pinchPrev = 0; }, { passive: true });
+  el.addEventListener('touchcancel', () => { pinchPrev = 0; }, { passive: true });
+}
+
+/* ---------------------------------------------------------------------------
+   Keyboard fly-through: WASD / arrow keys pan the camera rig across the floor,
+   Q/E (or PageUp/PageDown) change height, Shift = fast, H = reset view.
+   Movement is camera-relative, so W always means "away from me".
+   --------------------------------------------------------------------------- */
+const heldKeys = new Set();
+const MOVE_SPEED = 2.2;        // metres per second
+const clock = new THREE.Clock();
+let frameDt = 0;
+
+function isTyping() {
+  const a = document.activeElement;
+  return a && (a.tagName === 'INPUT' || a.tagName === 'SELECT' ||
+               a.tagName === 'TEXTAREA' || a.isContentEditable);
+}
+
+function bindKeyboard() {
+  addEventListener('keydown', (e) => {
+    if (isTyping()) return;
+    const k = e.key.toLowerCase();
+    if (['w', 'a', 's', 'd', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft',
+         'arrowright', 'pageup', 'pagedown', 'shift'].includes(k)) {
+      heldKeys.add(k);
+      if (k.startsWith('arrow') || k === 'pageup' || k === 'pagedown') e.preventDefault();
+    }
+  });
+  addEventListener('keyup', (e) => heldKeys.delete(e.key.toLowerCase()));
+  addEventListener('blur', () => heldKeys.clear());
+}
+
+function applyKeyboardMove() {
+  const dt = Math.min(frameDt, 0.1);
+  if (!heldKeys.size) return;
+
+  let fwdAmt = 0, rightAmt = 0, upAmt = 0;
+  if (heldKeys.has('w') || heldKeys.has('arrowup')) fwdAmt += 1;
+  if (heldKeys.has('s') || heldKeys.has('arrowdown')) fwdAmt -= 1;
+  if (heldKeys.has('d') || heldKeys.has('arrowright')) rightAmt += 1;
+  if (heldKeys.has('a') || heldKeys.has('arrowleft')) rightAmt -= 1;
+  if (heldKeys.has('e') || heldKeys.has('pageup')) upAmt += 1;
+  if (heldKeys.has('q') || heldKeys.has('pagedown')) upAmt -= 1;
+  if (!fwdAmt && !rightAmt && !upAmt) return;
+
+  const speed = MOVE_SPEED * (heldKeys.has('shift') ? 3 : 1) * dt;
+
+  // camera-relative basis on the ground plane
+  const fwd = new THREE.Vector3();
+  camera.getWorldDirection(fwd);
+  fwd.y = 0;
+  if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
+  fwd.normalize();
+  const right = new THREE.Vector3(-fwd.z, 0, fwd.x);   // fwd rotated -90° about Y
+
+  const delta = new THREE.Vector3()
+    .addScaledVector(fwd, fwdAmt * speed)
+    .addScaledVector(right, rightAmt * speed);
+  delta.y += upAmt * speed;
+
+  camera.position.add(delta);
+  controls.target.add(delta);
+  zoomAccum = 0;                 // keyboard wins over pending wheel momentum
 }
 
 // Keep the fog relative to the room and the camera distance so zooming out
@@ -544,6 +698,7 @@ function bindPointer() {
   const el = renderer.domElement;
   let downAt = null;
 
+  el.addEventListener('wheel', onWheel, { passive: false });
   el.addEventListener('pointerdown', (ev) => {
     if (ev.button !== 0) return;
     downAt = { x: ev.clientX, y: ev.clientY, t: performance.now() };
@@ -898,12 +1053,19 @@ function initUi() {
   $('trail').onchange = (e) => { S.showTrail = e.target.checked; buildTrail(); };
   $('view-top').onclick = () => setView('top');
   $('view-iso').onclick = () => setView('iso');
-  $('view-reset').onclick = () => { S.trail = {}; buildTrail(); };
+  $('view-home').onclick = resetView;
+  $('zoom-in').onclick = () => zoomBy(-1);
+  $('zoom-out').onclick = () => zoomBy(1);
+  $('trail-clear').onclick = () => { S.trail = {}; buildTrail(); };
   addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (document.activeElement.tagName !== 'INPUT') { removeSelected(); e.preventDefault(); }
     }
     if (e.key === 'Escape') select(null, null);
+    if (document.activeElement.tagName === 'INPUT') return;
+    if (e.key === '+' || e.key === '=') zoomBy(-1);
+    if (e.key === '-' || e.key === '_') zoomBy(1);
+    if (e.key === 'h' || e.key === 'H') resetView();
   });
   addEventListener('beforeunload', (e) => {
     if (S.dirty) { e.preventDefault(); e.returnValue = ''; }
@@ -919,7 +1081,36 @@ function setView(kind) {
     camera.position.set(W * 1.25, Math.max(W, D) * 1.05, D * 1.45);
     controls.target.set(W / 2, 0.8, D / 2);
   }
+  zoomAccum = 0;            // drop any pending wheel momentum
+  zoomFocus = null;
   controls.update();
+  rememberHome();
+}
+
+// The default viewport, remembered so "Reset view" always returns to it
+// (also used as the starting point on load).
+let homeView = null;
+
+function rememberHome() {
+  homeView = {
+    pos: camera.position.clone(),
+    target: controls.target.clone(),
+  };
+}
+
+function resetView() {
+  if (!homeView) { setView('iso'); return; }
+  camera.position.copy(homeView.pos);
+  controls.target.copy(homeView.target);
+  zoomAccum = 0;
+  zoomFocus = null;
+  select(null, null);
+  controls.update();
+}
+
+// One controlled notch, reusing the smooth wheel path.
+function zoomBy(notches) {
+  zoomAccum += notches * ZOOM_UNIT;
 }
 
 initThree();
@@ -927,3 +1118,13 @@ initUi();
 loadScene().then(() => setView('iso'));
 poll();
 setInterval(poll, 500);
+
+// Small read-only hook used by the automated UI tests (camera distance,
+// pending zoom momentum, held keys). Harmless in normal use.
+window.__uwbProbe = () => ({
+  dist: camera.position.distanceTo(controls.target),
+  zoomAccum,
+  keys: [...heldKeys],
+  target: [controls.target.x, controls.target.y, controls.target.z],
+  pos: [camera.position.x, camera.position.y, camera.position.z],
+});

@@ -14,9 +14,12 @@
   <div id="viewport">
     <div id="hud"></div>
     <div id="viewbar">
+      <button id="view-home" title="Back to the default view (Home)">⌂ Reset view</button>
       <button id="view-iso" title="Perspective view">3D</button>
       <button id="view-top" title="Top-down view">Top</button>
-      <button id="view-reset" title="Clear the movement trail">Clear trail</button>
+      <button id="zoom-in" title="Zoom in (+)">＋</button>
+      <button id="zoom-out" title="Zoom out (−)">－</button>
+      <button id="trail-clear" title="Clear the movement trail">Clear trail</button>
     </div>
     <div id="palette"></div>
     <div id="toast"></div>
@@ -50,8 +53,11 @@
     <footer>
       <button id="save" class="primary full">💾 Save room &amp; anchors</button>
       <button id="reload" class="full" style="margin-top:8px">↺ Reload from server</button>
-      <p class="hint">Drag = move · corner handles = resize · Delete = remove ·
-         Esc = deselect · drag empty space = orbit · scroll = zoom</p>
+      <p class="hint"><b>WASD / arrows</b> = move around · <b>Q/E</b> = down/up ·
+         <b>Shift</b> = fast · <b>H</b> = reset view<br>
+         Drag = move object · corner handles = resize · Delete = remove ·
+         Esc = deselect · drag empty space = orbit · scroll / pinch = zoom<br>
+         Phone: 1 finger = orbit, 2 fingers = pan &amp; pinch zoom</p>
     </footer>
   </aside>
 </div>

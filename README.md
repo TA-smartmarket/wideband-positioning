@@ -313,7 +313,10 @@ Buka `http://<server>:8080` — tampil **ruangan 3D interaktif** (Three.js):
 
 | Aksi | Cara |
 |---|---|
-| Putar / zoom kamera | drag area kosong · scroll |
+| Putar kamera | drag area kosong (1 jari di HP) |
+| **Zoom** | scroll (1 notch ≈ 8%) · **＋/－** · pinch di HP · `+`/`-` |
+| **Keliling ruangan** | **WASD** / **panah** · `Q`/`E` turun/naik · **Shift** = cepat |
+| **Balik ke viewport awal** | tombol **⌂ Reset view** atau tekan **H** |
 | Pindah anchor | drag bola hijau — otomatis dikunci di dalam ruangan |
 | Ubah ukuran ruangan | isi Width/Depth/Height di panel kanan |
 | Tambah anchor / obstacle | tombol **Anchor** / **Obstacle**, lalu klik lantai |
@@ -322,7 +325,10 @@ Buka `http://<server>:8080` — tampil **ruangan 3D interaktif** (Three.js):
 | Ubah tinggi obstacle | drag **cone di atas** |
 | Hapus | pilih lalu `Delete` (atau tombol Delete di inspector) |
 | Simpan | **💾 Save room & anchors** — langsung di-push ke device via MQTT |
-| View | **3D** / **Top** / **Clear trail** |
+| View | **⌂ Reset** / **3D** / **Top** / **Clear trail** |
+
+Di HP: **1 jari** = putar, **2 jari** = geser + pinch zoom. Layout otomatis
+bertumpuk (viewport di atas, panel di bawah) di layar sempit.
 
 Yang terlihat di scene:
 

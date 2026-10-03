@@ -48,7 +48,8 @@ html, body {
 
 #viewbar {
   position: absolute; top: 12px; right: 12px;
-  display: flex; gap: 6px;
+  display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;
+  max-width: calc(100% - 24px);
 }
 #viewbar button, #palette .pal {
   background: rgba(20, 26, 46, 0.9);
@@ -147,4 +148,14 @@ footer .hint { color: var(--muted); font-size: 11.5px; margin-top: 8px; }
   #app { flex-direction: column; }
   #panel { width: auto; flex: 1 1 auto; border-left: 0; border-top: 1px solid var(--line); }
   #viewport { flex: 0 0 52vh; }
+  #viewbar button, #palette .pal { padding: 9px 12px; font-size: 13px; }
+  #hud { font-size: 12px; padding: 6px 10px; }
+}
+
+/* Very narrow screens: the view bar wraps to several rows, so drop the HUD
+   below it instead of letting the two overlap. */
+@media (max-width: 560px) {
+  #viewbar { left: 12px; right: 12px; justify-content: flex-start; }
+  #hud { top: auto; bottom: 12px; left: 12px; right: 12px; }
+  #palette { bottom: 58px; left: 12px; flex-wrap: wrap; }
 }
