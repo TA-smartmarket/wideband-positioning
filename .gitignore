@@ -12,3 +12,7 @@ server/scene.json
 server/firmware/*.bin
 server/*.json
 server/ota_tokens.json
+
+# Downloaded journal PDFs (third-party, ~42 MB). The index stays tracked;
+# run the download again or copy the files when needed.
+docs/papers/*.pdf
