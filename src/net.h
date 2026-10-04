@@ -196,12 +196,16 @@ inline void portalStart()
 {
     if (net.portal_on) return;
 
+    char ssid[48];
+    apSsid(ssid, sizeof(ssid));
+    const uint8_t ch = apChannel();
+
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(SSID_AP);
+    WiFi.softAP(ssid, nullptr, ch);
     delay(300);                 // let the AP + lwIP come up before opening the socket
     g_portal.begin();
     net.portal_on = true;
-    Serial.printf("[ap] setup portal at http://192.168.4.1  (ssid %s)\n", SSID_AP);
+    Serial.printf("[ap] setup portal '%s' ch%u at http://192.168.4.1\n", ssid, ch);
 }
 
 // Close the portal AND drop the access point. Previously the WebServer was

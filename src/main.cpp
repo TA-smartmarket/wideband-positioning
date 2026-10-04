@@ -650,15 +650,17 @@ void drawUi()
     display.setTextColor(SSD1306_WHITE);
 
     if (cfg.role == ROLE_NONE) {
+        char ap[48];
+        apSsid(ap, sizeof(ap));
         display.setTextSize(1);
         display.setCursor(0, 0);
         display.println(F("NOT CONFIGURED"));
         display.setCursor(0, 16);
-        display.println(F("1) join WiFi 'UWB-Setup'"));
+        display.print(F("join WiFi:"));
         display.setCursor(0, 28);
-        display.println(F("2) open 192.168.4.1"));
+        display.print(ap);
         display.setCursor(0, 40);
-        display.println(F("   or use serial menu"));
+        display.print(F("or open 192.168.4.1"));
         display.display();
         return;
     }
@@ -674,10 +676,12 @@ void drawUi()
     display.print(net.portal_on ? F("AP") : (net.mqtt_up ? F("MQTT") : (net.wifi_up ? F("REST") : F("----"))));
 
     if (net.portal_on) {
+        char ap[48];
+        apSsid(ap, sizeof(ap));
         display.setCursor(0, 20);
         display.print(F("Join WiFi:"));
         display.setCursor(0, 30);
-        display.print(SSID_AP);
+        display.print(ap);
         display.setCursor(0, 44);
         display.print(F("open 192.168.4.1"));
         display.display();
@@ -770,6 +774,9 @@ void printConfig()
     Serial.printf("eui        : %s\n", eui);
     Serial.printf("site       : %s\n", cfg.site);
     Serial.printf("wifi       : %s\n", cfg.wifi_ssid[0] ? cfg.wifi_ssid : "(not set)");
+    char ap[48];
+    apSsid(ap, sizeof(ap));
+    Serial.printf("setup ap   : %s  ch%u\n", ap, (unsigned)apChannel());
     Serial.printf("server     : %s\n", cfg.server_url[0] ? cfg.server_url : "(not set)");
     Serial.printf("mqtt       : %s %s:%u\n", cfg.mqtt_enabled ? "on" : "off",
                   cfg.mqtt_host, (unsigned)cfg.mqtt_port);
