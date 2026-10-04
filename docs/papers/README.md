@@ -1,24 +1,74 @@
 # Daftar Paper (docs/papers)
 
 Kumpulan paper rujukan untuk proyek indoor positioning UWB (DW1000/ESP32).
-Semua PDF sudah diunduh lokal dan diverifikasi judulnya.
+Semua paper **open access**, PDF-nya sudah diunduh lokal dan judulnya sudah
+diverifikasi satu per satu dengan membaca halaman pertamanya.
 
-| # | Berkas | Tahun | Terbitan |
-|---|---|---|---|
-| 1 | `01_Krebs_2024_ESP32_DWM3000_UWB_Positioning.pdf` | 2024 | arXiv:2403.10194 |
-| 2 | `02_Shalihan_2022_NLOS_NN_Ranging_Mitigation.pdf` | 2022 | arXiv:2206.09607 |
-| 3 | `03_Angarano_2021_Robust_UWB_Range_Error_DL_Edge.pdf` | 2021 | arXiv:2011.14684 |
-| 4 | `04_Fan_2022_WLS_RKF_NLOS_Kalman.pdf` | 2022 | arXiv:2205.05939 |
-| 5 | `05_Bregar_2023_Indoor_UWB_Positioning_Dataset.pdf` | 2023 | Scientific Data 10:744 |
-| 6 | `06_Yao_2021_Indoor_Positioning_Accuracy_UWB.pdf` | 2021 | Sensors 21(17):5731 |
-| 7 | `07_Kramaric_2025_Anchor_Placement_Localization.pdf` | 2025 | Sensors 25(16):5115 |
-| 8 | `08_Yang_2024_CIR_Feature_NLOS_Identification.pdf` | 2024 | Sensors 24(5):1703 |
-| 9 | `09_Alarifi_2016_UWB_Indoor_Positioning_Survey.pdf` | 2016 | Sensors 16(5):707 |
-| 10 | `10_Kram_2019_UWB_CIR_Features_Complex_Env.pdf` | 2019 | Sensors 19(24):5547 |
-| 11 | `11_ISPRS_2020_Multilateration_Flip_Ambiguity_UWB.pdf` | 2020 | ISPRS Annals V-1-2020 |
-| 12 | `12_Zafari_2019_Survey_Indoor_Localization_Systems.pdf` | 2019 | IEEE COMST 21(3) |
-| 13 | `13_Liu_2022_Sensor_Fusion_LowCost_UWB_IMU.pdf` | 2022 | Sensors 22(21):8156 |
+Semua tautan di bawah sudah dicoba dan berhasil diunduh (status 200, header `%PDF`).
 
-Total: 13 PDF.
+| # | Berkas | Tahun | Terbitan | Unduh | Halaman |
+|---|---|---|---|---|---|
+| 1 | `01_Krebs_2024_ESP32_DWM3000_UWB_Positioning.pdf` | 2024 | arXiv:2403.10194 | [PDF](https://arxiv.org/pdf/2403.10194) · [abs](https://arxiv.org/abs/2403.10194) | — |
+| 2 | `02_Shalihan_2022_NLOS_NN_Ranging_Mitigation.pdf` | 2022 | arXiv:2206.09607 | [PDF](https://arxiv.org/pdf/2206.09607) · [abs](https://arxiv.org/abs/2206.09607) | — |
+| 3 | `03_Angarano_2021_Robust_UWB_Range_Error_DL_Edge.pdf` | 2021 | arXiv:2011.14684 | [PDF](https://arxiv.org/pdf/2011.14684) · [abs](https://arxiv.org/abs/2011.14684) | — |
+| 4 | `04_Fan_2022_WLS_RKF_NLOS_Kalman.pdf` | 2022 | arXiv:2205.05939 | [PDF](https://arxiv.org/pdf/2205.05939) · [abs](https://arxiv.org/abs/2205.05939) | — |
+| 5 | `05_Bregar_2023_Indoor_UWB_Positioning_Dataset.pdf` | 2023 | Scientific Data 10:744 | [PDF](https://www.nature.com/articles/s41597-023-02639-5.pdf) · [DOI](https://doi.org/10.1038/s41597-023-02639-5) | [PMC10603152](https://pmc.ncbi.nlm.nih.gov/articles/PMC10603152/) |
+| 6 | `06_Yao_2021_Indoor_Positioning_Accuracy_UWB.pdf` | 2021 | Sensors 21(17):5731 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-21-05731/article_deploy/sensors-21-05731.pdf) · [DOI](https://doi.org/10.3390/s21175731) | [PMC8433727](https://pmc.ncbi.nlm.nih.gov/articles/PMC8433727/) |
+| 7 | `07_Kramaric_2025_Anchor_Placement_Localization.pdf` | 2025 | Sensors 25(16):5115 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-25-05115/article_deploy/sensors-25-05115.pdf) · [DOI](https://doi.org/10.3390/s25165115) | [PMC12389748](https://pmc.ncbi.nlm.nih.gov/articles/PMC12389748/) |
+| 8 | `08_Yang_2024_CIR_Feature_NLOS_Identification.pdf` | 2024 | Sensors 24(5):1703 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-24-01703/article_deploy/sensors-24-01703.pdf) · [DOI](https://doi.org/10.3390/s24051703) | [PMC10934496](https://pmc.ncbi.nlm.nih.gov/articles/PMC10934496/) |
+| 9 | `09_Alarifi_2016_UWB_Indoor_Positioning_Survey.pdf` | 2016 | Sensors 16(5):707 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-16-00707/article_deploy/sensors-16-00707.pdf) · [DOI](https://doi.org/10.3390/s16050707) | — |
+| 10 | `10_Kram_2019_UWB_CIR_Features_Complex_Env.pdf` | 2019 | Sensors 19(24):5547 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-19-05547/article_deploy/sensors-19-05547.pdf) · [DOI](https://doi.org/10.3390/s19245547) | — |
+| 11 | `11_ISPRS_2020_Multilateration_Flip_Ambiguity_UWB.pdf` | 2020 | ISPRS Annals V-1-2020 | [PDF](https://isprs-annals.copernicus.org/articles/V-1-2020/317/2020/isprs-annals-V-1-2020-317-2020.pdf) · [DOI](https://doi.org/10.5194/isprs-annals-V-1-2020-317-2020) | — |
+| 12 | `12_Zafari_2019_Survey_Indoor_Localization_Systems.pdf` | 2019 | IEEE COMST 21(3) | [PDF (arXiv)](https://arxiv.org/pdf/1709.01015) · [abs](https://arxiv.org/abs/1709.01015) | — |
+| 13 | `13_Liu_2022_Sensor_Fusion_LowCost_UWB_IMU.pdf` | 2022 | Sensors 22(21):8156 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-22-08156/article_deploy/sensors-22-08156.pdf) · [DOI](https://doi.org/10.3390/s22218156) | — |
 
-Tabel review lengkapnya: `docs/Review_Jurnal_UWB_Indoor_Positioning.docx`
+Total: 13 PDF (~42 MB, tidak ikut di-commit — lihat `.gitignore`).
+
+## Catatan tentang tautan
+
+- **MDPI** memblokir permintaan langsung ke `mdpi.com/.../pdf` (403). Tautan
+  `res.mdpi.com/d_attachment/...` di tabel ini yang berhasil.
+- **Tautan `doi.org` ke MDPI juga 403** kalau diakses otomatis; itu normal
+  (MDPI memblokir bot). Di browser biasa tautan DOI-nya tetap terbuka. Untuk
+  mengunduh otomatis, pakai kolom **Unduh**.
+- **PMC/Europe PMC** juga memblokir unduhan otomatis (403), jadi untuk paper
+  MDPI dipakai CDN penerbitnya, dan untuk Bregar 2023 dipakai `nature.com`.
+- **#12 (Zafari)** ada di IEEE Xplore berbayar; tautan di sini menunjuk ke versi
+  arXiv penulisnya. Isinya sama, tetapi nomor halaman berbeda dari versi jurnal —
+  perhatikan ini kalau mengutip nomor halaman.
+
+## Ringkasan relevansi ke proyek
+
+| Kelompok | Paper | Dipakai untuk |
+|---|---|---|
+| Hardware ESP32 + UWB | #1 | Arsitektur paling mirip: ESP32 + modul UWB + EKF |
+| Pelacakan (EKF) | #6, #4 | EKF, gate inovasi, uji Mahalanobis untuk menolak pengukuran |
+| Penanganan NLOS | #2, #3, #8, #10 | Deteksi NLOS, pembobotan, koreksi galat ranging |
+| Geometri anchor | #7, #11 | PDOP, anchor koplanar, flip ambiguity (dua solusi cermin) |
+| Dasar / tinjauan | #9, #12 | Taksonomi teknologi dan teknik lokalisasi indoor |
+| Dataset & protokol | #5 | ADS-TWR, dataset CIR, arsitektur MQTT |
+| Pengembangan lanjutan | #13 | Fusi UWB + IMU |
+
+Tabel review lengkap (format 8 kolom): [`../Review_Jurnal_UWB_Indoor_Positioning.docx`](../Review_Jurnal_UWB_Indoor_Positioning.docx)
+
+## Unduh ulang semua PDF
+
+```bash
+cd docs/papers
+python - <<'EOF'
+import re, requests, pathlib
+md = pathlib.Path("README.md").read_text(encoding="utf-8")
+H = {"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,*/*",
+     "Referer": "https://www.mdpi.com/"}
+for row in md.splitlines():
+    m = re.match(r"\|\s*\d+\s*\|\s*`([^`]+)`.*?\[PDF[^\]]*\]\(([^)]+)\)", row)
+    if not m: continue
+    name, url = m.group(1), m.group(2)
+    r = requests.get(url, headers=H, timeout=120)
+    if r.status_code == 200 and r.content[:4] == b"%PDF":
+        pathlib.Path(name).write_bytes(r.content)
+        print(f"OK   {name}  {len(r.content)//1024} KB")
+    else:
+        print(f"FAIL {name}  status={r.status_code}")
+EOF
+```
