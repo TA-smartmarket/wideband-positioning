@@ -11,7 +11,7 @@
 #include <Preferences.h>
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.28"
+#define FW_VERSION      "1.0.29"
 #ifndef MAX_DEVICES
 #define MAX_DEVICES     10      // ids 1..10 for both roles
 #endif
@@ -105,16 +105,20 @@ inline void deviceId(const Config &c, char *out, size_t n)
 }
 
 // The setup AP name, unique per chip:
-//   "UWB-Setup-A3F2"   suffix = last two bytes of this board's MAC
+//   "UWB-Setup-3476"   suffix = two device-specific MAC bytes
 // Deliberately carries NO role or id: the role is picked during setup, so a
-// name that said "tag-1" would be wrong for the very board being configured
-// (and misleading when re-purposing a node that already had a role in NVS).
-// The suffix is what makes boards powered on together distinguishable.
+// name that said "tag-1" would be wrong for the very board being configured.
+//
+// The suffix must come from the DEVICE-SPECIFIC bytes. ESP.getEfuseMac()
+// returns the MAC with the first octet in the least significant byte, so
+// (mac>>40) and (mac>>32) are the two bytes that differ per board; taking
+// (mac>>8) and mac instead reads the OUI, which is identical across a batch —
+// two of these boards shared it and would have advertised the same name.
 inline void apSsid(char *out, size_t n)
 {
     const uint64_t mac = ESP.getEfuseMac();
     snprintf(out, n, "%s-%02X%02X", SSID_AP_PREFIX,
-             (unsigned)((mac >> 8) & 0xFF), (unsigned)(mac & 0xFF));
+             (unsigned)((mac >> 40) & 0xFF), (unsigned)((mac >> 32) & 0xFF));
 }
 
 // Spread the setup APs across the three non-overlapping 2.4 GHz channels
@@ -123,7 +127,7 @@ inline uint8_t apChannel()
 {
     const uint64_t mac = ESP.getEfuseMac();
     static const uint8_t ch[3] = {1, 6, 11};
-    return ch[(unsigned)((mac >> 16) & 0xFF) % 3];
+    return ch[(unsigned)((mac >> 40) & 0xFF) % 3];
 }
 
 // The DW1000 EUI is derived from role+id so no address is ever typed by hand.
