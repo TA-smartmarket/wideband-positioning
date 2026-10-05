@@ -1,9 +1,14 @@
 # Algoritma Sistem — Penjelasan Mendalam
 
-Dokumen ini menjelaskan **setiap algoritma** yang dipakai di proyek ini: apa
+Dokumen ini menjelaskan **algoritma inti** yang dipakai di proyek ini: apa
 masalahnya, bagaimana matematikanya, kenapa dipilih, dan di file/baris mana
 implementasinya. Semua rumus di bawah diambil dari kode yang benar-benar jalan,
 bukan dari rencana.
+
+Fokus dokumen ini adalah algoritma yang **menentukan akurasi posisi**. Algoritma
+pendukung (hash config, anti-downgrade OTA, penempatan anchor otomatis, perataan
+animasi UI) tidak dibahas di sini — bukan karena tidak penting, tapi karena
+tidak mempengaruhi hasil pengukuran; penjelasannya ada di komentar kode.
 
 Konvensi: koordinat ruang 2D `(x, y)` dalam meter, `z` untuk tinggi.
 Anchor = pemancar tetap dengan posisi diketahui; tag = perangkat yang dicari.
@@ -12,20 +17,14 @@ Anchor = pemancar tetap dengan posisi diketahui; tag = perangkat yang dicari.
 
 1. [Ikhtisar alur data](#1-ikhtisar-alur-data)
 2. [Two-Way Ranging (TWR) — pengukuran jarak](#2-two-way-ranging-twr)
-3. [Pre-filter jarak: median-3 + EMA + gate lompatan](#3-pre-filter-jarak)
+3. [Pre-filter jarak: gate lompatan + median-3 + EMA](#3-pre-filter-jarak)
 4. [Konversi jarak 3D → horizontal](#4-konversi-jarak-3d--horizontal)
 5. [Solver posisi (multilaterasi)](#5-solver-posisi-multilaterasi)
 6. [Extended Kalman Filter (EKF)](#6-extended-kalman-filter-ekf)
-7. [Innovation gating (penolakan outlier)](#7-innovation-gating)
-8. [Self-healing EKF](#8-self-healing-ekf)
-9. [Clamp batas ruangan](#9-clamp-batas-ruangan)
-10. [Uji ketidaksamaan segitiga (geometry check)](#10-uji-ketidaksamaan-segitiga)
-11. [Klasifikasi LOS/NLOS: slab method](#11-klasifikasi-losnlos-slab-method)
-12. [Sigma & bias NLOS](#12-sigma--bias-nlos)
-13. [Perataan kurva & visual](#13-perataan-kurva--visual)
-14. [Algoritma pendukung](#14-algoritma-pendukung)
-15. [Peta lengkap: algoritma → file](#15-peta-lengkap)
-16. [Parameter & penyetelan](#16-parameter--penyetelan)
+7. [Klasifikasi LOS/NLOS, sigma & bias](#7-klasifikasi-losnlos-sigma--bias)
+8. [Uji ketidaksamaan segitiga (geometry check)](#8-uji-ketidaksamaan-segitiga)
+9. [Peta algoritma → file](#9-peta-algoritma--file)
+10. [Parameter & penyetelan](#10-parameter--penyetelan)
 
 ---
 
@@ -33,31 +32,30 @@ Anchor = pemancar tetap dengan posisi diketahui; tag = perangkat yang dicari.
 
 ```
                  DW1000 (radio UWB)
-                        │  TWR
+                        │  TWR                      §2
                         ▼
              jarak mentah (3D, meter)
                         │
         ┌───────────────┴───────────────┐
-        │  pre-filter (median-3 + EMA)  │   src/main.cpp
+        │  pre-filter: gate+median+EMA  │             §3
         └───────────────┬───────────────┘
                         ▼
-              konversi 3D → horizontal
+              konversi 3D → horizontal                 §4
                         │
         ┌───────────────┴───────────────┐
-        │  solver: 2 anchor → irisan     │   src/solver.h
-        │  lingkaran; 3+ → least squares │   server/app.py
+        │  solver: 2 anchor → irisan     │             §5
+        │  lingkaran; 3+ → least squares │
         └───────────────┬───────────────┘
                         ▼  (hanya untuk fix pertama)
         ┌───────────────┴───────────────┐
-        │   EKF: predict + update/range  │   src/ekf.h
-        │   + innovation gate 3σ         │   server/app.py
+        │   EKF: predict + update/range  │             §6
+        │   + innovation gate 3σ         │
         └───────────────┬───────────────┘
                         ▼
           posisi (x, y), kecepatan, sigma
                         │
         ┌───────────────┴───────────────┐
-        │  clamp batas ruangan           │
-        │  + uji segitiga (geometry_ok)  │
+        │  clamp ruangan + uji segitiga  │             §8
         └───────────────┬───────────────┘
                         ▼
                  server → UI 3D
@@ -97,7 +95,7 @@ jarak = c · ToF          c = 299 702 547 m/s
 **Kenapa bukan ToA/TDoA?** ToA butuh sinkronisasi jam presisi antar semua node
 (1 ns error ≈ 30 cm). TDoA hanya butuh sinkronisasi antar anchor. Keduanya
 menambah kompleksitas infrastruktur. TWR tidak butuh sinkronisasi sama sekali —
-cocok untuk node baterai/WiFi sederhana seperti ESP32 ini. Rujukan: Bregar 2023
+cocok untuk node WiFi sederhana seperti ESP32 ini. Rujukan: Bregar 2023
 (ADS-TWR), Kramarić 2025 (DS-TWR).
 
 **Kode.** Implementasi ada di library `lib/DW1000/` (`DW1000Ranging.cpp`),
@@ -114,9 +112,8 @@ struct RangeRec {          // src/main.cpp:61
 };
 ```
 
-`rx` dan `fp` bukan sekadar hiasan: selisihnya dipakai untuk menilai kualitas
-jalur (lihat §11). Jarak yang diukur adalah **slant range 3D**, bukan jarak
-horizontal — itu penting untuk §4.
+Jarak yang diukur adalah **slant range 3D**, bukan jarak horizontal — itu
+penting untuk §4.
 
 ---
 
@@ -125,7 +122,7 @@ horizontal — itu penting untuk §4.
 **Masalah.** Satu sampel TWR bisa meleset jauh (multipath, tabrakan paket).
 Kalau sampel itu langsung masuk EKF, estimasi tersentak.
 
-**Algoritma.** Tiga tahap berurutan, di `src/main.cpp::rfUpdate()` (baris 129):
+**Algoritma.** Tiga tahap berurutan, di `src/main.cpp::rfUpdate()` (baris 129).
 
 ### 3a. Gate lompatan (outlier gate)
 
@@ -251,7 +248,7 @@ supaya pengguna tahu posisi itu tidak bisa dipercaya.
 ada solusi. Kode mengembalikan titik tengah kedua anchor dengan `confidence =
 0,1` dan `ambiguous = True` — jujur menyatakan "tidak tahu" alih-alih
 mengarang angka. Kasus inilah yang terjadi di proyek ini saat dua anchor
-saling berhadapan dan jaraknya tidak konsisten (lihat §10).
+saling berhadapan dan jaraknya tidak konsisten (lihat §8).
 
 Rujukan: Park 2020 membahas flip ambiguity ini secara formal untuk multilaterasi
 UWB.
@@ -337,7 +334,7 @@ di sekitar estimasi sekarang lewat Jacobian-nya:
 Hᵢ = [ (px−axᵢ)/d , (py−ayᵢ)/d , 0 , 0 ]        d = ‖p − aᵢ‖
 ```
 
-### Dua tahap tiap siklus
+### 6a. Dua tahap tiap siklus
 
 **Prediksi** (`ekfPredict`, `src/ekf.h:95`):
 
@@ -365,38 +362,13 @@ x ← x + K·y                    koreksi state
 P ← (I − K·H)·P                koreksi kovarians
 ```
 
-### Keputusan desain
-
 **Kenapa satu anchor per update, bukan sekaligus?** Setiap jarak adalah
 pengukuran **skalar** yang independen. Memprosesnya berurutan menghindari
 membangun matriks inovasi N×N, menghemat RAM (penting di ESP32) dan lebih
 stabil secara numerik. Secara matematis hasilnya sama dengan update batch
 untuk pengukuran yang tidak berkorelasi.
 
-**Pembatasan kovarians** (`src/ekf.h:141`):
-
-```cpp
-const float cap[EKF_N] = {25.0f, 25.0f, 9.0f, 9.0f};
-```
-
-Kalau pengukuran terus-menerus ditolak (NLOS berat), `P` tumbuh tanpa batas,
-`sigma` menjadi tak bermakna, dan `confidence` ambruk — pernah teramati 11 m.
-Cap membuat angkanya tetap bisa diinterpretasikan.
-
-**`dt` dibatasi 2 detik** — kalau sistem sempat macet (OTA, reboot), lompatan
-waktu besar akan membuat prediksi meleset jauh.
-
-**Kembar di server.** `server/app.py::TagEKF` (baris 326) mengimplementasikan
-matematika yang sama. Ini bukan duplikasi yang tidak disengaja: server perlu
-bisa menghitung ulang dari data mentah untuk verifikasi, dan tag perlu bisa
-mandiri saat WiFi putus.
-
-Rujukan: Yao 2021 (EKF mengungguli trilaterasi & least-squares saat data
-mengandung outlier), Fan 2022 (Kalman + uji statistik untuk NLOS).
-
----
-
-## 7. Innovation gating
+### 6b. Innovation gating — penolakan outlier
 
 **Masalah.** Pengukuran NLOS bisa meleset 1–3 m. Kalau diterima, EKF akan
 tertarik ke arah yang salah. Diperlukan cara otomatis untuk **menolak**
@@ -410,32 +382,38 @@ S     = H·P·Hᵀ + R                kovarians inovasi
 tolak jika |y| > gate_sigma · √S
 ```
 
-dengan `gate_sigma = 3.0` (default). Logikanya: `S` adalah **varians yang
-diharapkan** dari inovasi. Kalau inovasi jauh lebih besar dari yang
-diperkirakan filter sendiri, pengukuran itu tidak konsisten dengan model —
-kemungkinan besar pantulan, bukan jalur langsung.
-
 ```cpp
 const float gate = gate_sigma * sqrtf(S);
 if (fabsf(innov) > gate) return false;      // ditolak
 ```
 
-**Sifat penting:** ambang ini **adaptif**. Saat filter baru mulai (P besar),
+Logikanya: `S` adalah **varians yang diharapkan** dari inovasi. Kalau inovasi
+jauh lebih besar dari yang diperkirakan filter sendiri, pengukuran itu tidak
+konsisten dengan model — kemungkinan besar pantulan, bukan jalur langsung.
+
+**Sifat penting: ambang ini adaptif.** Saat filter baru mulai (`P` besar),
 gerbangnya lebar sehingga pengukuran pertama mudah diterima. Setelah filter
-yakin (P kecil), gerbangnya menyempit sehingga outlier mudah tertangkap. Tidak
-ada ambang tetap yang perlu disetel manual.
+yakin (`P` kecil), gerbangnya menyempit sehingga outlier mudah tertangkap.
+Tidak ada ambang tetap yang perlu disetel manual.
 
-**Efek terukur:** `P[0][0] = 1,0` (posisi belum yakin) → `√S` besar → toleran.
-Setelah beberapa update, `P[0][0]` mengecil → `√S` kecil → selektif.
-
-**Kembar di server**, dengan tambahan: `sigma_r` bisa **di-override per
+**Kembar di server** punya tambahan: `sigma_r` bisa **di-override per
 pengukuran** (`update_range(..., sigma_r=None)`) supaya jalur NLOS langsung
 mendapat sigma lebih besar — gerbangnya otomatis lebih longgar untuk jalur yang
-memang berisik, alih-alih menolaknya mentah-mentah. Lihat §12.
+memang berisik, alih-alih menolaknya mentah-mentah. Lihat §7.
 
----
+### 6c. Pembatasan kovarians
 
-## 8. Self-healing EKF
+```cpp
+const float cap[EKF_N] = {25.0f, 25.0f, 9.0f, 9.0f};
+```
+
+Kalau pengukuran terus-menerus ditolak (NLOS berat), `P` tumbuh tanpa batas,
+`sigma` menjadi tak bermakna, dan `confidence` ambruk — pernah teramati 11 m.
+Cap membuat angkanya tetap bisa diinterpretasikan. `dt` juga dibatasi 2 detik:
+kalau sistem sempat macet (OTA, reboot), lompatan waktu besar akan membuat
+prediksi meleset jauh.
+
+### 6d. Self-healing
 
 **Masalah.** Kalau NLOS sangat parah (misalnya ada orang berdiri tepat di
 antara anchor dan tag), **semua** pengukuran bisa ditolak. Filter lalu hanya
@@ -443,7 +421,8 @@ antara anchor dan tag), **semua** pengukuran bisa ditolak. Filter lalu hanya
 kembali ke kenyataan.
 
 **Algoritma.** Hitung siklus berturut-turut tanpa pengukuran yang diterima;
-setelah 8 siklus, **restart** filter dari solver geometris:
+setelah **8 siklus** (≈1,6 detik pada `update_ms = 200`), restart filter dari
+solver geometris:
 
 ```python
 if used == 0:
@@ -455,18 +434,12 @@ if used == 0:
             EKF_REJECTS[tag] = 0
 ```
 
-**Kenapa 8?** Satu siklus ≈ 200 ms (`update_ms`), jadi 8 siklus ≈ 1,6 detik.
-Cukup lama untuk tidak bereaksi berlebihan terhadap gangguan sesaat, cukup
-cepat untuk pulih sebelum UI terasa "macet".
-
 **Kenapa restart, bukan memperlebar gerbang?** Memperlebar gerbang akan
 membuat filter menerima data buruk — persis yang ingin dihindari. Restart dari
 solver geometris (yang tidak punya memori, jadi tidak bisa "tersesat")
 memberikan titik awal bersih tanpa mengorbankan selektivitas.
 
----
-
-## 9. Clamp batas ruangan
+### 6e. Clamp batas ruangan
 
 **Masalah.** Dengan hanya dua anchor, satu pasang jarak yang tidak konsisten
 bisa mendorong estimasi sangat jauh — pernah teramati **x = −38 m**.
@@ -493,9 +466,99 @@ filter akan terus "mendorong" ke luar tembok dan melawan clamp setiap siklus.
 Meredam kecepatan + menaikkan kovarians memberi tahu filter bahwa ia baru saja
 dipaksa, sehingga update berikutnya lebih berpengaruh.
 
+**Kembar di server.** `server/app.py::TagEKF` (baris 326) mengimplementasikan
+matematika yang sama. Ini bukan duplikasi yang tidak disengaja: server perlu
+bisa menghitung ulang dari data mentah untuk verifikasi, dan tag perlu bisa
+mandiri saat WiFi putus.
+
+Rujukan: Yao 2021 (EKF mengungguli trilaterasi & least-squares saat data
+mengandung outlier), Fan 2022 (Kalman + uji statistik untuk NLOS).
+
 ---
 
-## 10. Uji ketidaksamaan segitiga
+## 7. Klasifikasi LOS/NLOS, sigma & bias
+
+**Masalah.** Untuk menghitung pengaruh penghalang, perlu tahu apakah ruas garis
+anchor→tag **menembus** sebuah kotak (dinding/lemari) atau tidak.
+
+### 7a. Slab method — uji ruas garis vs kotak berorientasi
+
+Algoritma *slab method*: uji perpotongan ruas garis 3D dengan kotak berorientasi
+(oriented bounding box). Namanya "slab" karena tiap dimensi dipandang sebagai
+sepasang bidang paralel.
+
+```
+1. Transformasi p0, p1 ke kerangka lokal kotak (geser + rotasi −θ)
+2. Untuk tiap sumbu i ∈ {x, y, z}:
+       t1 = (−halfᵢ − aᵢ) / dᵢ
+       t2 = ( halfᵢ − aᵢ) / dᵢ
+       tmin = max(tmin, min(t1,t2))
+       tmax = min(tmax, max(t1,t2))
+       jika tmin > tmax → tidak berpotongan
+3. Berpotongan jika tmin ≤ tmax
+```
+
+**Detail penting:**
+
+- **Rotasi dibalik** (`cos(-rot)`) karena kita memindahkan *garis* ke kerangka
+  kotak, bukan memutar kotak ke kerangka dunia. Ini menghindari alokasi matriks.
+- **Kasus `|dᵢ| < 1e-9`** (garis sejajar bidang slab) ditangani terpisah:
+  berpotongan hanya jika `aᵢ` sudah berada di dalam batas.
+- **`tmin` dimulai dari 0 dan `tmax` dari 1**, bukan ±∞, karena kita hanya
+  peduli pada segmen `p0→p1`, bukan garis tak hingga.
+
+**Kenapa bukan bounding-sphere atau AABB saja?** Penghalang di UI bisa
+**diputar** (`rot`), jadi AABB (axis-aligned) akan memberi hasil salah untuk
+kotak yang dimiringkan. Slab method di kerangka lokal menangani rotasi dengan
+benar dan tetap murah: O(1) per kotak, tanpa alokasi memori.
+
+**Transparansi:** kotak dengan `atten ≤ 0` dilewati — dipakai untuk penghalang
+yang sengaja ditandai tidak menghalangi.
+
+### 7b. Sigma pengukuran membengkak
+
+```python
+def measurement_sigma(blockers, base_sigma, nlos_factor=8.0):
+    if not blockers: return base_sigma
+    atten = max(ob.get("atten", 1.0) for ob in blockers)
+    return base_sigma * (1.0 + (nlos_factor - 1.0) * min(atten, 1.0))
+```
+
+`base_sigma = 0,15 m` (LOS), dan bisa naik sampai **8×** (1,2 m) saat terhalang
+penuh. Nilai ini masuk ke `S = H·P·Hᵀ + R` di EKF, sehingga:
+
+- Gerbang §6b otomatis **melonggar** untuk jalur itu (tidak langsung ditolak).
+- Kalman gain mengecil, jadi filter **kurang memercayainya**.
+
+Ini jauh lebih baik daripada sekadar membuang pengukuran NLOS: informasinya
+tetap terpakai, hanya dengan bobot yang jujur.
+
+**Penghalang terkuat yang menentukan** (`max(atten)`), bukan rata-rata — satu
+dinding beton lebih menentukan daripada tiga tirai tipis.
+
+### 7c. Bias positif
+
+```python
+def nlos_bias(blockers, bias_m=0.35):
+    if not blockers: return 0.0
+    return bias_m * min(atten, 1.0)
+```
+
+Nilai ini **ditambahkan** ke jarak sebelum masuk EKF:
+
+```python
+EKF[tag].update_range(ax, ay, rng2d + bias, sigma_r=sigma)
+```
+
+**Dasarnya fisika:** sinyal UWB NLOS tiba **lebih lambat** karena menempuh
+jalur pantulan yang lebih panjang, jadi jarak terbaca **terlalu panjang**.
+Mengoreksinya ke arah sebaliknya (mengurangi) akan salah arah; menambah bias
+positif menggeser pengukuran kembali ke arah yang benar. Rujukan: Angarano 2021,
+Yang 2024, Shalihan 2022.
+
+---
+
+## 8. Uji ketidaksamaan segitiga
 
 **Masalah.** Bagaimana mengetahui bahwa **pasangan** jarak itu mustahil,
 sebelum mempercayainya? Ini bukan soal derau — ini soal fisika.
@@ -520,7 +583,7 @@ return worst <= 0.0, worst        # (ok, slack)
 ```
 
 `slack` = seberapa jauh pelanggarannya, dalam meter. Ini **bukan** untuk
-membuang data (EKF yang memutuskan lewat gerbang §7) — ini **indikator
+membuang data (EKF yang memutuskan lewat gerbang §6b) — ini **indikator
 diagnostik** yang ditampilkan di UI sebagai `geometry_ok` / `geometry_slack`.
 
 **Kasus nyata yang terdeteksi di proyek ini:**
@@ -544,213 +607,27 @@ ini perlu ditinjau ulang.
 
 ---
 
-## 11. Klasifikasi LOS/NLOS: slab method
-
-**Masalah.** Untuk menghitung pengaruh penghalang, perlu tahu apakah ruas garis
-anchor→tag **menembus** sebuah kotak (dinding/lemari) atau tidak.
-
-**Algoritma.** *Slab method* — uji perpotongan ruas garis 3D dengan kotak
-berorientasi (oriented bounding box). Namanya "slab" karena tiap dimensi
-dipandang sebagai sepasang bidang paralel (slab).
-
-```
-1. Transformasi p0, p1 ke kerangka lokal kotak (geser + rotasi −θ)
-2. Untuk tiap sumbu i ∈ {x, y, z}:
-       t1 = (−halfᵢ − aᵢ) / dᵢ
-       t2 = ( halfᵢ − aᵢ) / dᵢ
-       tmin = max(tmin, min(t1,t2))
-       tmax = min(tmax, max(t1,t2))
-       jika tmin > tmax → tidak berpotongan
-3. Berpotongan jika tmin ≤ tmax
-```
-
-**Detail penting:**
-
-- **Rotasi dibalik** (`cos(-rot)`) karena kita memindahkan *garis* ke kerangka
-  kotak, bukan memutar kotak ke kerangka dunia. Ini menghindari alokasi matriks.
-- **Kasus `|dᵢ| < 1e-9`** (garis sejajar bidang slab) ditangani terpisah:
-  berpotongan hanya jika `aᵢ` sudah berada di dalam batas.
-- **`tmin` dimulai dari 0 dan `tmax` dari 1**, bukan ±∞, karena kita hanya
-  peduli pada segmen `p0→p1`, bukan garis tak hingga.
-
-**Kompleksitas:** O(1) per kotak, O(n) total. Tidak ada alokasi memori.
-
-**Kenapa bukan bounding-sphere atau AABB saja?** Penghalang di UI bisa
-**diputar** (`rot`), jadi AABB (axis-aligned) akan memberi hasil salah untuk
-kotak yang dimiringkan. Slab method di kerangka lokal menangani rotasi dengan
-benar dan tetap murah.
-
-**Transparansi:** kotak dengan `atten ≤ 0` dilewati — dipakai untuk penghalang
-yang sengaja ditandai tidak menghalangi.
-
----
-
-## 12. Sigma & bias NLOS
-
-Setelah tahu jalur mana yang terhalang (§11), nilainya dipakai dua cara.
-
-### 12a. Sigma pengukuran membengkak
-
-```python
-def measurement_sigma(blockers, base_sigma, nlos_factor=8.0):
-    if not blockers: return base_sigma
-    atten = max(ob.get("atten", 1.0) for ob in blockers)
-    return base_sigma * (1.0 + (nlos_factor - 1.0) * min(atten, 1.0))
-```
-
-`base_sigma = 0,15 m` (LOS), dan bisa naik sampai **8×** (1,2 m) saat terhalang
-penuh. Nilai ini masuk ke `S = H·P·Hᵀ + R` di EKF, sehingga:
-
-- Gerbang §7 otomatis **melonggar** untuk jalur itu (tidak langsung ditolak).
-- Kalman gain mengecil, jadi filter **kurang memercayainya**.
-
-Ini jauh lebih baik daripada sekadar membuang pengukuran NLOS: informasinya
-tetap terpakai, hanya dengan bobot yang jujur.
-
-**Penghalang terkuat yang menentukan** (`max(atten)`), bukan rata-rata — satu
-dinding beton lebih menentukan daripada tiga tirai tipis.
-
-### 12b. Bias positif
-
-```python
-def nlos_bias(blockers, bias_m=0.35):
-    if not blockers: return 0.0
-    return bias_m * min(atten, 1.0)
-```
-
-Nilai ini **ditambahkan** ke jarak sebelum masuk EKF:
-
-```python
-EKF[tag].update_range(ax, ay, rng2d + bias, sigma_r=sigma)
-```
-
-**Dasarnya fisika:** sinyal UWB NLOS tiba **lebih lambat** karena menempuh
-jalur pantulan yang lebih panjang, jadi jarak terbaca **terlalu panjang**.
-Mengoreksinya ke arah sebaliknya (mengurangi) akan salah arah; menambah bias
-positif menggeser pengukuran kembali ke arah yang benar. Rujukan: Angarano 2021,
-Yang 2024, Shalihan 2022.
-
----
-
-## 13. Perataan kurva & visual
-
-Algoritma ringan yang membuat UI enak dilihat. Semuanya di `server/static/app.js`.
-
-| Algoritma | Rumus | Dipakai untuk |
-|---|---|---|
-| Ease-out cubic | `e = 1 − (1−p)³` | Animasi intro kamera |
-| Interpolasi alpha | `a ← a + (target − a)·k` | Kamera menyusul (damping) |
-| Fog adaptif | `span = max(W, D, 1)` | Kabut tidak menelan ruangan |
-| Zoom terkuantitasi | `step = clamp(zoom/UNIT, −1, 1)` | Maksimal satu notch per frame |
-| Akumulasi delta | `frameDt = clock.getDelta()` | Gerak tidak bergantung FPS |
-| Raycast + `threshold` | `Line.threshold = 0.02` | Klik garis/panah di 3D |
-
-**Ease-out cubic** dipilih karena memberi awal cepat lalu melambat halus —
-cocok untuk transisi kamera; ease-in-out terasa lambat di awal.
-
-**Zoom terkuantitasi** mencegah lompatan besar: roda mouse bisa mengirim delta
-besar sekaligus, jadi nilainya diakumulasi lalu dibatasi satu langkah per frame.
-
-**Raycast `threshold = 0.02`** — nilai ini dulu 1,0 satuan dunia (≈1 m) sehingga
-klik pada panah kecil "tertelan" objek lain. Turun ke 0,02 membuat panah bisa
-diklik presisi.
-
----
-
-## 14. Algoritma pendukung
-
-### 14a. Deteksi perangkat via alamat pendek UWB
-
-```cpp
-inline void shortToDeviceId(uint16_t shortAddr, char *out, size_t n) {
-    uint8_t hi = (shortAddr >> 8) & 0xFF;
-    uint8_t lo = shortAddr & 0xFF;
-    // "anchor-2" / "tag-1"
-}
-```
-
-Alamat pendek DW1000 diambil dari dua byte pertama EUI, dan EUI itu sendiri
-diturunkan dari role+id (`config.h::deviceEui`). Jadi identitas perangkat
-**tidak pernah diketik manual** — menghilangkan seluruh kelas kesalahan
-konfigurasi.
-
-### 14b. FNV-1a untuk deteksi perubahan config
-
-```cpp
-static uint32_t configHash(JsonObjectConst doc) {
-    uint32_t h = 2166136261u;           // offset basis FNV-1a 32-bit
-    // ... h ^= byte; h *= 16777619u;
-}
-```
-
-**Masalah.** Server mengirim config berulang-ulang (retained MQTT). Tanpa
-penjaga, node akan reboot terus-menerus — ini **penyebab reboot loop** yang
-pernah terjadi di proyek ini.
-
-**Solusi.** Simpan hash config yang terakhir diterapkan di NVS. Config baru
-hanya diterapkan bila hash-nya berbeda. FNV-1a dipilih karena sangat sederhana,
-cepat, dan sebarannya cukup baik untuk keperluan ini (bukan kriptografi).
-
-### 14c. Auto-placement anchor
-
-```python
-corners = [(0,0), (w,0), (w,d), (0,d), (w/2,0), (w,d/2), (w/2,d), (0,d/2)]
-```
-
-Anchor baru yang belum dikenal diletakkan di sudut pertama yang belum terisi
-(toleransi 0,3 m). Kalau sudut habis, disebar di tepi langit-langit.
-
-**Ini bukan penempatan yang benar** — hanya membuat node **terlihat** di editor
-3D supaya operator bisa menggesernya ke posisi sebenarnya. Tanpa ini, anchor
-baru tidak muncul sama sekali dan tidak bisa dikonfigurasi. Sesuai prinsip
-"semua device bisa ditambah tanpa ubah kode".
-
-### 14d. Anti-downgrade OTA
-
-```python
-def version_tuple(v):    # "1.0.10" -> (1, 0, 10)
-    return tuple(int(d) if (d := "".join(c for c in p if c.isdigit())) else 0
-                 for p in str(v).split("."))
-
-def version_newer(candidate, current):
-    return version_tuple(candidate) > version_tuple(current)
-```
-
-**Kenapa bukan perbandingan string?** Secara leksikografis `"1.0.9" > "1.0.10"`
-— salah. Perbandingan numerik per komponen memberi urutan yang benar. Ini
-mencegah firmware lama menimpa yang baru.
-
-### 14e. Median-of-3 pada pengurutan
-
-Dipakai di §3b. Insertion sort dipilih karena untuk `n ≤ 4` ia lebih cepat
-daripada quicksort/mergesort (tidak ada overhead rekursi/alokasi).
-
----
-
-## 15. Peta lengkap
+## 9. Peta algoritma → file
 
 | Algoritma | File | Fungsi |
 |---|---|---|
 | TWR | `lib/DW1000/DW1000Ranging.cpp` | pengukuran jarak |
-| Pre-filter (median+EMA+gate) | `src/main.cpp:129` | `rfUpdate()` |
+| Pre-filter (gate+median+EMA) | `src/main.cpp:129` | `rfUpdate()` |
 | Proyeksi 3D→2D | `server/scene.py:130` | `horizontal_range()` |
-| Solver 2 anchor (irisan lingkaran) | `src/solver.h:51`, `app.py:255` | `solvePosition` / `solve_2d` |
-| Solver 3+ (least squares + Newton) | `src/solver.h:105`, `app.py:290` | idem |
+| Solver 2 anchor (irisan lingkaran) | `src/solver.h:51`, `app.py:254` | `solvePosition` / `solve_2d` |
+| Solver 3+ (least squares + Newton) | `src/solver.h:100`, `app.py:280` | idem |
 | EKF | `src/ekf.h`, `app.py:326` | `ekfPredict`/`ekfUpdateRange`, `TagEKF` |
-| Innovation gating | `src/ekf.h:170`, `app.py:390` | di dalam update |
-| Self-healing | `app.py:530` | `EKF_REJECTS` |
-| Clamp ruangan | `app.py:540` | di `recompute_positions` |
+| Innovation gating | `src/ekf.h:175`, `app.py:387` | di dalam update |
+| Self-healing | `app.py:529` | `EKF_REJECTS` |
+| Clamp ruangan | `app.py:545` | di `recompute_positions` |
 | Uji segitiga | `src/main.cpp:403`, `app.py:426` | `geometrySlack` / `geometry_check` |
 | Slab method | `server/scene.py:85` | `segment_hits_box()` |
 | Sigma NLOS | `server/scene.py:144` | `measurement_sigma()` |
 | Bias NLOS | `server/scene.py:153` | `nlos_bias()` |
-| FNV-1a hash | `src/main.cpp:959` | `configHash()` |
-| Anti-downgrade | `app.py:106` | `version_tuple()` |
-| Auto-placement | `app.py:164` | `auto_place_anchor()` |
 
 ---
 
-## 16. Parameter & penyetelan
+## 10. Parameter & penyetelan
 
 | Parameter | Nilai | Di mana | Efek kalau diubah |
 |---|---|---|---|
@@ -764,11 +641,12 @@ daripada quicksort/mergesort (tidak ada overhead rekursi/alokasi).
 | `bias_m` | 0,35 m | `scene.py` | koreksi NLOS positif |
 | `DEFAULT_TAG_Z` | 0,9 m | `scene.py` | tinggi tag saat memproyeksikan jarak |
 | cap kovarians | 25 / 9 | `ekf.h`, `app.py` | batas P posisi / kecepatan |
-| threshold reboot | 8 siklus | `app.py` | kecepatan self-healing |
+| threshold self-healing | 8 siklus | `app.py` | kecepatan pemulihan |
+| `update_ms` | 200 ms | `config.h` | laju siklus; mempengaruhi `dt` EKF |
 
 **Catatan penyetelan.** `sigma_a` dan `sigma_r` menentukan **rasio kepercayaan**
 antara model gerak dan pengukuran. Menaikkan `sigma_r` membuat filter lebih
-mengikuti pengukuran (responsif, tapi berisik); menaikkannya `sigma_a` membuat
+mengikuti pengukuran (responsif, tapi berisik); menaikkan `sigma_a` membuat
 filter lebih mengikuti model (halus, tapi lambat bereaksi). Rasio inilah yang
 paling sering perlu disetel saat pengujian lapangan, bukan nilai absolutnya.
 
@@ -777,13 +655,13 @@ paling sering perlu disetel saat pengujian lapangan, bukan nilai absolutnya.
 ## Rujukan
 
 - **Bregar 2023** — ADS-TWR, multilateration, dataset CIR → §2, §5
-- **Kramarić 2025** — DS-TWR, PDOP, anchor koplanar → §2, §10
+- **Kramarić 2025** — DS-TWR, PDOP, anchor koplanar → §2, §8
 - **Park 2020** — flip ambiguity pada multilaterasi UWB → §5a
-- **Yao 2021** — EKF untuk UWB, distribusi noise LOS/NLOS → §6, §7
-- **Fan 2022** — Kalman + uji Mahalanobis untuk NLOS → §7
-- **Shalihan 2022, Angarano 2021, Yang 2024, Kram 2019** — mitigasi galat NLOS → §12
+- **Yao 2021** — EKF untuk UWB, distribusi noise LOS/NLOS → §6
+- **Fan 2022** — Kalman + uji Mahalanobis untuk NLOS → §6b
+- **Shalihan 2022, Angarano 2021, Yang 2024, Kram 2019** — mitigasi galat NLOS → §7
 - **Krebs 2024** — arsitektur ESP32 + UWB + EKF lokal di tag → §1, §6
-- **Liu 2022** — fusi UWB+IMU (pengembangan lanjutan) → §14
+- **Liu 2022** — fusi UWB+IMU (pengembangan lanjutan) → §6
 
 PDF-nya ada di `docs/papers/` (lihat `docs/papers/README.md`).
 Tabel review 13 paper: `docs/Review_Jurnal_UWB_Indoor_Positioning.docx`.
