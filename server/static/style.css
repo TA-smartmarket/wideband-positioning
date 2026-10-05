@@ -330,11 +330,19 @@ html, body {
   overflow-y: auto;
 }
 
+/* Header + tabs are pinned: with a long section the title used to scroll away
+   and the content appeared to overlap it.
+   `flex: none` is essential: #panel is a flex column, so without it the header
+   shrank below its own content height (29px for a 37px title) and the title
+   spilled out of its box. */
 #panel header {
+  flex: none;
+  position: sticky; top: 0; z-index: 3;
   padding: 16px 16px 12px;
   border-bottom: 1px solid var(--line);
   background:
-    repeating-linear-gradient(45deg, var(--hatch) 0 1px, transparent 1px 7px);
+    repeating-linear-gradient(45deg, var(--hatch) 0 1px, transparent 1px 7px),
+    var(--surface);
 }
 #panel h1 {
   font-family: var(--font-display); font-weight: 700;
@@ -367,7 +375,15 @@ html, body {
   color: var(--ink-dim); margin: 16px 0 7px; font-weight: 500;
 }
 
-#tabs { display: flex; gap: 0; padding: 0; border-bottom: 1px solid var(--line); }
+#tabs {
+  flex: none;
+  display: flex; gap: 0; padding: 0;
+  border-bottom: 1px solid var(--line);
+  /* Pinned directly under the header; --header-h is measured at runtime so the
+     offset stays correct if the header text wraps. */
+  position: sticky; top: var(--header-h, 65px); z-index: 3;
+  background: var(--surface);
+}
 #tabs button {
   flex: 1; padding: 11px 4px; font-size: 11.5px;
   border: 0; border-right: 1px solid var(--line);
@@ -377,7 +393,8 @@ html, body {
 #tabs button:hover { background: var(--surface-3); color: var(--accent); }
 #tabs button.active { color: var(--accent-ink); }
 
-section { padding: 16px; border-top: 1px solid var(--line-soft); }
+section { padding: 16px; border-top: 1px solid var(--line-soft);
+          background: var(--surface); position: relative; z-index: 1; }
 section[hidden] { display: none; }
 
 label {
@@ -503,6 +520,7 @@ code {
 .ep .d { color: var(--ink-dim); font-size: 11px; margin-top: 3px; }
 
 footer {
+  flex: none;
   margin-top: auto; padding: 14px 16px 18px;
   border-top: 1px solid var(--line);
   background:
@@ -611,7 +629,7 @@ section.rise > * { animation: rise .26s cubic-bezier(.22,.61,.36,1) backwards;
   animation: sheen 1.1s ease-out .35s 1 backwards;
   pointer-events: none;
 }
-#panel header { position: relative; overflow: hidden; }
+#panel header { overflow: hidden; }   /* position comes from the sticky rule above */
 
 /* Tabs: the active underline wipes in from the left. */
 #tabs button { position: relative; }

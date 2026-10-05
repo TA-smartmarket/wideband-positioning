@@ -29,21 +29,31 @@ const $ = (id) => document.getElementById(id);
 const COL_DARK = {
   room: 0x1a1a1f, wall: 0x24242b, grid: 0x2a2a31, anchor: 0x34d399, anchorOff: 0x55555c,
   tag: 0xffb020, los: 0x34d399, nlos: 0xe8243b, obstacle: 0x3a3a44,
-  sel: 0xffffff, ghost: 0x8e8e92,
-  ruler: 0x9aa0b5, rulerMajor: 0xc7d6ff, rulerText: 0xb9c8ee,
+  sel: 0xe01f34, ghost: 0x8e8e92,
+  ruler: 0xffffff, rulerMajor: 0xffffff, rulerText: 0xffffff,
   dimText: 0xa8b8dc, originText: 0xd8e0ff,
   axisX: 0xff6b6b, axisY: 0x6bff9c, axisZ: 0x6bb5ff,
   labelOutline: 0x0a0a0c,
+  labelOn: 0xcffbe6, labelOff: 0xc3c9d6, labelTag: 0xffe6a8,
+  plateBg: 0x111114, plateLine: 0x3a3a44,
+  gridMajor: 0x2e2e38, wallGlass: 0x3a3a46,
+  anchorBody: 0x1c3b30, anchorBodyOff: 0x24242b, tagBody: 0x4a3208,
 };
 const COL_LIGHT = {
   room: 0xdedbd5, wall: 0xcfccc5, grid: 0xc9c6c0, anchor: 0x0f8a5f, anchorOff: 0x9a9aa4,
   tag: 0xd97706, los: 0x0f8a5f, nlos: 0xe8243b, obstacle: 0xc9c6c0,
-  sel: 0x14141a, ghost: 0x5c5c66,
+  sel: 0xe01f34, ghost: 0x5c5c66,
   // Darker than the paper background: the old pale blues were unreadable here.
-  ruler: 0x50505a, rulerMajor: 0x2a2a33, rulerText: 0x2e2e38,
+  ruler: 0xe01f34, rulerMajor: 0xc4162a, rulerText: 0xe01f34,
   dimText: 0x2e2e38, originText: 0x2a2a33,
   axisX: 0xc81e2b, axisY: 0x0f8a5f, axisZ: 0x1d5fa8,
   labelOutline: 0xeceae6,
+  // On paper, a pale green label over a pale wall disappeared; these are dark
+  // enough to hold against #eceae6 while still reading as "online".
+  labelOn: 0x0a5c3f, labelOff: 0x4a4a55, labelTag: 0x7a4a00,
+  plateBg: 0xf6f5f2, plateLine: 0xc9c6c0,
+  gridMajor: 0xb8b4ac, wallGlass: 0xa9a49b,
+  anchorBody: 0xcfccc5, anchorBodyOff: 0xc9c6c0, tagBody: 0xf0d9a8,
 };
 const COL = { ...COL_DARK };
 
@@ -79,6 +89,9 @@ function initThree() {
   camera.position.set(6, 7, 8);
 
   controls = new OrbitControls(camera, renderer.domElement);
+  // Orbit and pan happen inside OrbitControls, so they are marked here too —
+  // otherwise dragging the view would still be overridden by an auto re-fit.
+  controls.addEventListener('start', markCameraMoved);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.maxPolarAngle = Math.PI * 0.495;   // never below the floor
@@ -133,6 +146,18 @@ function resize() {
   renderer.domElement.style.height = '100%';
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  // Publish the header height so the sticky tab row sits exactly below it,
+  // even if the title wraps on a narrow panel.
+  const hdr = document.querySelector('#panel header');
+  if (hdr) document.documentElement.style.setProperty('--header-h', hdr.offsetHeight + 'px');
+
+  // Re-fit ONLY when the camera is still on the default framing. Calling
+  // setView() unconditionally here made the view jump: choosing an object
+  // rewrites the inspector, that changes the panel size, the ResizeObserver
+  // fires, and the camera snapped back to the default pose — the "unselect
+  // makes the viewport offset itself" bug. A user who has moved the camera
+  // keeps their view; only the projection is updated.
+  if (S.scene && !S.drag && homeView && !S.userMovedCamera) setView(S.viewKind || 'iso');
 }
 
 // If the GPU context is lost (driver reset, too many contexts) show a clear
@@ -146,6 +171,33 @@ function bindContextLoss() {
   });
 }
 
+// Labels are three.js sprites, so they shrink as the camera pulls back and
+// become unreadable at exactly the zoom where the whole room matters. Rescale
+// every frame so a label keeps a constant size on screen, and hide it when the
+// node is too small to matter.
+const LABEL_PX = 30;          // on-screen height of a label at reference size
+const LABEL_REF = 0.20;       // `size` of the anchor label = the reference
+function updateLabelScale() {
+  const h = renderer.domElement.clientHeight || 1;
+  for (const g of [anchorGroup, tagGroup, roomGroup]) {
+    if (!g) continue;
+    for (const node of g.children) {
+      for (const c of node.children) {
+        if (!c.isSprite || !c.userData.labelSize) continue;
+        const dist = camera.position.distanceTo(c.getWorldPosition(_labelTmp));
+        // World units covered by one screen pixel at this depth.
+        const worldPerPx = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * dist / h;
+        // `size` scales the label, so ruler numbers stay smaller than anchors.
+        const weight = (c.userData.labelSize || LABEL_REF) / LABEL_REF;
+        const target = LABEL_PX * weight * worldPerPx;
+        c.scale.set(target * (c.userData.aspect || 1), target, 1);
+        c.visible = dist < 26;                        // drop the far ones
+      }
+    }
+  }
+}
+const _labelTmp = new THREE.Vector3();
+
 function animate() {
   requestAnimationFrame(animate);
   frameDt = clock.getDelta();
@@ -156,7 +208,9 @@ function animate() {
   controls.update();
   applyZoom();
   animatePulses();
+  animateSelRig();
   updateFog();
+  updateLabelScale();
   renderer.render(scene3, camera);
 }
 
@@ -195,6 +249,7 @@ function normalizeWheel(ev) {
 
 function onWheel(ev) {
   ev.preventDefault();
+  markCameraMoved();
   zoomAccum += normalizeWheel(ev);
   // remember what is under the cursor so zooming in feels anchored
   const gp = groundPoint(ev);
@@ -291,6 +346,7 @@ function bindKeyboard() {
 function applyKeyboardMove() {
   const dt = Math.min(frameDt, 0.1);
   if (!heldKeys.size) return;
+  markCameraMoved();
 
   let fwdAmt = 0, rightAmt = 0, upAmt = 0;
   if (heldKeys.has('w') || heldKeys.has('arrowup')) fwdAmt += 1;
@@ -358,14 +414,16 @@ function buildRoom() {
   roomGroup.add(floor);
 
   // 1 m grid, aligned with the world origin (0,0) so it doubles as a ruler
-  const grid = new THREE.GridHelper(Math.max(W, D) * 1.2, Math.round(Math.max(W, D) * 1.2),
-                                    0x33406b, 0x222b45);
+  // Grid colours come from the palette; the fixed blues did not follow the
+  // theme and read as a stray element on the paper background.
+  const grid = new THREE.GridHelper(Math.max(W, D) * 1.4, Math.round(Math.max(W, D) * 1.4),
+                                    COL.gridMajor, COL.grid);
   grid.position.set(W / 2, 0.005, D / 2);
   roomGroup.add(grid);
 
   // ---- coordinate system: X axis (red), Y axis (green), origin marker ----
   const axes = new THREE.Group();
-  const axisLen = Math.max(W, D) * 0.35 + 0.6;
+  const axisLen = 0.45;        // a corner marker, not a line across the room
 
   const mkAxis = (from, to, color) => {
     const geo = new THREE.BufferGeometry().setFromPoints([from, to]);
@@ -379,7 +437,7 @@ function buildRoom() {
 
   // arrow heads
   const head = (dir, color) => {
-    const cone = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.18, 12),
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.11, 12),
                                 new THREE.MeshBasicMaterial({ color }));
     cone.position.copy(dir.clone().multiplyScalar(axisLen));
     cone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
@@ -390,24 +448,28 @@ function buildRoom() {
   axes.add(head(Y, COL.axisY));
 
   // origin dot
-  const origin = new THREE.Mesh(new THREE.SphereGeometry(0.055, 14, 12),
-                                new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  const origin = new THREE.Mesh(new THREE.SphereGeometry(0.04, 14, 12),
+                                new THREE.MeshBasicMaterial({ color: COL.originText }));
   origin.position.set(0, 0.02, 0);
   origin.userData.pick = 'axis';
   axes.add(origin);
 
-  axes.add(label('X →', new THREE.Vector3(axisLen * 0.72, 0.14, 0.16), COL.axisX, 0.13));
-  axes.add(label('Y →', new THREE.Vector3(0.16, 0.14, axisLen * 0.72), COL.axisY, 0.13));
-  axes.add(label('0,0', new THREE.Vector3(-0.02, 0.10, -0.22), COL.originText, 0.12));
+  axes.add(label('X →', new THREE.Vector3(axisLen * 1.35, 0.10, 0.10), COL.axisX, 0.11));
+  axes.add(label('Y →', new THREE.Vector3(0.10, 0.10, axisLen * 1.35), COL.axisY, 0.11));
+  axes.add(label('0,0', new THREE.Vector3(-0.14, 0.10, -0.34), COL.originText, 0.10));
   roomGroup.add(axes);
 
   // ---- rulers along two edges -------------------------------------------
-  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(W, 0, 0), 'x'));
-  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, 0, D), 'y'));
+  const centre = new THREE.Vector3(W / 2, 0, D / 2);
+  // Numbers read along their own axis, so the Z rulers get rotated text.
+  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(W, 0, 0), centre, 0));
+  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, 0, D), centre, -Math.PI / 2));
+  roomGroup.add(makeRuler(new THREE.Vector3(0, 0.02, D), new THREE.Vector3(W, 0, D), centre, 0));
+  roomGroup.add(makeRuler(new THREE.Vector3(W, 0.02, 0), new THREE.Vector3(W, 0, D), centre, -Math.PI / 2));
 
   // ---- walls (translucent so the room stays readable from any angle) -----
   const wallMat = new THREE.MeshStandardMaterial({
-    color: 0x38507f, transparent: true, opacity: 0.16,
+    color: COL.wallGlass, transparent: true, opacity: 0.15,
     side: THREE.DoubleSide, roughness: 1.0 });
   const mk = (w, h, d, x, y, z) => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), wallMat);
@@ -421,14 +483,15 @@ function buildRoom() {
   mk(0.06, H, D, W, H / 2, D / 2);          // x = W
 
   // dimension labels (the rulers already carry per-metre numbers)
-  label(`width ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -0.62), COL.dimText);
-  label(`depth ${D.toFixed(2)} m`, new THREE.Vector3(-0.62, 0.12, D / 2), COL.dimText);
+  // Outside the footprint, clear of the rulers' own numbers.
+  label(`width ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -1.05), COL.rulerText, 0.145, true);
+  label(`depth ${D.toFixed(2)} m`, new THREE.Vector3(-1.05, 0.12, D / 2), COL.rulerText, 0.145, true);
 
   controls.target.set(W / 2, 0.8, D / 2);
   updateHud();
 }
 
-function label(text, pos, color = 0xffffff, size = 0.16) {
+function label(text, pos, color = 0xffffff, size = 0.16, plate = false) {
   const canvas = document.createElement('canvas');
   const spr = new THREE.Sprite(new THREE.SpriteMaterial({
     transparent: true, depthTest: false }));
@@ -448,24 +511,41 @@ function label(text, pos, color = 0xffffff, size = 0.16) {
     const font = 'bold 40px "JetBrains Mono", ui-monospace, monospace';
     g.font = font;
     const lines = String(t).split('\n');
-    const w = Math.ceil(Math.max(...lines.map((l) => g.measureText(l).width))) + 24;
+    const pad = plate ? 20 : 12;
+    const w = Math.ceil(Math.max(...lines.map((l) => g.measureText(l).width))) + pad * 2;
     const lh = 48;
-    const h = lh * lines.length;
+    const h = lh * lines.length + (plate ? 14 : 0);
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
     g.clearRect(0, 0, w, h);
     g.font = font;
     g.textBaseline = 'middle';
+    // A plate behind the glyphs: the labels sit over a grid, a floor and walls,
+    // and an outlined hairline was still hard to read at sprite scale. A solid
+    // chip is also what the rest of this interface uses for a label.
+    if (plate) {
+      const bg = `#${(COL.plateBg ?? 0x111114).toString(16).padStart(6, '0')}`;
+      const br = `#${(COL.plateLine ?? 0x2a2a30).toString(16).padStart(6, '0')}`;
+      g.fillStyle = bg;
+      g.fillRect(0, 0, w, h);
+      g.strokeStyle = br;
+      g.lineWidth = 3;
+      g.strokeRect(1.5, 1.5, w - 3, h - 3);
+      g.fillStyle = br;
+      g.fillRect(0, 0, 5, h);                 // accent edge, like the panel rows
+      g.fillStyle = bg;
+    }
     // Outline in the background colour first: the labels sit over a grid, a
     // floor plane and walls, and a hairline glyph on a same-tone surface was
     // unreadable — worst on the paper-white theme.
-    g.lineWidth = 7;
+    g.lineWidth = 9;
     g.lineJoin = 'round';
     g.strokeStyle = `#${(COL.labelOutline ?? 0x000000).toString(16).padStart(6, '0')}`;
     g.fillStyle = `#${spr.userData.labelColor.toString(16).padStart(6, '0')}`;
     lines.forEach((l, i) => {
-      g.strokeText(l, 12, lh * i + lh / 2);
-      g.fillText(l, 12, lh * i + lh / 2);
+      const ty = (plate ? 7 : 0) + lh * i + lh / 2;
+      if (!plate) g.strokeText(l, pad, ty);   // plate already separates the text
+      g.fillText(l, pad, ty);
     });
 
     if (!spr.material.map) {
@@ -475,10 +555,107 @@ function label(text, pos, color = 0xffffff, size = 0.16) {
       spr.material.map.needsUpdate = true;
     }
     const s = spr.userData.labelSize;
+    spr.userData.aspect = (w / 64 * s) / (h / 64 * s);   // w/h, for uniform rescale
     spr.scale.set(w / 64 * s, h / 64 * s, 1);
   };
   spr.userData.setText(text);
   return spr;
+}
+
+/* --------------------------------------------------------- selection rig ---
+   A selection marker that reads at a glance: four corner brackets orbiting the
+   object, a pulsing ring, and a ping that expands outward. Built once and
+   re-parented on each selection, so switching objects costs nothing and the
+   animation never restarts. Works for anchors, obstacles and tags alike. */
+let selRig = null;
+
+function buildSelRig() {
+  const rig = new THREE.Group();
+  rig.name = 'selRig';
+
+  // four L brackets, as one LineSegments in a unit square
+  const L = 0.30;
+  const pts = [];
+  for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+    pts.push(new THREE.Vector3(sx, 0, sz), new THREE.Vector3(sx - sx * L, 0, sz));
+    pts.push(new THREE.Vector3(sx, 0, sz), new THREE.Vector3(sx, 0, sz - sz * L));
+  }
+  const brackets = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: COL.sel, transparent: true, opacity: 0.95 }));
+  brackets.name = 'brackets';
+  rig.add(brackets);
+
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.98, 1.0, 64),
+    new THREE.MeshBasicMaterial({ color: COL.sel, transparent: true, opacity: 0.7,
+                                  side: THREE.DoubleSide, depthWrite: false }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.name = 'ring';
+  rig.add(ring);
+
+  const ping = new THREE.Mesh(
+    new THREE.RingGeometry(0.98, 1.0, 64),
+    new THREE.MeshBasicMaterial({ color: COL.sel, transparent: true, opacity: 0.0,
+                                  side: THREE.DoubleSide, depthWrite: false }));
+  ping.rotation.x = -Math.PI / 2;
+  ping.name = 'ping';
+  rig.add(ping);
+
+  return rig;
+}
+
+// Attach the rig to whatever is selected, sized to the object.
+function updateSelRig() {
+  const sel = S.selected;
+  if (!selRig) selRig = buildSelRig();
+  if (!sel) { selRig.visible = false; return; }
+
+  let parent = null, radius = 0.5, y = 0;
+  if (sel.type === 'anchor') {
+    parent = anchorObjs[sel.id];
+    radius = 0.55;
+  } else if (sel.type === 'obstacle') {
+    parent = obstacleObjs[sel.id];
+    const o = S.scene.obstacles.find((x) => x.id === sel.id);
+    radius = o ? Math.max(o.sx, o.sy) * 0.78 : 0.5;
+    y = o ? o.sz / 2 : 0;
+  } else if (sel.type === 'tag') {
+    parent = tagMeshes[sel.id];
+    radius = 0.42;
+  }
+
+  if (!parent) { selRig.visible = false; return; }
+  if (selRig.parent !== parent) parent.add(selRig);
+  selRig.visible = true;
+  selRig.scale.set(radius, radius, radius);
+  selRig.position.set(0, y, 0);
+  selRig.traverse((c) => { if (c.material && c.material.color) c.material.color.setHex(COL.sel); });
+}
+
+// Called every frame: spin the brackets, pulse the ring, expand the ping.
+let selT = 0;
+function animateSelRig() {
+  if (!selRig || !selRig.visible) return;
+  selT += frameDt;
+  const b = selRig.getObjectByName('brackets');
+  const ring = selRig.getObjectByName('ring');
+  const ping = selRig.getObjectByName('ping');
+  if (b) {
+    b.rotation.y = selT * 0.7;                       // slow orbit
+    b.material.opacity = 0.75 + 0.25 * Math.sin(selT * 3.1);
+  }
+  if (ring) {
+    const k = 1 + 0.05 * Math.sin(selT * 2.6);
+    ring.scale.set(k, k, 1);
+    ring.material.opacity = 0.55 + 0.35 * Math.sin(selT * 2.6);
+  }
+  if (ping) {
+    const t = (selT % 1.6) / 1.6;                    // 0..1, repeating
+    const k = 1 + t * 0.55;
+    ping.scale.set(k, k, 1);
+    ping.material.opacity = 0.45 * (1 - t) * (1 - t);
+  }
 }
 
 /* ------------------------------------------------------------- rulers */
@@ -486,11 +663,57 @@ function label(text, pos, color = 0xffffff, size = 0.16) {
 // A measuring ruler along one room edge: a baseline with 0.5 m ticks and a
 // numeric label every metre, so distances in the 3D view can be read off
 // directly instead of guessed.
-function makeRuler(from, to) {
+// `outward` is the room centre; the tick side is chosen to point AWAY from it.
+// The old fixed normal put the X ruler's numbers inside the room (the Y one
+// happened to land outside), so half the scale sat over the floor it measures.
+
+/* A text label painted flat on the floor. Unlike the billboard sprites (which
+   always face the camera and are rescaled per frame), this is a real plane in
+   the scene: it lies in the XZ plane, keeps a fixed world size, and therefore
+   reads as part of the floor rather than as an overlay. */
+function floorLabel(text, pos, color, size = 0.17, rotY = 0) {
+  const canvas = document.createElement('canvas');
+  const g = canvas.getContext('2d');
+  const font = 'bold 40px "JetBrains Mono", ui-monospace, monospace';
+  g.font = font;
+  const pad = 10;
+  const w = Math.ceil(g.measureText(String(text)).width) + pad * 2;
+  const h = 48;
+  canvas.width = w; canvas.height = h;
+  const g2 = canvas.getContext('2d');
+  g2.font = font;
+  g2.textBaseline = 'middle';
+  g2.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
+  g2.fillText(String(text), pad, h / 2);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry((w / 64) * size, (h / 64) * size),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false,
+                                  side: THREE.DoubleSide }));
+  mesh.rotation.x = -Math.PI / 2;      // lie flat, face up
+  mesh.rotation.z = rotY;
+  mesh.position.copy(pos);
+  mesh.userData.pick = 'label';
+  return mesh;
+}
+
+function makeRuler(from, to, outward, rotY = 0) {
   const g = new THREE.Group();
   const len = from.distanceTo(to);
   const dir = new THREE.Vector3().subVectors(to, from).normalize();
-  const side = new THREE.Vector3(-dir.z, 0, dir.x);      // outward on the floor
+  const side = new THREE.Vector3(-dir.z, 0, dir.x);
+  if (outward) {
+    const mid = from.clone().addScaledVector(dir, len / 2);
+    const toCentre = outward.clone().sub(mid);
+    if (side.dot(toCentre) > 0) side.negate();           // face away from the room
+  }
+  // Lift the whole ruler clear of the floor edge. Sitting exactly on the edge,
+  // the near side's numbers visually crossed the floor they measure.
+  const OFFSET = 0.30;
+  from = from.clone().addScaledVector(side, OFFSET);
+  to = to.clone().addScaledVector(side, OFFSET);
 
   g.add(new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([from, to]),
@@ -504,15 +727,16 @@ function makeRuler(from, to) {
     const t = i / 2;                                      // metres
     const p = from.clone().addScaledVector(dir, t);
     const major = Math.abs(t - Math.round(t)) < 1e-6;     // whole metre
-    const h = major ? 0.17 : 0.09;
+    const h = major ? 0.22 : 0.11;
     const a = p.clone().addScaledVector(side, 0.02);
     const b = p.clone().addScaledVector(side, h);
     g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]),
                          major ? majorMat : tickMat));
     if (major && i > 0) {
-      const lp = p.clone().addScaledVector(side, h + 0.12);
-      lp.y = 0.10;
-      g.add(label(`${t} m`, lp, COL.rulerText, 0.105));
+      // Slightly further out than the tick so the number never sits on the line.
+      const lp = p.clone().addScaledVector(side, h + 0.16);
+      lp.y = 0.012;                      // just above the floor, no z-fighting
+      g.add(floorLabel(`${t} m`, lp, COL.rulerText, 0.19, rotY));
     }
   }
   return g;
@@ -530,51 +754,49 @@ function buildAnchors() {
     g.userData.pick = 'anchor';
     g.userData.id = a.id;
 
-    // mast
-    const mast = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.035, 0.05, a.z, 12),
-      new THREE.MeshStandardMaterial({ color: online ? COL.anchor : COL.anchorOff,
-                                       metalness: 0.5, roughness: 0.35 }));
-    mast.position.y = a.z / 2;
-    mast.castShadow = true;
-    mast.userData.pick = 'anchor';
-    mast.userData.id = a.id;
-    g.add(mast);
+    // The group is already translated to y = a.z, so every child is positioned
+    // RELATIVE to that. Adding a.z again here put the whole marker at twice the
+    // anchor height — the post, plate and label floated above the room and the
+    // label sat off-screen at y = 5.1 m in a 2.7 m room.
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: online ? COL.anchor : COL.anchorOff,
+      metalness: 0.35, roughness: 0.5,
+    });
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.11, a.z, 0.11), bodyMat);
+    post.position.y = -a.z / 2;              // spans -a.z .. 0, i.e. floor to head
+    post.castShadow = true;
+    post.userData.pick = 'anchor';
+    post.userData.id = a.id;
+    g.add(post);
 
-    // head
-    const head = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(0.14, 1),
-      new THREE.MeshStandardMaterial({ color: online ? COL.anchor : COL.anchorOff,
-                                       emissive: online ? 0x1f6f4f : 0x000000,
-                                       emissiveIntensity: 1.1, metalness: 0.3 }));
-    head.position.y = a.z;
-    head.castShadow = true;
-    head.userData.pick = 'anchor';
-    head.userData.id = a.id;
-    g.add(head);
+    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.06, 0.34), bodyMat);
+    plate.position.y = 0;                    // at the anchor's own height
+    plate.rotation.y = Math.PI / 4;
+    plate.castShadow = true;
+    plate.userData.pick = 'anchor';
+    plate.userData.id = a.id;
+    g.add(plate);
 
-    // halo when selected
-    if (S.selected && S.selected.type === 'anchor' && S.selected.id === a.id) {
-      const halo = new THREE.Mesh(
-        new THREE.TorusGeometry(0.26, 0.018, 8, 32),
-        new THREE.MeshBasicMaterial({ color: COL.sel }));
-      halo.rotation.x = Math.PI / 2;
-      halo.position.y = a.z;
-      g.add(halo);
-    }
+    // A short fin on top so the plate reads as a direction, not a floating tile.
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.22, 0.05), bodyMat);
+    fin.position.y = 0.14;
+    fin.userData.pick = 'anchor';
+    fin.userData.id = a.id;
+    g.add(fin);
 
     g.add(anchorLabel(a, live));
     anchorObjs[a.id] = g;
     anchorGroup.add(g);
   }
+  updateSelRig();          // the groups were rebuilt; re-attach the marker
 }
 
 // Anchor label: name on the first line, live values underneath
 // (position always, plus the current range/RSSI when the device reports them).
 function anchorLabel(a, live) {
   const online = live ? live.online : false;
-  const spr = label(anchorLabelText(a, live), new THREE.Vector3(0, a.z + 0.42, 0),
-                    online ? 0x9ff5cf : 0x93a4c8, 0.125);
+  const spr = label(anchorLabelText(a, live), new THREE.Vector3(0, 0.55, 0),
+                    online ? COL.labelOn : COL.labelOff, 0.20, true);
   spr.userData.anchorId = a.id;
   return spr;
 }
@@ -616,7 +838,7 @@ function updateAnchorLabels() {
       if (l && t.ranges && t.ranges[a.id] !== undefined) { rng = t.ranges[a.id]; break; }
     }
 
-    spr.userData.setText(anchorLabelText(a, live), online ? 0x9ff5cf : 0x93a4c8);
+    spr.userData.setText(anchorLabelText(a, live), online ? COL.labelOn : COL.labelOff);
   }
 }
 
@@ -726,8 +948,8 @@ function buildObstacles() {
     obstacleObjs[ob.id] = g;
     obstacleGroup.add(g);
   }
+  updateSelRig();          // groups rebuilt
 }
-
 /* ==========================================================================
    Pulse rings: one thin ring per node that expands and fades, like a sonar
    ping. Cheap by design — a handful of meshes share two geometries, nothing is
@@ -815,14 +1037,27 @@ function buildTags() {
     let mesh = tagMeshes[t.id];
     if (!mesh) {
       mesh = new THREE.Group();
+      // An octagonal puck rather than a sphere: same flat language as the
+      // anchor plate, and it still reads as a distinct shape from the anchors.
       const body = new THREE.Mesh(
-        new THREE.SphereGeometry(0.11, 20, 16),
-        new THREE.MeshStandardMaterial({ color: COL.tag, emissive: 0x8a6a10,
+        new THREE.CylinderGeometry(0.135, 0.135, 0.07, 8),
+        new THREE.MeshStandardMaterial({ color: COL.tag, emissive: COL.tagBody,
                                          emissiveIntensity: 0.9, roughness: 0.35 }));
       body.castShadow = true;
       body.userData.pick = 'tag';
       body.userData.id = t.id;
       mesh.add(body);
+
+      // crosshair bars on top, so the tag is identifiable from above
+      const barMat = new THREE.MeshBasicMaterial({ color: COL.tag });
+      for (const rot of [0, Math.PI / 2]) {
+        const bar = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.012, 0.022), barMat);
+        bar.position.y = 0.035;
+        bar.rotation.y = rot;
+        bar.userData.pick = 'tag';
+        bar.userData.id = t.id;
+        mesh.add(bar);
+      }
       // uncertainty ring, scaled from the EKF sigma
       const ring = new THREE.Mesh(
         new THREE.RingGeometry(0.9, 0.93, 64),
@@ -831,7 +1066,7 @@ function buildTags() {
       ring.rotation.x = -Math.PI / 2;
       ring.name = 'sigma';
       mesh.add(ring);
-      mesh.add(label(t.id, new THREE.Vector3(0, 0.34, 0), 0xffe6a8, 0.13));
+      mesh.add(label(t.id, new THREE.Vector3(0, 0.46, 0), COL.labelTag, 0.19, true));
       tagGroup.add(mesh);
       tagMeshes[t.id] = mesh;
     }
@@ -859,8 +1094,8 @@ function buildTags() {
     if (!seen.has(id)) tagMeshes[id].visible = false;
 
   buildTrail();
+  updateSelRig();          // meshes rebuilt
 }
-
 // The trail is updated IN PLACE: rebuilding the Line objects every poll
 // (500 ms) allocated two geometries per second per tag for no reason.
 const trailLines = {};
@@ -1227,8 +1462,8 @@ function bindPointer() {
       if (gp) {
         const x = clamp(gp.x, 0, S.scene.room.width);
         const y = clamp(gp.z, 0, S.scene.room.depth);
-        if (S.mode === 'addAnchor') addAnchor(x, y);
-        else addObstacle(x, y);
+        if (S.mode === 'addAnchor') { addAnchor(x, y); Audio2.place(); }
+        else { addObstacle(x, y); Audio2.place(); }
       }
       downAt = null;
       return;
@@ -1302,6 +1537,7 @@ function removeSelected() {
 
 function select(type, id) {
   S.selected = type ? { type, id } : null;
+  updateSelRig();
   // Only the anchor/obstacle groups render selection visuals, so avoid a full
   // rebuild (which would also recreate the tag meshes and the trail).
   buildAnchors();
@@ -1421,6 +1657,7 @@ function buildPalette() {
 
 /* -------------------------------------------------------------------- io */
 async function loadScene() {
+  try {
   const r = await fetch('/api/v1/scene');
   const d = await r.json();
   S.scene = d.scene;
@@ -1428,6 +1665,8 @@ async function loadScene() {
   $('nlos').checked = S.nlos;
   syncRoomInputs();
   rebuildAll();
+  Audio2.success();
+  } catch (e) { Audio2.error(); }
 }
 
 async function saveScene() {
@@ -1438,6 +1677,7 @@ async function saveScene() {
   S.dirty = false;
   toast(d.ok ? `Saved — pushed to ${d.pushed?.length || 0} device(s).` : 'Save failed.');
   setSaved();
+  if (d.ok) Audio2.success(); else Audio2.error();
 }
 
 async function poll() {
@@ -1561,46 +1801,127 @@ function toast(msg) {
 const Audio2 = (() => {
   let ctx = null;
   let enabled = true;
+  let master = null;
 
   const ensure = () => {
     if (!ctx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return null;
       ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = 0.5;
+      master.connect(ctx.destination);
     }
     if (ctx.state === 'suspended') ctx.resume();
     return ctx;
   };
 
-  // one shaped tone
-  const tone = (freq, dur, type = 'sine', gain = 0.06, slideTo = null) => {
+  // One shaped tone. `slideTo` sweeps the pitch, which is what makes a click
+  // sound like a mechanical detent rather than a beep.
+  const tone = (freq, dur, type = 'sine', gain = 0.05, slideTo = null, delay = 0) => {
     if (!enabled) return;
     const c = ensure();
     if (!c) return;
+    const t0 = c.currentTime + delay;
     const o = c.createOscillator();
     const g = c.createGain();
     o.type = type;
-    o.frequency.setValueAtTime(freq, c.currentTime);
-    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, c.currentTime + dur);
-    g.gain.setValueAtTime(0.0001, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(gain, c.currentTime + 0.012);
-    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
-    o.connect(g).connect(c.destination);
-    o.start();
-    o.stop(c.currentTime + dur + 0.02);
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.010);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(master);
+    o.start(t0);
+    o.stop(t0 + dur + 0.02);
+  };
+
+  // Short filtered noise: used for clicks and sweeps, which a plain oscillator
+  // cannot make without sounding like a tone.
+  const noise = (dur, gain = 0.05, freq = 1800, q = 1.2, delay = 0) => {
+    if (!enabled) return;
+    const c = ensure();
+    if (!c) return;
+    const n = Math.max(1, Math.floor(c.sampleRate * dur));
+    const buf = c.createBuffer(1, n, c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = c.createBufferSource();
+    src.buffer = buf;
+    const bp = c.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = freq; bp.Q.value = q;
+    const g = c.createGain();
+    g.gain.value = gain;
+    src.connect(bp).connect(g).connect(master);
+    src.start(c.currentTime + delay);
   };
 
   return {
     get enabled() { return enabled; },
     set enabled(v) { enabled = v; if (v) ensure(); },
-    online()  { tone(660, 0.10, 'triangle', 0.05); setTimeout(() => tone(990, 0.12, 'triangle', 0.04), 90); },
+    get volume() { return master ? master.gain.value * 2 : 0.5; },
+    set volume(v) { if (master) master.gain.value = Math.max(0, Math.min(v, 1)) * 2; },
+
+    /* --- interaction cues ------------------------------------------------ */
+    hover()   { tone(1560, 0.030, 'sine', 0.012); },                      // tick under the cursor
+    click()   { noise(0.035, 0.05, 2400, 0.9);
+                tone(880, 0.045, 'square', 0.022, 620); },                // mechanical press
+    toggleOn(){ tone(520, 0.05, 'triangle', 0.03, 880); },
+    toggleOff(){ tone(880, 0.05, 'triangle', 0.03, 520); },
+    tab()     { noise(0.05, 0.035, 1400, 1.1);
+                tone(300, 0.07, 'sine', 0.022, 480); },                   // panel slide
+    error()   { tone(180, 0.30, 'sawtooth', 0.045, 110); },
+    success() { tone(660, 0.09, 'sine', 0.035);
+                tone(990, 0.16, 'sine', 0.030, null, 0.08); },
+
+    /* --- system cues ----------------------------------------------------- */
+    online()  { tone(660, 0.10, 'triangle', 0.05);
+                tone(990, 0.12, 'triangle', 0.04, null, 0.09); },
     offline() { tone(220, 0.22, 'sawtooth', 0.035, 140); },
-    update()  { tone(440, 0.09, 'square', 0.035); setTimeout(() => tone(880, 0.14, 'square', 0.03), 100); },
+    update()  { tone(440, 0.09, 'square', 0.035);
+                tone(880, 0.14, 'square', 0.03, null, 0.10); },
     nlos()    { tone(300, 0.18, 'sine', 0.03, 200); },
-    boot()    { tone(523, 0.10, 'sine', 0.04); setTimeout(() => tone(784, 0.14, 'sine', 0.035), 110);
-                setTimeout(() => tone(1046, 0.20, 'sine', 0.03), 230); },
+    place()   { noise(0.05, 0.045, 900, 0.8);
+                tone(420, 0.10, 'triangle', 0.03, 700); },                // object dropped
+    remove()  { noise(0.06, 0.05, 700, 0.8);
+                tone(520, 0.12, 'sawtooth', 0.03, 180); },
+    boot()    { tone(523, 0.10, 'sine', 0.04);
+                tone(784, 0.14, 'sine', 0.035, null, 0.11);
+                tone(1046, 0.20, 'sine', 0.03, null, 0.23); },
   };
 })();
+
+/* Wire a sound to every control automatically, so a new button cannot be
+   added without feedback. Delegated at the document level: the panel rebuilds
+   its rows on every poll, and per-element listeners would be lost. */
+function bindSound() {
+  let lastHover = 0;
+  document.addEventListener('pointerover', (e) => {
+    const el = e.target.closest('button, .pal, .dev, .ep, input, select');
+    if (!el) return;
+    const now = performance.now();
+    if (now - lastHover < 70) return;      // do not machine-gun on fast sweeps
+    lastHover = now;
+    if (el.matches('input[type=checkbox], input[type=range], select')) Audio2.hover();
+    else if (el.tagName === 'BUTTON' || el.classList.contains('pal')) Audio2.hover();
+  }, { passive: true });
+
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn || btn.disabled) return;
+    // These own their cue; playing one here as well would double it.
+    if (btn.id === 'sound-toggle') return;
+    if (btn.id === 'save' || btn.id === 'reload') { Audio2.click(); return; }
+    if (btn.dataset.tab) { Audio2.tab(); return; }
+    if (btn.classList.contains('pal')) { Audio2.click(); return; }
+    if (btn.classList.contains('danger') || btn.id === 'i-del' || btn.id === 'o-del') { Audio2.remove(); return; }
+    if (btn.classList.contains('on')) { Audio2.toggleOff(); return; }
+    if (btn.id === 'render-toggle' || btn.id === 'view-iso' || btn.id === 'view-top') {
+      Audio2.toggleOn(); return;
+    }
+    Audio2.click();
+  }, true);
+}
 
 /* ==========================================================================
    Tabs
@@ -1966,6 +2287,7 @@ function applyIntro() {
 }
 
 function initUi() {
+  bindSound();          // every control gets a cue, present and future
   // tabs
   document.querySelectorAll('#tabs button').forEach((b) => {
     b.onclick = () => setTab(b.dataset.tab);
@@ -1999,14 +2321,19 @@ function initUi() {
     $('sound-toggle').classList.toggle('on', !Audio2.enabled);
     if (Audio2.enabled) Audio2.online();
   };
-  $('theme-toggle').onclick = () =>
+  $('theme-toggle').onclick = () => {
+    Audio2.toggleOn();
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+  };
   $('ota-push-all').onclick = () => pushOta('all');
   $('scr-apply').onclick = applyScreenPolicy;
 
   addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {
-      if (document.activeElement.tagName !== 'INPUT') { removeSelected(); e.preventDefault(); }
+      if (document.activeElement.tagName !== 'INPUT') {
+        if (S.selected) Audio2.remove();          // keyboard path has no click event
+        removeSelected(); e.preventDefault();
+      }
     }
     if (e.key === 'Escape') select(null, null);
     if (document.activeElement.tagName === 'INPUT') return;
@@ -2021,18 +2348,33 @@ function initUi() {
 }
 
 function setView(kind) {
-  const { width: W, depth: D } = S.scene.room;
+  const { width: W, depth: D, height: H } = S.scene.room;
+  // Frame the room by its bounding sphere, not by a fixed multiple of its
+  // size. A fixed factor zoomed far too close in a long narrow room, so part
+  // of the floor fell outside the viewport. This keeps the whole room visible
+  // at any aspect ratio.
+  const fit = (dir, pad = 1.28) => {
+    const radius = Math.hypot(W, D, H) / 2;
+    const vFov = THREE.MathUtils.degToRad(camera.fov);
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+    const dist = radius / Math.sin(Math.min(vFov, hFov) / 2) * pad;
+    const center = new THREE.Vector3(W / 2, H / 2, D / 2);
+    camera.position.copy(center).addScaledVector(dir.clone().normalize(), dist);
+    controls.target.copy(kind === 'top' ? new THREE.Vector3(W / 2, 0, D / 2) : center);
+  };
+
   if (kind === 'top') {
-    camera.position.set(W / 2, Math.max(W, D) * 1.25, D / 2 + 0.01);
-    controls.target.set(W / 2, 0, D / 2);
+    fit(new THREE.Vector3(0, 1, 0.0001), 1.12);
   } else {
-    camera.position.set(W * 1.25, Math.max(W, D) * 1.05, D * 1.45);
-    controls.target.set(W / 2, 0.8, D / 2);
+    fit(new THREE.Vector3(1, 0.95, 1.15), 1.28);
   }
+
   zoomAccum = 0;            // drop any pending wheel momentum
   zoomFocus = null;
   controls.update();
   rememberHome();
+  S.viewKind = kind;        // remembered so a resize can re-fit the framing
+  S.userMovedCamera = false; // an explicit view change re-arms the auto-fit
   // The view buttons are a radio group, so the current mode has to be visible.
   $('view-iso').classList.toggle('on', kind !== 'top');
   $('view-top').classList.toggle('on', kind === 'top');
@@ -2049,6 +2391,11 @@ function rememberHome() {
   };
 }
 
+// Set as soon as the user orbits, pans, zooms or flies the camera. resize()
+// uses it to decide whether the framing may still be recomputed: once the user
+// has taken control, a panel resize must not snap the view back.
+function markCameraMoved() { S.userMovedCamera = true; }
+
 function resetView() {
   if (!homeView) { setView('iso'); return; }
   camera.position.copy(homeView.pos);
@@ -2061,6 +2408,7 @@ function resetView() {
 
 // One controlled notch, reusing the smooth wheel path.
 function zoomBy(notches) {
+  markCameraMoved();
   zoomAccum += notches * ZOOM_UNIT;
 }
 
