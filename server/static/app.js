@@ -29,7 +29,7 @@ const $ = (id) => document.getElementById(id);
 const COL_DARK = {
   room: 0x1a1a1f, wall: 0x24242b, grid: 0x2a2a31, anchor: 0x34d399, anchorOff: 0x55555c,
   tag: 0xffb020, los: 0x34d399, nlos: 0xe8243b, obstacle: 0x3a3a44,
-  sel: 0xe01f34, ghost: 0x8e8e92,
+  sel: 0xffffff, ghost: 0x8e8e92,   // white reads best on the dark scene
   ruler: 0xffffff, rulerMajor: 0xffffff, rulerText: 0xffffff,
   dimText: 0xa8b8dc, originText: 0xd8e0ff,
   axisX: 0xff6b6b, axisY: 0x6bff9c, axisZ: 0x6bb5ff,
@@ -38,10 +38,12 @@ const COL_DARK = {
   plateBg: 0x111114, plateLine: 0x3a3a44,
   gridMajor: 0x2e2e38, wallGlass: 0x3a3a46,
   anchorBody: 0x1c3b30, anchorBodyOff: 0x24242b, tagBody: 0x4a3208,
+  obstacleEdge: 0x6e6e7a, obstacleSel: 0x3a2030,
+  handleCorner: 0x9aa6bd, handleTop: 0x8fd8b4,
 };
 const COL_LIGHT = {
-  room: 0xdedbd5, wall: 0xcfccc5, grid: 0xc9c6c0, anchor: 0x0f8a5f, anchorOff: 0x9a9aa4,
-  tag: 0xd97706, los: 0x0f8a5f, nlos: 0xe8243b, obstacle: 0xc9c6c0,
+  room: 0xdedbd5, wall: 0xd6d3cc, grid: 0xd2cfc8, anchor: 0x2f9e77, anchorOff: 0xc4c1ba,
+  tag: 0xc2761a, los: 0x2f9e77, nlos: 0xd12a3d, obstacle: 0xd2cfc8,
   sel: 0xe01f34, ghost: 0x5c5c66,
   // Darker than the paper background: the old pale blues were unreadable here.
   ruler: 0xe01f34, rulerMajor: 0xc4162a, rulerText: 0xe01f34,
@@ -52,19 +54,33 @@ const COL_LIGHT = {
   // enough to hold against #eceae6 while still reading as "online".
   labelOn: 0x0a5c3f, labelOff: 0x4a4a55, labelTag: 0x7a4a00,
   plateBg: 0xf6f5f2, plateLine: 0xc9c6c0,
-  gridMajor: 0xb8b4ac, wallGlass: 0xa9a49b,
-  anchorBody: 0xcfccc5, anchorBodyOff: 0xc9c6c0, tagBody: 0xf0d9a8,
+  gridMajor: 0xc4c0b8, wallGlass: 0xd9d4cb,
+  anchorBody: 0xdad7d0, anchorBodyOff: 0xd4d1ca, tagBody: 0xf0d9a8,
+  obstacleEdge: 0x9c9a94, obstacleSel: 0xe8c9cd,
+  handleCorner: 0x6b7a94, handleTop: 0x2f8f68,
 };
 const COL = { ...COL_DARK };
 
 function setPalette(theme) {
   Object.assign(COL, theme === 'light' ? COL_LIGHT : COL_DARK);
+  // Relight for the theme. A single directional light leaves the far side of a
+  // post almost black (measured #7a7a7c against a 233 background), which is
+  // what made the light theme look heavy. The paper theme gets a strong fill
+  // and a weaker key so shading stays soft; the dark theme keeps its contrast.
+  if (hemiLight && keyLight) {
+    const light = theme === 'light';
+    hemiLight.intensity = light ? 2.1 : 0.85;
+    hemiLight.color.setHex(light ? 0xffffff : 0xdfe8ff);
+    hemiLight.groundColor.setHex(light ? 0xe8e5df : 0x1a2033);
+    keyLight.intensity = light ? 0.85 : 1.5;
+  }
 }
 
 /* ------------------------------------------------------------------ three */
 let renderer, scene3, camera, controls, raycaster;
 let roomGroup, anchorGroup, obstacleGroup, tagGroup, linkGroup, trailGroup;
 let keyLight = null;
+let hemiLight = null;
 let pickables = [];
 const tagMeshes = {};
 const anchorObjs = {};     // anchor id -> Group (moved directly while dragging)
@@ -104,7 +120,8 @@ function initThree() {
   controls.target.set(2.5, 1, 2);
 
   // lights
-  scene3.add(new THREE.HemisphereLight(0xdfe8ff, 0x1a2033, 0.85));
+  hemiLight = new THREE.HemisphereLight(0xdfe8ff, 0x1a2033, 0.85);
+  scene3.add(hemiLight);
   const key = new THREE.DirectionalLight(0xffffff, 1.5);
   key.position.set(6, 12, 7);
   key.castShadow = true;
@@ -569,6 +586,26 @@ function label(text, pos, color = 0xffffff, size = 0.16, plate = false) {
    animation never restarts. Works for anchors, obstacles and tags alike. */
 let selRig = null;
 
+// A ring drawn as dashes, as one geometry in the XZ plane. Built by hand
+// rather than with a dashed LineMaterial because that needs line distances and
+// still renders hairline-thin; these dashes keep a real thickness and read
+// clearly at any zoom.
+function dashedRingGeometry(inner, outer, dashes = 28, duty = 0.55) {
+  const pos = [];
+  for (let i = 0; i < dashes; i++) {
+    const a0 = (i / dashes) * Math.PI * 2;
+    const a1 = a0 + (Math.PI * 2 / dashes) * duty;
+    const r = [inner, outer];
+    const p = (rad, a) => [Math.cos(a) * rad, 0, Math.sin(a) * rad];
+    const v = [p(r[1], a0), p(r[0], a0), p(r[1], a1), p(r[0], a1)];
+    pos.push(...v[0], ...v[1], ...v[2], ...v[1], ...v[3], ...v[2]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
 function buildSelRig() {
   const rig = new THREE.Group();
   rig.name = 'selRig';
@@ -586,19 +623,19 @@ function buildSelRig() {
   brackets.name = 'brackets';
   rig.add(brackets);
 
+  // Dashed, and with a visible thickness: a solid hairline ring looked heavy
+  // and the dashes make the marker read as an instrument overlay.
   const ring = new THREE.Mesh(
-    new THREE.RingGeometry(0.98, 1.0, 64),
-    new THREE.MeshBasicMaterial({ color: COL.sel, transparent: true, opacity: 0.7,
+    dashedRingGeometry(0.95, 1.0, 30, 0.55),
+    new THREE.MeshBasicMaterial({ color: COL.sel, transparent: true, opacity: 0.85,
                                   side: THREE.DoubleSide, depthWrite: false }));
-  ring.rotation.x = -Math.PI / 2;
   ring.name = 'ring';
   rig.add(ring);
 
   const ping = new THREE.Mesh(
-    new THREE.RingGeometry(0.98, 1.0, 64),
+    dashedRingGeometry(0.97, 1.0, 30, 0.40),
     new THREE.MeshBasicMaterial({ color: COL.sel, transparent: true, opacity: 0.0,
                                   side: THREE.DoubleSide, depthWrite: false }));
-  ping.rotation.x = -Math.PI / 2;
   ping.name = 'ping';
   rig.add(ping);
 
@@ -647,14 +684,14 @@ function animateSelRig() {
   }
   if (ring) {
     const k = 1 + 0.05 * Math.sin(selT * 2.6);
-    ring.scale.set(k, k, 1);
-    ring.material.opacity = 0.55 + 0.35 * Math.sin(selT * 2.6);
+    ring.scale.set(k, 1, k);                         // XZ plane, so scale X and Z
+    ring.material.opacity = 0.7 + 0.3 * Math.sin(selT * 2.6);
   }
   if (ping) {
     const t = (selT % 1.6) / 1.6;                    // 0..1, repeating
     const k = 1 + t * 0.55;
-    ping.scale.set(k, k, 1);
-    ping.material.opacity = 0.45 * (1 - t) * (1 - t);
+    ping.scale.set(k, 1, k);
+    ping.material.opacity = 0.5 * (1 - t) * (1 - t);
   }
 }
 
@@ -758,9 +795,13 @@ function buildAnchors() {
     // RELATIVE to that. Adding a.z again here put the whole marker at twice the
     // anchor height — the post, plate and label floated above the room and the
     // label sat off-screen at y = 5.1 m in a 2.7 m room.
+    // No metalness: a metal surface with no environment map renders almost
+    // black, which is what made the light theme's posts look like heavy dark
+    // bars (measured luminance 98 against a 233 background). Roughness only
+    // keeps the shape readable without darkening the colour.
     const bodyMat = new THREE.MeshStandardMaterial({
       color: online ? COL.anchor : COL.anchorOff,
-      metalness: 0.35, roughness: 0.5,
+      metalness: 0.0, roughness: 0.55,
     });
     const post = new THREE.Mesh(new THREE.BoxGeometry(0.11, a.z, 0.11), bodyMat);
     post.position.y = -a.z / 2;              // spans -a.z .. 0, i.e. floor to head
@@ -861,7 +902,7 @@ function buildObstacles() {
         transparent: true,
         opacity: 0.30 + 0.45 * Math.min(ob.atten ?? 1, 1),
         roughness: 0.8,
-        emissive: sel ? 0x2b1f66 : 0x000000 }));
+        emissive: sel ? COL.obstacleSel : 0x000000 }));
     box.castShadow = true;
     box.userData.pick = 'obstacle';
     box.userData.id = ob.id;
@@ -869,7 +910,7 @@ function buildObstacles() {
 
     const edges = new THREE.LineSegments(
       new THREE.EdgesGeometry(box.geometry),
-      new THREE.LineBasicMaterial({ color: sel ? COL.sel : 0xb794f6 }));
+      new THREE.LineBasicMaterial({ color: sel ? COL.sel : COL.obstacleEdge }));
     g.add(edges);
 
     if (sel) {
@@ -925,7 +966,7 @@ function buildObstacles() {
       for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
         const h = new THREE.Mesh(
           new THREE.BoxGeometry(0.17, 0.17, 0.17),
-          new THREE.MeshBasicMaterial({ color: 0x93c5fd }));
+          new THREE.MeshBasicMaterial({ color: COL.handleCorner }));
         h.position.set(sx * (ob.sx / 2 + 0.09), 0, sz * (ob.sy / 2 + 0.09));
         h.userData.pick = 'obstacleHandle';
         h.userData.id = ob.id;
@@ -937,7 +978,7 @@ function buildObstacles() {
       // top handle: change the height (sz) only
       const top = new THREE.Mesh(
         new THREE.BoxGeometry(0.17, 0.17, 0.17),
-        new THREE.MeshBasicMaterial({ color: 0xa7f3d0 }));
+        new THREE.MeshBasicMaterial({ color: COL.handleTop }));
       top.position.set(0, ob.sz / 2 + 0.13, 0);
       top.userData.pick = 'sizeZ';
       top.userData.id = ob.id;
