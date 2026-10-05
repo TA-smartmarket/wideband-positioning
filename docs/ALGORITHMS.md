@@ -250,8 +250,9 @@ ada solusi. Kode mengembalikan titik tengah kedua anchor dengan `confidence =
 mengarang angka. Kasus inilah yang terjadi di proyek ini saat dua anchor
 saling berhadapan dan jaraknya tidak konsisten (lihat §8).
 
-Rujukan: Park 2020 membahas flip ambiguity ini secara formal untuk multilaterasi
-UWB.
+Kasus kedua kandidat sama-sama valid secara matematis ini disebut *flip
+ambiguity*; solusinya di sini memakai batas ruangan sebagai informasi
+tambahan, karena tanpa informasi tambahan memang tidak ada cara memilih.
 
 ### 5b. Kasus 3+ anchor — linearised least squares + Gauss-Newton
 
@@ -656,7 +657,6 @@ paling sering perlu disetel saat pengujian lapangan, bukan nilai absolutnya.
 
 - **Bregar 2023** — ADS-TWR, multilateration, dataset CIR → §2, §5
 - **Kramarić 2025** — DS-TWR, PDOP, anchor koplanar → §2, §8
-- **Park 2020** — flip ambiguity pada multilaterasi UWB → §5a
 - **Yao 2021** — EKF untuk UWB, distribusi noise LOS/NLOS → §6
 - **Fan 2022** — Kalman + uji Mahalanobis untuk NLOS → §6b
 - **Shalihan 2022, Angarano 2021, Yang 2024, Kram 2019** — mitigasi galat NLOS → §7
@@ -664,4 +664,4 @@ paling sering perlu disetel saat pengujian lapangan, bukan nilai absolutnya.
 - **Liu 2022** — fusi UWB+IMU (pengembangan lanjutan) → §6
 
 PDF-nya ada di `docs/papers/` (lihat `docs/papers/README.md`).
-Tabel review 13 paper: `docs/Review_Jurnal_UWB_Indoor_Positioning.docx`.
+Tabel review jurnal: `docs/Jurnal_UWB_Indoor_Positioning.docx`.

@@ -63,17 +63,29 @@ ArduinoJson) diunduh otomatis oleh PlatformIO saat build pertama.
 
 ```
 wideband-positioning/
-├── platformio.ini        # 1 env: esp32uwb (partisi huge_app)
+├── platformio.ini        # 1 env: esp32uwb (partisi min_spiffs: app0 + app1)
 ├── src/
 │   ├── main.cpp          # firmware: ranging, OLED UI, serial menu, portal AP,
 │   │                     #          REST+MQTT, terapkan config dari server
 │   ├── config.h          # model config + NVS + derivasi EUI + anchor map
 │   ├── net.h             # WiFi, HTTP client, MQTT (PubSubClient), setup portal
-│   └── solver.h          # multilaterasi 2D (dipakai tag standalone)
+│   ├── ekf.h             # Extended Kalman Filter 2D (tracking tag)
+│   ├── solver.h          # multilaterasi 2D (fix pertama / mode standalone)
+│   └── ota.h             # OTA: pull dari server + web updater (push)
 ├── lib/
 │   └── DW1000/           # library Makerfabs DW1000 (di-vendor, include guard difix)
+├── docs/
+│   ├── API.md            # kontrak API/MQTT + model payload
+│   ├── ARCHITECTURE.md   # cara kerja sistem + trade-off desain
+│   ├── ALGORITHMS.md     # penjelasan matematis tiap algoritma
+│   ├── Jurnal_UWB_Indoor_Positioning.docx   # tabel review 10 jurnal
+│   └── papers/           # PDF 10 paper rujukan + README berisi link
+├── tools/                # build_firmware.py (build + staging OTA), ota_debug.py
 └── server/
     ├── app.py            # Flask: REST + MQTT ingest + solver + web UI (1 file)
+    ├── scene.py          # geometri ruangan, penghalang, klasifikasi LOS/NLOS
+    ├── static/           # web UI 3D (Three.js di-vendor di static/vendor/)
+    ├── firmware/         # gambar OTA yang sudah di-build
     ├── requirements.txt  # flask, paho-mqtt
     ├── README.md         # panduan server (ringkas)
     └── mosquitto.test.conf
@@ -570,6 +582,14 @@ Detail matematis lengkap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 - [`docs/API.md`](docs/API.md) — kontrak API/MQTT lengkap + model payload.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — cara kerja sistem, skema
   alamat UWB, matematika solver, trade-off.
+- [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md) — penjelasan matematis tiap
+  algoritma (TWR, pre-filter, solver, EKF, NLOS, geometry check) + tabel
+  parameter yang bisa disetel.
+- [`docs/Jurnal_UWB_Indoor_Positioning.docx`](docs/Jurnal_UWB_Indoor_Positioning.docx)
+  — tabel review 10 jurnal (AUTHOR | JUDUL | TAHUN | METODE | ALGORITMA | ALAT |
+  KEKURANGAN | KELEBIHAN) + daftar pustaka APA.
+- [`docs/papers/`](docs/papers/README.md) — 10 PDF paper rujukan; README-nya
+  memuat tautan unduh tiap paper dan ringkasan relevansinya ke proyek.
 - [`server/README.md`](server/README.md) — panduan server saja.
 
 ## ⚠️ Catatan & Keterbatasan
