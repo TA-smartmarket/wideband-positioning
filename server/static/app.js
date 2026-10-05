@@ -781,6 +781,7 @@ function ensurePulses() {
 // Animate: expand + fade, looping. Runs every frame but touches only a few
 // floats per ring.
 let pulseT = 0;
+const tagFlashers = {};   // tag id -> value flasher for the coordinate readout
 function animatePulses() {
   if (!pulses.length) return;
   pulseT += frameDt;
@@ -1445,7 +1446,12 @@ async function poll() {
     S.state = await r.json();
     if (!S.drag) { buildTags(); buildLinks(); updateAnchorLabels(); ensurePulses(); }
     updateHud();
-    renderTagList();
+    // Rebuilding the list on every poll (5 Hz) would restart its entry
+    // animation constantly and thrash the DOM. Only the numbers are refreshed;
+    // the structure is rebuilt when the set of tags actually changes.
+    const ids = (S.state.tags || []).map((t) => t.id + (t.online ? '+' : '-')).join(',');
+    if (ids !== poll._tagIds) { poll._tagIds = ids; renderTagList(); }
+    else updateTagValues();
     cueTransitions();
     if (S.selected?.type === 'tag') showSelection();
     updateFog();
@@ -1456,9 +1462,10 @@ function updateHud() {
   const live = S.state.tags?.filter((t) => t.online).length || 0;
   const anc = S.state.anchors?.filter((a) => a.online).length || 0;
   const tag = S.state.tags?.[0];
-  const coord = tag && tag.online
-    ? `<span class="sep"></span><span class="mono">tag (${tag.x.toFixed(2)}, ${tag.y.toFixed(2)}) m</span>`
-    : '';
+  const coordTxt = tag && tag.online
+    ? `tag (${tag.x.toFixed(2)}, ${tag.y.toFixed(2)}) m` : null;
+  const coord = coordTxt
+    ? `<span class="sep"></span><span class="mono" data-coord>${coordTxt}</span>` : '';
   // Geometry warning: ranges that violate the triangle inequality mean at
   // least one anchor is measuring a reflection (NLOS), not the direct path.
   const geoWarn = (tag && tag.online && tag.geometry_ok === false)
@@ -1469,12 +1476,68 @@ function updateHud() {
     `<span class="sep"></span><span class="dot ${live ? 'on' : 'off'}"></span>` +
     `${live} tag${live === 1 ? '' : 's'} live` + coord + geoWarn +
     (S.state.nlos_enabled === false ? '<span class="sep"></span><span class="warn">NLOS off</span>' : '');
+
+  // Mark the coordinate when it changes: the HUD is rebuilt every poll, so a
+  // changed value needs an explicit cue or the eye cannot follow it.
+  const el = $('hud').querySelector('[data-coord]');
+  if (el && coordTxt) {
+    if (updateHud._last !== null && coordTxt !== updateHud._last) {
+      el.classList.add('flash');
+    }
+    updateHud._last = coordTxt;
+  } else if (!coordTxt) {
+    updateHud._last = null;
+  }
 }
+updateHud._last = null;
 
 function syncRoomInputs() {
   $('r-w').value = S.scene.room.width.toFixed(2);
   $('r-d').value = S.scene.room.depth.toFixed(2);
   $('r-h').value = S.scene.room.height.toFixed(2);
+}
+
+/* ------------------------------------------------------------------ motion
+   Small helpers so the animation rules stay declarative in CSS. */
+
+// Stagger children of a freshly revealed section: the eye reads the block
+// top-to-bottom instead of every row appearing on the same frame.
+function stagger(host, sel = ':scope > *') {
+  const kids = host ? [...host.querySelectorAll(sel)] : [];
+  kids.forEach((k, i) => k.style.setProperty('--i', i));
+  return kids;
+}
+
+// Refresh just the coordinate readouts of the existing rows.
+function updateTagValues() {
+  for (const t of S.state.tags || []) {
+    const f = tagFlashers[t.id];
+    if (f) f(t);
+  }
+}
+
+// Flash a value that just changed. Returns a function to feed the next value.
+function flasher(el, fmt = (v) => v) {
+  let last = null;
+  return (v) => {
+    if (!el) return;
+    const txt = fmt(v);
+    if (last !== null && txt !== last && el.textContent !== txt) {
+      el.classList.remove('flash');
+      void el.offsetWidth;              // restart the animation
+      el.classList.add('flash');
+    }
+    last = txt;
+    el.textContent = txt;
+  };
+}
+
+// Mark a button busy while it waits on the network, so a slow reply looks
+// like work in progress rather than a dead control.
+function busy(btn, on) {
+  if (!btn) return;
+  btn.classList.toggle('busy', !!on);
+  btn.setAttribute('aria-busy', on ? 'true' : 'false');
 }
 
 function setDirty() { S.dirty = true; $('save').classList.add('dirty'); }
@@ -1545,8 +1608,18 @@ const Audio2 = (() => {
 function setTab(name) {
   document.querySelectorAll('#tabs button').forEach((b) =>
     b.classList.toggle('active', b.dataset.tab === name));
-  document.querySelectorAll('#panel section[data-panel]').forEach((s) =>
-    (s.hidden = s.dataset.panel !== name));
+  document.querySelectorAll('#panel section[data-panel]').forEach((s) => {
+    const on = s.dataset.panel === name;
+    s.hidden = !on;
+    // Reveal with a staggered rise. The class is re-added each time so the
+    // animation replays on every switch rather than only the first.
+    if (on) {
+      s.classList.remove('rise');
+      void s.offsetWidth;
+      s.classList.add('rise');
+      stagger(s);
+    }
+  });
   if (name === 'devices') renderDevices();
   if (name === 'api') renderApi();
   if (name === 'setup') loadOta();
@@ -1564,10 +1637,10 @@ async function renderDevices() {
   try { ota = await (await fetch('/api/v1/ota')).json(); } catch (e) { /* offline */ }
   const keyOf = (id) => (ota.devices || []).find((d) => d.id === id) || {};
 
-  host.innerHTML = devs.map((d) => {
+  host.innerHTML = devs.map((d, i) => {
     const o = keyOf(d.id);
     const rssi = (d.rssi === null || d.rssi === undefined) ? '—' : `${d.rssi} dBm`;
-    return `<div class="dev">
+    return `<div class="dev" style="--i:${i}">
       <span class="dot ${d.online ? 'on' : 'off'}"></span>
       <div>
         <div class="name">${esc(d.id)} <span class="pill">${esc(d.role || '')}</span></div>
@@ -1748,8 +1821,8 @@ async function renderApi() {
     apiInfo = await (await fetch('/api/v1/meta')).json();
   } catch (e) { host.innerHTML = '<p class="muted">Server unreachable.</p>'; return; }
 
-  host.innerHTML = apiInfo.endpoints.map((e) => `
-    <div class="ep">
+  host.innerHTML = apiInfo.endpoints.map((e, i) => `
+    <div class="ep" style="--i:${i}">
       ${e.methods.map((m) => `<span class="m ${m}">${m}</span>`).join('')}
       <span class="p">${esc(e.path)}</span>
       ${e.doc ? `<div class="d">${esc(e.doc)}</div>` : ''}
@@ -1813,15 +1886,22 @@ function renderTagList() {
   const host = $('taglist');
   const tags = S.state.tags || [];
   if (!tags.length) { host.innerHTML = '<p class="muted">No tag reporting yet.</p>'; return; }
-  host.innerHTML = tags.map((t) => `
-    <div class="dev">
+  host.innerHTML = tags.map((t, i) => `
+    <div class="dev" style="--i:${i}">
       <span class="dot ${t.online ? 'on' : 'off'}"></span>
       <div>
         <div class="name">${esc(t.id)}</div>
-        <div class="meta mono">(${t.x.toFixed(2)}, ${t.y.toFixed(2)}) m · σ ${(t.sigma || 0).toFixed(2)}</div>
+        <div class="meta mono"><span data-coord>(${t.x.toFixed(2)}, ${t.y.toFixed(2)}) m</span> · σ ${(t.sigma || 0).toFixed(2)}</div>
         <div class="meta">${esc(t.ip || 'no ip yet')} · conf ${((t.confidence || 0) * 100).toFixed(0)}%</div>
       </div>
     </div>`).join('');
+  // Coordinates are the value that actually moves; flash them on change.
+  tags.forEach((t) => {
+    const el = host.querySelector(`.dev:nth-child(${tags.indexOf(t) + 1}) [data-coord]`);
+    const f = flasher(el, (v) => `(${v.x.toFixed(2)}, ${v.y.toFixed(2)}) m`);
+    f(t);
+    tagFlashers[t.id] = f;
+  });
 }
 
 /* ==========================================================================
@@ -1901,8 +1981,8 @@ function initUi() {
       syncRoomInputs();
     };
   });
-  $('save').onclick = saveScene;
-  $('reload').onclick = loadScene;
+  $('save').onclick = async () => { busy($('save'), true); try { await saveScene(); } finally { busy($('save'), false); } };
+  $('reload').onclick = async () => { busy($('reload'), true); try { await loadScene(); } finally { busy($('reload'), false); } };
   $('nlos').onchange = (e) => { S.nlos = e.target.checked; setDirty(); };
   $('trail').onchange = (e) => { S.showTrail = e.target.checked; buildTrail(); };
   $('spin').onchange = (e) => { S.autoSpin = e.target.checked; };
@@ -1953,6 +2033,9 @@ function setView(kind) {
   zoomFocus = null;
   controls.update();
   rememberHome();
+  // The view buttons are a radio group, so the current mode has to be visible.
+  $('view-iso').classList.toggle('on', kind !== 'top');
+  $('view-top').classList.toggle('on', kind === 'top');
 }
 
 // The default viewport, remembered so "Reset view" always returns to it

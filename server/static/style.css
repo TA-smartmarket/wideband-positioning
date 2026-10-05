@@ -72,6 +72,14 @@
 
   --pad: 14px;
   --r: 0px;                /* sharp by default; chamfer is applied per-element */
+
+  /* Motion tokens. Every transition in this file uses these, so nothing feels
+     faster or bouncier than anything else. */
+  --dur-fast: 110ms;
+  --dur:      190ms;
+  --dur-slow: 320ms;
+  --ease:     cubic-bezier(.22,.61,.36,1);
+  --ease-in:  cubic-bezier(.4,0,1,1);
 }
 
 html[data-theme="light"] {
@@ -276,12 +284,24 @@ html, body {
 }
 #viewbar button:active, button:active { transform: translate(1px, 1px); }
 
-/* Active state = accent fill. High contrast in both themes, no glow needed. */
+/* ONE active convention for every control that can be "on": accent fill.
+   Tabs and toolbar toggles used to differ (fill vs outline), which read as two
+   unrelated systems. The primary action is distinguished by shape (chamfer)
+   and letter weight instead of by colour. */
 #viewbar button.on, #tabs button.active {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-ink);
 }
+#viewbar button.on:hover, #tabs button.active:hover {
+  background: var(--accent);
+  color: var(--accent-ink);
+  filter: brightness(1.12);
+}
+
+/* Idle tabs keep a hairline so the row reads as controls even before hover. */
+#tabs button { border-bottom: 1px solid transparent; }
+#tabs button:hover { border-bottom-color: var(--line); }
 
 #palette { position: absolute; left: 12px; bottom: 14px; display: flex; gap: 6px; }
 #palette .pal { display: flex; align-items: center; gap: 8px; }
@@ -377,10 +397,24 @@ input[type=number], input[type=text], input:not([type]), select {
   letter-spacing: 0;
   text-transform: none;
 }
+input, select, textarea {
+  transition: border-color var(--dur) var(--ease),
+              background var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
+}
 input:focus, select:focus {
   outline: none; border-color: var(--accent);
   box-shadow: inset 0 0 0 1px var(--accent);
+  animation: focusIn var(--dur) var(--ease);
 }
+@keyframes focusIn { from { box-shadow: inset 0 0 0 1px transparent; }
+                     to   { box-shadow: inset 0 0 0 1px var(--accent); } }
+label { transition: color var(--dur) var(--ease); }
+label:focus-within { color: var(--accent); }
+input[type=checkbox] { transition: transform var(--dur-fast) var(--ease); }
+input[type=checkbox]:hover { transform: scale(1.15); }
+input[type=range]::-webkit-slider-thumb { transition: transform var(--dur-fast) var(--ease); }
+input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
 input[type=range] { width: 100%; accent-color: var(--accent); }
 input[type=checkbox] { accent-color: var(--accent); margin-right: 7px; }
 
@@ -503,4 +537,206 @@ footer .hint b { color: var(--ink); font-weight: 500; }
 @media (prefers-reduced-motion: reduce) {
   .boot-title::after, .dot.on, .boot-bar span { animation: none; }
   * { transition-duration: .01ms !important; }
+}
+
+/* ============================================================================
+   MOTION
+   Two kinds of animation live here, and they are labelled as such:
+
+   NECESSARY — carries information. A value that just changed flashes so the
+   eye can find it; a section reveals itself so the panel switch is legible;
+   a busy action shows a moving indicator so the interface never looks frozen.
+
+   DECORATIVE — the theme's own texture: scanlines, a boot sweep, a glitch on
+   the title, a sheen across the primary button. None of it hides state; it
+   exists to make the instrument feel like one.
+
+   Everything here is switched off under prefers-reduced-motion at the bottom.
+   ========================================================================== */
+
+/* ---------------------------------------------------------- keyframes ---- */
+@keyframes rise      { from { opacity: 0; transform: translateY(8px); }  to { opacity: 1; transform: none; } }
+@keyframes slideL    { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: none; } }
+@keyframes sheen     { from { transform: translateX(-120%); } to { transform: translateX(220%); } }
+@keyframes scanDown  { from { transform: translateY(-6%); }  to { transform: translateY(106%); } }
+@keyframes valueFlash{ 0% { background: var(--accent); color: var(--accent-ink); }
+                       100% { background: transparent; color: inherit; } }
+@keyframes barGrow   { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes flicker   { 0%,91%,100% { opacity: 1; } 92% { opacity: .3; } 93% { opacity: 1; }
+                       95% { opacity: .55; } 96% { opacity: 1; } }
+@keyframes spin      { to { transform: rotate(360deg); } }
+@keyframes dashMove  { to { background-position: 24px 0; } }
+@keyframes sweepX    { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+/* ============================================================ NECESSARY === */
+
+/* Panel sections reveal on tab switch. The stagger is driven by --i, which
+   app.js sets per child, so the eye reads the block top-to-bottom instead of
+   everything appearing at once. */
+section.rise > * { animation: rise .26s cubic-bezier(.22,.61,.36,1) backwards;
+                   animation-delay: calc(var(--i, 0) * 32ms); }
+
+/* A value that just changed gets a single flash. Information, not decoration:
+   with coordinates updating five times a second, the eye needs the change
+   marked or it all reads as noise. */
+.flash { animation: valueFlash .55s ease-out; }
+
+/* Busy indicators. Anything that waits on the network gets a moving element
+   so a slow reply is visibly "working" rather than broken. */
+.busy::after {
+  content: ""; position: absolute; left: 0; bottom: -1px; height: 2px; width: 40%;
+  background: var(--accent);
+  animation: sweepX 1s linear infinite;
+}
+.busy { position: relative; overflow: hidden; }
+
+/* A dotted trace that runs along the top of the viewport while the server is
+   reachable but no data has arrived yet. */
+#hud.stale { animation: flicker 4s steps(1, end) infinite; }
+
+/* =========================================================== DECORATIVE === */
+
+/* Boot: a single scanline travelling down the overlay, once. */
+#boot::after {
+  content: ""; position: absolute; left: 0; right: 0; height: 22%;
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--accent) 12%, transparent), transparent);
+  animation: scanDown 1.5s cubic-bezier(.4,0,.2,1) 1 forwards;
+  pointer-events: none;
+}
+
+/* Panel header: a sheen crossing once on load. */
+#panel header::after {
+  content: ""; position: absolute; top: 0; bottom: 0; width: 34%;
+  background: linear-gradient(90deg, transparent, var(--hatch), transparent);
+  animation: sheen 1.1s ease-out .35s 1 backwards;
+  pointer-events: none;
+}
+#panel header { position: relative; overflow: hidden; }
+
+/* Tabs: the active underline wipes in from the left. */
+#tabs button { position: relative; }
+#tabs button::before {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--accent); transform: scaleX(0); transform-origin: left;
+}
+/* `forwards` matters: without it the bar snaps back to scaleX(0) the moment
+   the animation ends, so the active tab loses its marker. */
+#tabs button.active::before { animation: barGrow .22s var(--ease) forwards; }
+
+/* Buttons: hairline offset on hover, and a sheen sweep on the primary CTA.
+   The hard offset replaces a soft shadow, which the flat style avoids. */
+/* Every clickable control shares one motion language: a hairline offset on
+   hover, a press-down on click, and a sheen that crosses the surface. */
+button, #viewbar button, #tabs button, #palette .pal {
+  position: relative;
+  overflow: hidden;
+  transition: transform var(--dur-fast) var(--ease),
+              box-shadow var(--dur-fast) var(--ease),
+              background var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+}
+button::after, #viewbar button::after, #tabs button::after, #palette .pal::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent,
+              color-mix(in srgb, var(--accent) 22%, transparent), transparent);
+  transform: translateX(-130%);
+}
+button:hover::after, #viewbar button:hover::after,
+#tabs button:hover::after, #palette .pal:hover::after {
+  animation: sheen .62s var(--ease);
+}
+button:hover, #viewbar button:hover, #tabs button:hover, #palette .pal:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: var(--shadow-hard);
+}
+button:active, #viewbar button:active, #tabs button:active, #palette .pal:active {
+  transform: translate(1px, 1px);
+  box-shadow: none;
+  transition-duration: var(--dur-fast);
+}
+
+/* Cards and rows enter from the left with their accent bar drawn in. */
+.dev { animation: slideL .28s ease-out backwards; animation-delay: calc(var(--i, 0) * 28ms); }
+.dev::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
+  background: var(--accent); transform: scaleY(0); transform-origin: top;
+  animation: barGrow .3s ease-out .1s forwards;
+}
+.dev { position: relative; overflow: hidden; }
+
+/* Toast: the accent bar wipes across before the text settles. */
+#toast { overflow: hidden; }
+#toast::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--accent); transform-origin: top;
+  animation: barGrow .28s ease-out;
+}
+
+/* The save button pulses while there are unsaved edits — decorative, but it
+   also carries the one piece of state the operator must not miss. */
+button.dirty { animation: flicker 3.4s steps(1, end) infinite; }
+
+/* Connection dot keeps a slow pulse (already in the base sheet) and gains a
+   ring that expands on each new report. */
+.dot.on::after {
+  content: ""; position: absolute; inset: -3px; border: 1px solid var(--good);
+  animation: sweepX 0s; opacity: 0;
+}
+.dot { position: relative; }
+
+/* Endpoint rows in the API tab: method chip slides in, row has a hairline
+   that draws itself. */
+.ep { animation: rise .3s ease-out backwards; animation-delay: calc(var(--i, 0) * 22ms); }
+.ep .m { animation: slideL .3s ease-out backwards; animation-delay: calc(var(--i, 0) * 22ms + 60ms); }
+.ep { transition: background var(--dur) var(--ease), padding-left var(--dur) var(--ease); }
+.ep:hover { background: var(--surface-2); padding-left: 6px; }
+
+/* Key/value rows, chips and inline code get the same restrained treatment. */
+table.kv tr { transition: background var(--dur) var(--ease); }
+table.kv tr:hover { background: var(--surface-2); }
+table.kv th, table.kv td { transition: color var(--dur) var(--ease); }
+.pill { transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+                    border-color var(--dur) var(--ease); }
+.pill:hover { border-color: var(--accent); color: var(--accent); }
+code { transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+                   border-color var(--dur) var(--ease); }
+code:hover { border-color: var(--accent); }
+
+/* Section headings: the accent bar grows when the section is hovered. */
+#panel h3::before { transition: transform var(--dur) var(--ease); transform-origin: top; }
+section:hover > h3::before { transform: scaleY(1.35); }
+
+/* Legend buttons already animate; their swatch pulses on hover. */
+#palette .pal span { transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+#palette .pal:hover span { transform: scale(1.35); box-shadow: 0 0 0 3px var(--surface-3); }
+
+/* Device row buttons keep their own rhythm, slightly faster than the rest. */
+.dev button { transition-duration: var(--dur-fast); }
+
+/* The HUD is a live readout: give its values a hairline underline that sweeps
+   when the text changes, matching the flash used in the panel. */
+#hud .mono { position: relative; }
+#hud .mono::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 1px;
+  background: var(--accent); transform: scaleX(0); transform-origin: left;
+}
+#hud .mono.flash::after { animation: barGrow var(--dur-slow) var(--ease); }
+
+/* Scrollbar thumb picks up the accent while dragging the panel. */
+#panel:active::-webkit-scrollbar-thumb { background: var(--accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  section.rise > *,
+  #boot::after,
+  #panel header::after,
+  #tabs button.active::after,
+  .dev, .dev::before, .ep, .ep .m,
+  #toast::before,
+  button.primary:hover::after,
+  button.dirty,
+  .flash,
+  .busy::after,
+  #hud.stale { animation: none !important; }
+  #viewbar button:hover, #tabs button:hover, #palette .pal:hover, button:hover { transform: none; }
 }
