@@ -21,11 +21,35 @@ const S = {
 };
 
 const $ = (id) => document.getElementById(id);
-const COL = {
-  room: 0x2a3350, grid: 0x1f2740, anchor: 0x6ee7b7, anchorOff: 0x64748b,
-  tag: 0xffd166, los: 0x6ee7b7, nlos: 0xf87171, obstacle: 0x8b5cf6,
-  sel: 0x60a5fa, ghost: 0x94a3b8,
+
+/* 3D palette. The scene has to sit on two very different backdrops, so the
+   colours are declared per theme and swapped in setPalette() below. Before
+   this, only the background followed the theme and the room/obstacles stayed
+   dark blue on a paper-white canvas. */
+const COL_DARK = {
+  room: 0x1a1a1f, wall: 0x24242b, grid: 0x2a2a31, anchor: 0x34d399, anchorOff: 0x55555c,
+  tag: 0xffb020, los: 0x34d399, nlos: 0xe8243b, obstacle: 0x3a3a44,
+  sel: 0xffffff, ghost: 0x8e8e92,
+  ruler: 0x9aa0b5, rulerMajor: 0xc7d6ff, rulerText: 0xb9c8ee,
+  dimText: 0xa8b8dc, originText: 0xd8e0ff,
+  axisX: 0xff6b6b, axisY: 0x6bff9c, axisZ: 0x6bb5ff,
+  labelOutline: 0x0a0a0c,
 };
+const COL_LIGHT = {
+  room: 0xdedbd5, wall: 0xcfccc5, grid: 0xc9c6c0, anchor: 0x0f8a5f, anchorOff: 0x9a9aa4,
+  tag: 0xd97706, los: 0x0f8a5f, nlos: 0xe8243b, obstacle: 0xc9c6c0,
+  sel: 0x14141a, ghost: 0x5c5c66,
+  // Darker than the paper background: the old pale blues were unreadable here.
+  ruler: 0x50505a, rulerMajor: 0x2a2a33, rulerText: 0x2e2e38,
+  dimText: 0x2e2e38, originText: 0x2a2a33,
+  axisX: 0xc81e2b, axisY: 0x0f8a5f, axisZ: 0x1d5fa8,
+  labelOutline: 0xeceae6,
+};
+const COL = { ...COL_DARK };
+
+function setPalette(theme) {
+  Object.assign(COL, theme === 'light' ? COL_LIGHT : COL_DARK);
+}
 
 /* ------------------------------------------------------------------ three */
 let renderer, scene3, camera, controls, raycaster;
@@ -327,7 +351,7 @@ function buildRoom() {
   // floor
   const floor = new THREE.Mesh(
     new THREE.BoxGeometry(W, 0.06, D),
-    new THREE.MeshStandardMaterial({ color: COL.room, roughness: 0.95, metalness: 0.05 }));
+    new THREE.MeshStandardMaterial({ color: COL.wall, roughness: 0.95, metalness: 0.05 }));
   floor.position.set(W / 2, -0.03, D / 2);
   floor.receiveShadow = true;
   floor.userData.pick = 'floor';
@@ -350,8 +374,8 @@ function buildRoom() {
     return line;
   };
   const X = new THREE.Vector3(1, 0, 0), Y = new THREE.Vector3(0, 0, 1);
-  axes.add(mkAxis(new THREE.Vector3(0, 0.02, 0), X.clone().multiplyScalar(axisLen), 0xff6b6b));
-  axes.add(mkAxis(new THREE.Vector3(0, 0.02, 0), Y.clone().multiplyScalar(axisLen), 0x6bff9c));
+  axes.add(mkAxis(new THREE.Vector3(0, 0.02, 0), X.clone().multiplyScalar(axisLen), COL.axisX));
+  axes.add(mkAxis(new THREE.Vector3(0, 0.02, 0), Y.clone().multiplyScalar(axisLen), COL.axisY));
 
   // arrow heads
   const head = (dir, color) => {
@@ -362,8 +386,8 @@ function buildRoom() {
     cone.userData.pick = 'axis';
     return cone;
   };
-  axes.add(head(X, 0xff6b6b));
-  axes.add(head(Y, 0x6bff9c));
+  axes.add(head(X, COL.axisX));
+  axes.add(head(Y, COL.axisY));
 
   // origin dot
   const origin = new THREE.Mesh(new THREE.SphereGeometry(0.055, 14, 12),
@@ -372,9 +396,9 @@ function buildRoom() {
   origin.userData.pick = 'axis';
   axes.add(origin);
 
-  axes.add(label('X →', new THREE.Vector3(axisLen * 0.72, 0.14, 0.16), 0xff9a9a, 0.13));
-  axes.add(label('Y →', new THREE.Vector3(0.16, 0.14, axisLen * 0.72), 0x9affc0, 0.13));
-  axes.add(label('0,0', new THREE.Vector3(-0.02, 0.10, -0.22), 0xd8e0ff, 0.12));
+  axes.add(label('X →', new THREE.Vector3(axisLen * 0.72, 0.14, 0.16), COL.axisX, 0.13));
+  axes.add(label('Y →', new THREE.Vector3(0.16, 0.14, axisLen * 0.72), COL.axisY, 0.13));
+  axes.add(label('0,0', new THREE.Vector3(-0.02, 0.10, -0.22), COL.originText, 0.12));
   roomGroup.add(axes);
 
   // ---- rulers along two edges -------------------------------------------
@@ -397,8 +421,8 @@ function buildRoom() {
   mk(0.06, H, D, W, H / 2, D / 2);          // x = W
 
   // dimension labels (the rulers already carry per-metre numbers)
-  label(`width ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -0.62), 0xa8b8dc);
-  label(`depth ${D.toFixed(2)} m`, new THREE.Vector3(-0.62, 0.12, D / 2), 0xa8b8dc);
+  label(`width ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -0.62), COL.dimText);
+  label(`depth ${D.toFixed(2)} m`, new THREE.Vector3(-0.62, 0.12, D / 2), COL.dimText);
 
   controls.target.set(W / 2, 0.8, D / 2);
   updateHud();
@@ -421,7 +445,7 @@ function label(text, pos, color = 0xffffff, size = 0.16) {
     spr.userData.col = spr.userData.labelColor;
 
     const g = canvas.getContext('2d');
-    const font = 'bold 40px system-ui, sans-serif';
+    const font = 'bold 40px "JetBrains Mono", ui-monospace, monospace';
     g.font = font;
     const lines = String(t).split('\n');
     const w = Math.ceil(Math.max(...lines.map((l) => g.measureText(l).width))) + 24;
@@ -431,9 +455,18 @@ function label(text, pos, color = 0xffffff, size = 0.16) {
     if (canvas.height !== h) canvas.height = h;
     g.clearRect(0, 0, w, h);
     g.font = font;
-    g.fillStyle = `#${spr.userData.labelColor.toString(16).padStart(6, '0')}`;
     g.textBaseline = 'middle';
-    lines.forEach((l, i) => g.fillText(l, 12, lh * i + lh / 2));
+    // Outline in the background colour first: the labels sit over a grid, a
+    // floor plane and walls, and a hairline glyph on a same-tone surface was
+    // unreadable — worst on the paper-white theme.
+    g.lineWidth = 7;
+    g.lineJoin = 'round';
+    g.strokeStyle = `#${(COL.labelOutline ?? 0x000000).toString(16).padStart(6, '0')}`;
+    g.fillStyle = `#${spr.userData.labelColor.toString(16).padStart(6, '0')}`;
+    lines.forEach((l, i) => {
+      g.strokeText(l, 12, lh * i + lh / 2);
+      g.fillText(l, 12, lh * i + lh / 2);
+    });
 
     if (!spr.material.map) {
       spr.material.map = new THREE.CanvasTexture(canvas);
@@ -461,10 +494,10 @@ function makeRuler(from, to) {
 
   g.add(new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([from, to]),
-    new THREE.LineBasicMaterial({ color: 0x8fa6d8, transparent: true, opacity: 0.9 })));
+    new THREE.LineBasicMaterial({ color: COL.ruler, transparent: true, opacity: 0.9 })));
 
-  const tickMat = new THREE.LineBasicMaterial({ color: 0x8fa6d8, transparent: true, opacity: 0.75 });
-  const majorMat = new THREE.LineBasicMaterial({ color: 0xc7d6ff });
+  const tickMat = new THREE.LineBasicMaterial({ color: COL.ruler, transparent: true, opacity: 0.75 });
+  const majorMat = new THREE.LineBasicMaterial({ color: COL.rulerMajor });
 
   const ticks = Math.round(len * 2);                      // every 0.5 m
   for (let i = 0; i <= ticks; i++) {
@@ -479,7 +512,7 @@ function makeRuler(from, to) {
     if (major && i > 0) {
       const lp = p.clone().addScaledVector(side, h + 0.12);
       lp.y = 0.10;
-      g.add(label(`${t} m`, lp, 0xb9c8ee, 0.105));
+      g.add(label(`${t} m`, lp, COL.rulerText, 0.105));
     }
   }
   return g;
@@ -659,9 +692,9 @@ function buildObstacles() {
       gz.position.set(0, 0, 0);
       gz.userData.pick = 'gizmo';
       gz.userData.id = ob.id;
-      gz.add(axisArrow(new THREE.Vector3(1, 0, 0), 0xff6b6b, 'x'));
-      gz.add(axisArrow(new THREE.Vector3(0, 0, 1), 0x6bff9c, 'y'));
-      gz.add(axisArrow(new THREE.Vector3(0, 1, 0), 0x6bb5ff, 'z'));
+      gz.add(axisArrow(new THREE.Vector3(1, 0, 0), COL.axisX, 'x'));
+      gz.add(axisArrow(new THREE.Vector3(0, 0, 1), COL.axisY, 'y'));
+      gz.add(axisArrow(new THREE.Vector3(0, 1, 0), COL.axisZ, 'z'));
       gz.renderOrder = 20;
       g.add(gz);
 
@@ -1369,11 +1402,14 @@ const fmt = (v) => (v === undefined || v === null) ? '—' : Number(v).toFixed(2
 function buildPalette() {
   const host = $('palette');
   const items = [
-    { t: 'anchor', n: 'Anchor', c: '#6ee7b7' },
-    { t: 'obstacle', n: 'Obstacle', c: '#8b5cf6' },
+    { t: 'anchor', n: 'Anchor' },
+    { t: 'obstacle', n: 'Obstacle' },
   ];
+  // Swatches read the live 3D palette, so the legend cannot drift out of sync
+  // with the scene when the theme changes.
   host.innerHTML = items.map((i) =>
-    `<button class="pal" data-add="${i.t}"><span style="background:${i.c}"></span>${i.n}</button>`).join('');
+    `<button class="pal" data-add="${i.t}"><span style="background:#${
+      COL[i.t].toString(16).padStart(6, '0')}"></span>${i.n}</button>`).join('');
   host.querySelectorAll('.pal').forEach((b) => {
     b.onclick = () => {
       S.mode = b.dataset.add === 'anchor' ? 'addAnchor' : 'addObstacle';
@@ -1736,12 +1772,23 @@ async function renderApi() {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   try { localStorage.setItem('uwb-theme', theme); } catch (e) {}
-  $('theme-toggle').textContent = theme === 'light' ? '🌙' : '☀';
+  $('theme-toggle').textContent = theme === 'light' ? 'DARK' : 'LIGHT';
   if (scene3) {
     const light = theme === 'light';
-    scene3.background = new THREE.Color(light ? 0xeef2fb : 0x0b0e1a);
+    setPalette(theme);
+    scene3.background = new THREE.Color(light ? 0xeceae6 : 0x0a0a0c);
     if (scene3.fog) scene3.fog.color = scene3.background;
+    // Rebuild every group that carries a themed colour. Before this only the
+    // room was rebuilt, so anchors, obstacles, tags and links kept the old
+    // palette after a theme switch.
     if (roomGroup) buildRoom();
+    if (anchorGroup) buildAnchors();
+    if (obstacleGroup) buildObstacles();
+    if (tagGroup) buildTags();
+    if (linkGroup) buildLinks();
+    updateAnchorLabels();
+    ensurePulses();
+    buildPalette();          // legend swatches follow the 3D palette
   }
 }
 
@@ -1938,6 +1985,7 @@ initThree();
 initUi();
 loadScene().then(() => { setView('iso'); playIntro(); });
 applyTheme(localStorage.getItem('uwb-theme') || 'dark');
+setPalette(document.documentElement.dataset.theme);   // 3D colours before the first build
 poll();
 setInterval(poll, 500);
 
