@@ -156,7 +156,7 @@ Board belum dikonfigur → OLED menampilkan `NOT CONFIGURED`. Ada **3 cara**:
 1. Board terhubung Wi-Fi (WiFi & server URL sudah diset sewaktu pertama kali;
    kalau belum, pakai 4b atau 4c dulu satu kali).
 2. Buka `http://<IP-server>:8080` → form **Setup**.
-3. Isi per board:
+3. Contoh Konfigurasi Anchor dan Tag di ruangan:
    - **Anchor 1** → role `anchor`, ID `1`, Position X `0`, Position Y `0`
      (taruh board di pojok ruangan), Room width/height → misal `5` × `4`.
    - **Anchor 2** → role `anchor`, ID `2`, Position X `5` (lebar ruangan),
