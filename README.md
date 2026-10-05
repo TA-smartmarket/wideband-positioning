@@ -553,6 +553,35 @@ step 3  true_y=1.6 -> x=2.01 y=1.64  vy=0.68  sigma=0.202  used=2
 | bootstrap | ya (standalone) | ya |
 | EKF tracking | ya (fallback) | **ya (utama)** |
 
+### 4. Tinggi tag — setelan yang paling mudah salah
+
+Radio mengukur jarak **miring 3D** antara anchor di langit-langit dan tag yang
+kamu bawa. Solver bekerja di lantai (2D), jadi komponen vertikal harus dibuang:
+
+```
+r_horizontal = √(r_3D² − (z_anchor − z_tag)²)
+```
+
+`z_anchor` kamu isi di editor 3D. **`z_tag` kamu ukur sendiri** di
+**Setup → Tag height above floor** (default 1,3 m) — sistem tidak bisa
+menebaknya. Nilainya disimpan sebagai `tag_z` di scene dan dikirim ke device,
+supaya tag yang menghitung mandiri memakai angka yang sama dengan server.
+
+**Kenapa ini penting:** salah tinggi 30 cm menggeser tiap jarak ~13 cm, dan
+pada dua anchor itu berubah menjadi puluhan sentimeter pada posisi akhir.
+Gejalanya khas: posisi **konsisten** terlalu jauh dari anchor, atau tag tampak
+"di belakang" padahal secara fisik dekat. Kalau gejalanya seperti itu, curigai
+tinggi tag lebih dulu sebelum menuduh radionya.
+
+Sensitivitasnya, dihitung dari range nyata 3,689 m:
+
+| Tinggi tag | Posisi yang dihasilkan |
+|---|---|
+| 0,4 m | y = 1,52 m |
+| 0,6 m | y = 1,73 m |
+| **1,3 m (sebenarnya)** | **y = 2,23 m** |
+| 1,6 m | y = 2,36 m |
+
 Detail matematis lengkap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 
 > Karena jarak radio ±10–30 cm noise di dalam ruangan (pantulan), EKF +
@@ -568,12 +597,13 @@ Detail matematis lengkap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 | OLED tulisan `NOT CONFIGURED` | Set role+ID (serial `role tag` + `id 1` + `save`, atau AP `UWB-Setup`) |
 | Tidak ada jarak sama sekali | Pastikan anchor & tag ID unik, jarak masih jangkauan, power USB cukup |
 | Web map kosong | Cek `/api/v1/devices` — device online? Posisi anchor sudah diset? |
-| Posisi tag loncat/cermin | 2 anchor → mirror (tanda `ambiguous`). Tambah anchor ke-3 |
+| Posisi tag loncat/cermin | 2 anchor → mirror (tanda `ambiguous`). Pastikan kotak ruangan di web sama dengan ruangan asli, sebaiknya anchor tidak sebaris. Tambah anchor ke-3 untuk menghilangkannya |
+| **Posisi tag konsisten terlalu jauh / terlihat "di belakang"** | Tinggi tag salah. Set **Setup → Tag height above floor** sesuai ukuran meteran (jangan ditebak), lalu Save. Salah 30 cm menggeser posisi puluhan cm |
 | Server tidak bisa diakses board | Board & server harus satu Wi-Fi; pakai IP LAN (`192.168.x.x`), bukan `127.0.0.1` |
 | MQTT tidak terima | Broker harus jalan (`mosquitto -v`); REST tetap jalan tanpa MQTT |
 | Flash stuck "Connecting..." | BOOT + RST manual (lihat Langkah 3) |
 | Posisi beku | Server drop range lebih 5 detik tanpa data baru (device offline) |
-| Boros flash/RAM? | Partisi huge_app sudah diset; pakai `mode shortdata_fast_accuracy` kalau mau hemat |
+| Boros flash/RAM? | Partisi `min_spiffs` sudah diset (app0+app1, perlu untuk OTA); pakai `mode shortdata_fast_accuracy` kalau mau hemat |
 
 ---
 

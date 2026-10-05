@@ -174,12 +174,19 @@ memakai riwayat basi.
 
 ## 4. Konversi jarak 3D → horizontal
 
-**Masalah.** Anchor dipasang di langit-langit (`z = 2,2 m`), tag dipegang
-setinggi pinggang (`z = 0,9 m`). TWR mengukur jarak **miring 3D**, sedangkan
+**Masalah.** Anchor dipasang di langit-langit (`z = 2,2 m`), tag dibawa pada
+ketinggian tertentu di atas lantai. TWR mengukur jarak **miring 3D**, sedangkan
 EKF bekerja di bidang 2D `(x, y)`.
 
 Kalau selisih tinggi ini diabaikan, ia menjadi galat sistematis yang
 membengkakkan semua jarak.
+
+**Tinggi tag adalah setelan, bukan konstanta.** Nilainya diatur di tab Setup
+(`Tag height above floor`) dan disimpan sebagai `tag_z` di scene, karena hanya
+operator yang bisa mengukurnya. Salah 30 cm menggeser tiap jarak sekitar 13 cm,
+dan pada dua anchor itu bergeser menjadi puluhan sentimeter pada posisi akhir.
+Nilai yang sama dikirim ke device lewat config, supaya tag yang menghitung
+sendiri memakai tinggi yang persis sama dengan server.
 
 **Solusi.** Proyeksikan secara eksak (`server/scene.py::horizontal_range`):
 
@@ -640,7 +647,7 @@ ini perlu ditinjau ulang.
 | `gate_sigma` | 3,0 | `ekf.h`, `app.py` | lebih kecil = lebih selektif |
 | `nlos_factor` | 8,0 | `scene.py` | sigma maksimum saat terhalang penuh |
 | `bias_m` | 0,35 m | `scene.py` | koreksi NLOS positif |
-| `DEFAULT_TAG_Z` | 0,9 m | `scene.py` | tinggi tag saat memproyeksikan jarak |
+| `tag_z` (tinggi tag) | **1,3 m** | UI Setup → `scene.py` | tinggi tag saat memproyeksikan jarak; **atur ini sesuai ukuran sebenarnya** |
 | cap kovarians | 25 / 9 | `ekf.h`, `app.py` | batas P posisi / kecepatan |
 | threshold self-healing | 8 siklus | `app.py` | kecepatan pemulihan |
 | `update_ms` | 200 ms | `config.h` | laju siklus; mempengaruhi `dt` EKF |

@@ -1018,7 +1018,7 @@ function makePulse(color) {
 function ensurePulses() {
   const want = [];
   for (const a of S.scene.anchors) want.push(['anchor', a.id, a.x, a.y, a.z, 0x6ee7b7]);
-  for (const t of S.state.tags || []) want.push(['tag', t.id, t.x, t.y, t.z ?? 0.9, 0xffd166]);
+  for (const t of S.state.tags || []) want.push(['tag', t.id, t.x, t.y, tagZ(t), 0xffd166]);
 
   // drop pulses for things that vanished
   const keys = new Set(want.map((w) => w[0] + ':' + w[1]));
@@ -1045,6 +1045,13 @@ function ensurePulses() {
 // floats per ring.
 let pulseT = 0;
 const tagFlashers = {};   // tag id -> value flasher for the coordinate readout
+
+// Height of the tag above the floor, as set in Setup. The server reports the
+// solved z per tag; fall back to the scene value, then to the server default.
+function tagZ(t) {
+  return (t && typeof t.z === 'number') ? t.z
+       : (S.scene && typeof S.scene.tag_z === 'number') ? S.scene.tag_z : 1.3;
+}
 function animatePulses() {
   if (!pulses.length) return;
   pulseT += frameDt;
@@ -1111,7 +1118,7 @@ function buildTags() {
       tagGroup.add(mesh);
       tagMeshes[t.id] = mesh;
     }
-    mesh.position.set(t.x, t.z ?? 0.9, t.y);
+    mesh.position.set(t.x, tagZ(t), t.y);
 
     const ring = mesh.getObjectByName('sigma');
     if (ring) {
@@ -1169,7 +1176,7 @@ function buildTrail() {
     const pos = new Float32Array(pts.length * 3);
     for (let i = 0; i < pts.length; i++) {
       pos[i * 3] = pts[i][0];
-      pos[i * 3 + 1] = 0.9;
+      pos[i * 3 + 1] = tagZ(null);
       pos[i * 3 + 2] = pts[i][1];
     }
     line.geometry.dispose();
@@ -1187,7 +1194,7 @@ function buildLinks() {
       if (!a) continue;
       const blocked = !!info.blocked;
       const pts = [new THREE.Vector3(a.x, a.z, a.y),
-                   new THREE.Vector3(t.x, t.z ?? 0.9, t.y)];
+                   new THREE.Vector3(t.x, tagZ(t), t.y)];
       const line = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints(pts),
         new THREE.LineDashedMaterial({
@@ -1653,7 +1660,7 @@ function showSelection() {
       <h3>Tag <span class="pill">${t.id}</span></h3>
       <table class="kv">
         <tr><td>Position</td><td>${fmt(t.x)}, ${fmt(t.y)} m</td></tr>
-        <tr><td>Height</td><td>${fmt(t.z ?? 0.9)} m</td></tr>
+        <tr><td>Height</td><td>${fmt(tagZ(t))} m</td></tr>
         <tr><td>Speed</td><td>${Math.hypot(t.vx || 0, t.vy || 0).toFixed(2)} m/s</td></tr>
         <tr><td>1σ</td><td>${fmt(t.sigma)} m</td></tr>
         <tr><td>Confidence</td><td>${((t.confidence ?? 0) * 100).toFixed(0)}%</td></tr>
@@ -1776,6 +1783,7 @@ function syncRoomInputs() {
   $('r-w').value = S.scene.room.width.toFixed(2);
   $('r-d').value = S.scene.room.depth.toFixed(2);
   $('r-h').value = S.scene.room.height.toFixed(2);
+  $('r-tz').value = (S.scene.tag_z ?? 1.3).toFixed(2);
 }
 
 /* ------------------------------------------------------------------ motion
@@ -2334,6 +2342,13 @@ function initUi() {
     b.onclick = () => setTab(b.dataset.tab);
   });
 
+  $('r-tz').onchange = () => {
+    const v = Math.min(Math.max(+$('r-tz').value || 1.3, 0.05), 3);
+    S.scene.tag_z = v;
+    $('r-tz').value = v.toFixed(2);
+    setDirty();
+    rebuildAll();          // the tag marker sits at this height
+  };
   ['r-w', 'r-d', 'r-h'].forEach((id) => {
     $(id).onchange = () => {
       S.scene.room.width = Math.max(0.5, +$('r-w').value);

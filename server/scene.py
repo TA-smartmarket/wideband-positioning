@@ -17,11 +17,16 @@ This is standard NLOS identification/mitigation for UWB.
 import math
 
 DEFAULT_ROOM = {"width": 5.0, "depth": 4.0, "height": 2.7}
-DEFAULT_TAG_Z = 0.9          # assumed tag height when solving in 2D
+# Height of the tag above the floor, in metres. This is NOT a guess any more:
+# it is a scene field the operator sets, because the 3D→horizontal projection
+# below divides by it and a wrong value shifts every position (30 cm of error
+# moves a range by ~13 cm). The default matches how the tag is normally held.
+DEFAULT_TAG_Z = 1.3
 
 
 def default_scene():
-    return {"room": dict(DEFAULT_ROOM), "anchors": [], "obstacles": []}
+    return {"room": dict(DEFAULT_ROOM), "anchors": [], "obstacles": [],
+            "tag_z": DEFAULT_TAG_Z}
 
 
 def _norm_room(room):
@@ -55,6 +60,17 @@ def _norm_obstacle(ob, idx=0):
     }
 
 
+def _norm_tag_z(raw):
+    try:
+        v = float(raw.get("tag_z", DEFAULT_TAG_Z))
+    except (TypeError, ValueError):
+        return DEFAULT_TAG_Z
+    # Must stay below the anchors and above the floor: a tag at or under 0
+    # would make the projection divide by zero, and one above the ceiling is
+    # physically impossible.
+    return min(max(v, 0.05), 3.0)
+
+
 def normalise_scene(raw):
     """Coerce an arbitrary payload into a valid scene dict."""
     raw = raw if isinstance(raw, dict) else {}
@@ -75,7 +91,8 @@ def normalise_scene(raw):
             continue
     obstacles = [_norm_obstacle(o, i) for i, o in enumerate(raw.get("obstacles") or [])
                  if isinstance(o, dict)]
-    return {"room": room, "anchors": anchors, "obstacles": obstacles}
+    return {"room": room, "anchors": anchors, "obstacles": obstacles,
+            "tag_z": _norm_tag_z(raw)}
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@
 #include <Preferences.h>
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.29"
+#define FW_VERSION      "1.0.30"
 #ifndef MAX_DEVICES
 #define MAX_DEVICES     10      // ids 1..10 for both roles
 #endif
@@ -73,6 +73,12 @@ struct Config {
     // Positions of every anchor, pushed by the server so a tag can solve its
     // own position without asking the server. Encoded "id:x,y;id:x,y".
     char     anchor_map[192] = "";
+
+    // Height of this tag above the floor, in metres. Ranges are measured in 3D
+    // between the anchor and the tag, so the horizontal distance the solver
+    // needs is sqrt(r^2 - dz^2). The server pushes this value; without it the
+    // solver used the raw 3D range and every position came out too far away.
+    float    tag_z = 1.3f;
 
     // Display power saving. The OLED is the only always-on consumer on the
     // board; turning it off keeps WiFi, ranging and telemetry running.
@@ -178,7 +184,11 @@ inline UwbMode uwbModeFromName(const char *s)
 }
 
 // Parse the anchor map "1:0,0;2:5,0" and return the position of anchor `id`.
-inline bool anchorPos(const Config &c, uint8_t id, float &x, float &y)
+// Anchor height used when the server did not send one. Matches the default the
+// server and the UI assume, so the two agree before anything is configured.
+#define ANCHOR_DEFAULT_Z 2.2f
+
+inline bool anchorPos(const Config &c, uint8_t id, float &x, float &y, float *z = nullptr)
 {
     const char *p = c.anchor_map;
     while (*p) {
@@ -191,7 +201,11 @@ inline bool anchorPos(const Config &c, uint8_t id, float &x, float &y)
         const char *comma = strchr(colon + 1, ',');
         if (!comma) break;
         float ay = atof(comma + 1);
-        if (aid == (int)id) { x = ax; y = ay; return true; }
+        if (aid == (int)id) {
+            x = ax; y = ay;
+            if (z) *z = ANCHOR_DEFAULT_Z;   // map carries x,y only
+            return true;
+        }
         const char *semi = strchr(comma, ';');
         if (!semi) break;
         p = semi + 1;
@@ -229,6 +243,7 @@ inline void configLoad(Config &c)
     c.range_filter = p.getBool("rfilt", true);
     c.update_ms = p.getUShort("upd", 200);
     p.getString("amap", c.anchor_map, sizeof(c.anchor_map));
+    c.tag_z = p.getFloat("tagz", 1.3f);
     c.screen_mode = p.getUChar("scr_mode", 1);
     c.screen_timeout_s = p.getUShort("scr_to", 60);
     c.ota_enabled = p.getBool("ota_en", true);
@@ -263,6 +278,7 @@ inline void configSave(const Config &c)
     p.putBool("rfilt", c.range_filter);
     p.putUShort("upd", c.update_ms);
     p.putString("amap", c.anchor_map);
+    p.putFloat("tagz", c.tag_z);
     p.putUChar("scr_mode", c.screen_mode);
     p.putUShort("scr_to", c.screen_timeout_s);
     p.putBool("ota_en", c.ota_enabled);

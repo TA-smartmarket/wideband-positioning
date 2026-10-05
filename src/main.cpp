@@ -249,6 +249,7 @@ String buildTelemetry()
     }
 
     JsonObject st = doc["status"].to<JsonObject>();
+    jsonPutFloat(st, "tag_z", cfg.tag_z);       // height the device solved with
     if (net.wifi_up) st["ip"] = WiFi.localIP().toString();
     st["rssi"] = net.wifi_up ? WiFi.RSSI() : 0;
     st["uptime_s"] = (millis() - boot_ms) / 1000;
@@ -428,10 +429,24 @@ void solveLocally()
         if (aid < 1 || aid > MAX_ANCHORS) continue;
 
         // anchor positions come from the config pushed by the server
-        float ax, ay;
-        if (!anchorPos(cfg, aid, ax, ay)) continue;
+        float ax, ay, az;
+        if (!anchorPos(cfg, aid, ax, ay, &az)) continue;
+
+        // The radio measures the SLANT range between the anchor (up high) and
+        // the tag (held at cfg.tag_z). The solver works on the floor plane, so
+        // the vertical offset has to come out exactly:
+        //     horizontal = sqrt(r^2 - dz^2)
+        // Feeding the raw 3D range to a 2D solver made every position read too
+        // far from the anchors — the bug the server side never had.
+        const float dz = az - cfg.tag_z;
+        const float r3d = ranges[i].range;
+        float r2d = r3d;
+        const float r2 = r3d * r3d - dz * dz;
+        if (r2 > 0.0f) r2d = sqrtf(r2);
+        else r2d = fmaxf(r3d * 0.1f, 0.01f);       // degenerate geometry
+
         fixes[n].x = ax; fixes[n].y = ay;
-        fixes[n].range = ranges[i].range;
+        fixes[n].range = r2d;
         fixes[n].valid = true;
         n++;
     }
@@ -783,6 +798,7 @@ void printConfig()
     Serial.printf("base topic : %s\n", cfg.mqtt_base);
     Serial.printf("position   : %.2f %.2f %.2f\n", cfg.pos_x, cfg.pos_y, cfg.pos_z);
     Serial.printf("room       : %.2f x %.2f m\n", cfg.room_w, cfg.room_h);
+    Serial.printf("tag height : %.2f m\n", cfg.tag_z);
     Serial.printf("uwb mode   : %s\n", uwbModeName(cfg.uwb_mode));
     Serial.printf("filter     : %s\n", cfg.range_filter ? "on" : "off");
     Serial.printf("screen     : %s after %us\n",
@@ -1051,6 +1067,10 @@ void onServerConfig(JsonObjectConst doc)
         JsonObjectConst r = doc["room"].as<JsonObjectConst>();
         if (r["width"].is<float>()) cfg.room_w = r["width"].as<float>();
         if (r["height"].is<float>()) cfg.room_h = r["height"].as<float>();
+    }
+    if (doc["tag_z"].is<float>()) {                     // tag height, for the range projection
+        float v = doc["tag_z"].as<float>();
+        if (v > 0.05f && v < 3.0f) cfg.tag_z = v;
     }
     if (doc["anchors"].is<JsonArrayConst>()) {          // anchor map for tag-side solving
         char map[sizeof(cfg.anchor_map)] = "";

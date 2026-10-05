@@ -196,6 +196,15 @@ def auto_place_anchor(device_id, height=2.2):
         SCENE = scene_mod.normalise_scene(SCENE)
 
 
+def _anchor_num(device_id):
+    """'anchor-3' -> 3. The firmware keys its anchor map by this number, so the
+    config has to carry it as an integer; 0 means 'no usable number'."""
+    try:
+        return int(str(device_id).split("-")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
 def merged_config(role, did):
     """Config for a device: its stored values over the defaults, plus the
     anchor map.
@@ -218,17 +227,41 @@ def merged_config(role, did):
         cfg["id"] = did
         # OTA credentials: the device needs its key to accept an update
         cfg["ota"] = {"enabled": True, "port": OTA_PORT, "token": ota_token(key)}
-        # anchors[] array so a tag can solve locally too
+        # Height of the tag above the floor. The device projects its 3D ranges
+        # against this when it solves locally, so it has to travel with the
+        # config or the tag and the server would disagree about the same data.
+        cfg["tag_z"] = float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z))
+        # anchors[] array so a tag can solve locally too. Built from the SCENE,
+        # which is the source of truth for where anchors are (the 3D editor
+        # writes it), falling back to the device's own report. Building it from
+        # DEVICES alone skipped every anchor that had been auto-placed but not
+        # explicitly saved, so the map arrived empty and a tag could not solve.
         anchors = []
+        seen_ids = set()
+        for a in SCENE.get("anchors", []):
+            aid = a.get("id")
+            if not aid or aid in seen_ids:
+                continue
+            seen_ids.add(aid)
+            anchors.append({"id": a.get("id_int", 0) or _anchor_num(aid),
+                            "x": a["x"], "y": a["y"], "z": a.get("z", 2.2),
+                            "device_id": aid})
         for dk, dc in DEVICES.items():
-            if dc.get("role") == "anchor" and not dc.get("_auto"):
-                anchors.append({"id": dc.get("id"), "x": dc["position"]["x"],
-                                "y": dc["position"]["y"], "z": dc["position"]["z"],
-                                "device_id": dk})
+            if dc.get("role") != "anchor" or dk in seen_ids:
+                continue
+            pos = dc.get("position") or {}
+            anchors.append({"id": dc.get("id"), "x": pos.get("x", 0.0),
+                            "y": pos.get("y", 0.0), "z": pos.get("z", 2.2),
+                            "device_id": dk})
         cfg["anchors"] = anchors
         if not known:
-            # strip everything the device already knows locally
+            # strip everything the device already knows locally — but tag_z is
+            # not a credential, it is measurement data the device cannot derive,
+            # so it must be sent even here. Without it a device seen only
+            # through telemetry kept its NVS default and solved with the wrong
+            # height.
             return {"device_id": key, "role": role, "id": did, "anchors": anchors,
+                    "tag_z": float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z)),
                     "ota": {"enabled": True, "port": OTA_PORT, "token": ota_token(key)}}
         # never push empty credentials back — that would wipe the device
         if not cfg["wifi"]["ssid"]:
@@ -465,6 +498,10 @@ def recompute_positions():
     with LOCK:
         room = dict(SCENE["room"])
         obstacles = list(SCENE.get("obstacles", []))
+        # Height of the tag above the floor, set by the operator in the UI.
+        # It is what the 3D range is projected against, so it must come from
+        # the scene rather than a constant in the code.
+        tag_z = float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z))
 
     for tag in tags:
         fixes, anchors_used = [], []
@@ -478,7 +515,7 @@ def recompute_positions():
             if not pos:
                 continue
             ax, ay, az = pos
-            dz = az - scene_mod.DEFAULT_TAG_Z
+            dz = az - tag_z
             rng2d = scene_mod.horizontal_range(r["range"], dz)
             if rng2d <= 0.01:
                 continue
@@ -504,7 +541,7 @@ def recompute_positions():
         link_info = {}
         for (a, ax, ay, az, rng2d) in links:
             blockers = scene_mod.los_blockers(
-                (ax, ay, az), (EKF[tag].x[0], EKF[tag].x[1], scene_mod.DEFAULT_TAG_Z),
+                (ax, ay, az), (EKF[tag].x[0], EKF[tag].x[1], tag_z),
                 obstacles) if NLOS_ENABLED else []
             sigma = scene_mod.measurement_sigma(blockers, EKF[tag].sigma_r)
             bias = scene_mod.nlos_bias(blockers)
@@ -559,7 +596,7 @@ def recompute_positions():
 
         out[tag] = {
             "ts": now, "src": "server", "id": tag,
-            "x": px, "y": py, "z": scene_mod.DEFAULT_TAG_Z,
+            "x": px, "y": py, "z": tag_z,
             "vx": vx, "vy": vy,
             "confidence": 1.0 / (1.0 + sigma),
             "sigma": sigma, "ambiguous": False,
@@ -690,7 +727,7 @@ def build_state():
     tags = []
     for tag, p in TAG_POS.items():
         tags.append({"id": tag, "x": p["x"], "y": p["y"],
-                     "z": p.get("z", scene_mod.DEFAULT_TAG_Z),
+                     "z": p.get("z", scene_mod.DEFAULT_TAG_Z),   # solved value, already tag_z
                      "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
                      "sigma": p.get("sigma", 0.0),
                      "geometry_ok": p.get("geometry_ok", True),

@@ -11,7 +11,7 @@
 
 struct AnchorFix {
     float x, y;
-    float range;
+    float range;      // horizontal range (already projected from the 3D measurement)
     bool  valid;
 };
 
