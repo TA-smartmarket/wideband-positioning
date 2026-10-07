@@ -127,6 +127,8 @@ required on `/api/v1/*` **only if** the server was started with a token.
 | `GET`  | `/api/v1/devices` | List known devices + last seen |
 | `PUT`  | `/api/v1/config` | Web UI writes config for a device |
 | `POST` | `/api/v1/position` | Solve now from current ranges (debug) |
+| `GET`  | `/api/v1/navigation/position` | Trolley position in the navigation contract (section 8) |
+| `GET`  | `/api/v1/navigation/scene` | Static obstacles in the navigation contract (section 8) |
 | `GET`  | `/` | Web UI (live map + config) |
 
 Responses: `200` with `{"ok": true, ...}`, errors `4xx/5xx` with
@@ -217,3 +219,95 @@ The pipeline is **pre-filter → bootstrap → EKF tracking** (full maths in
    EKF covariance (shrinks as measurements accumulate). `vx`/`vy` (m/s) and
    `sigma` are included in the tag state.
 6. Positions are recomputed on every ingest and broadcast on `<base>/state`.
+
+---
+
+## 8. Navigation integration (server → trolley)
+
+The `wideband-navigation` trolley consumes the **processed position** and the
+**static scene** — never raw ranges. Three read-only endpoints expose those in
+the exact contract navigation documents (`navigation_core/docs/data_contract.md`
++ `integration.md`). Position is polled periodically (or pushed over MQTT); the
+map and scene are fetched once per navigation session / map change (they are not
+re-sent with every position).
+
+### `GET /api/v1/navigation/position`
+
+Polled by the trolley at ~10 Hz. Optional `?tag=<id>` selects a specific tag;
+otherwise the freshest online tag wins.
+
+```json
+{
+  "schema_version": 1,
+  "trolley_id": "TROLLEY_01",
+  "frame_id": "smart_market_map",
+  "timestamp_ms": 204621234,
+  "position": { "x_m": 1.495, "y_m": 0.991 },
+  "quality": 0.925,
+  "valid": true
+}
+```
+
+- `timestamp_ms` is **monotonic** (`time.monotonic_ns()`), not wall clock —
+  navigation uses it only for staleness detection.
+- `quality` is the EKF confidence, clamped to `[0, 1]`.
+- `valid` is `false` when the tag position is stale/offline (`STALE_MS = 5000`).
+- Returns `404` only when no tag position has ever been seen.
+
+### `GET /api/v1/navigation/map`
+
+Fetched once at navigation start; the map rectangle is sourced from the 3D
+scene so navigation never hard-codes room dimensions that drift from the scene.
+
+```json
+{
+  "map_id": "SMART_MARKET_MAIN",
+  "map_version": 1,
+  "frame_id": "smart_market_map",
+  "width_m": 3.9,
+  "height_m": 2.5,
+  "origin_x_m": 0.0,
+  "origin_y_m": 0.0
+}
+```
+
+### `GET /api/v1/navigation/scene`
+
+Fetched once at navigation start (and re-fetched when the map changes).
+
+```json
+{
+  "schema_version": 1,
+  "map_id": "SMART_MARKET_MAIN",
+  "map_version": 1,
+  "frame_id": "smart_market_map",
+  "scene": {
+    "room": { "width": 3.9, "depth": 2.5 },
+    "obstacles": [
+      { "id": "obstacle-1", "label": "Wall", "x": 1.0, "y": 2.0, "z": 0.24,
+        "sx": 1.79, "sy": 0.97, "sz": 0.39, "rot": 1.5708, "atten": 1.0 }
+    ]
+  },
+  "nlos_enabled": true
+}
+```
+
+- `map_id` / `map_version` / `frame_id` let navigation version-check the map
+  against the `GET /api/v1/navigation/map` response before motion.
+- `x`, `y` are the obstacle centre, `sx`, `sy` the full size, in metres.
+- **`rot` is in radians** here (positioning stores degrees; the server converts
+  at this boundary). navigation's obstacle parser reads `rot` directly as
+  radians, so the units now match end-to-end.
+
+### MQTT push (position)
+
+When MQTT is enabled the server also publishes the position-contract document to
+`<base>/navigation/position` at 10 Hz (non-retained). `valid:false` samples are
+**not** published — a drop-out means no sample, which navigation treats as
+stale and enters `POSITION_LOST` safely.
+
+### Coordinate frame
+
+Origin bottom-left, `+X` right, `+Y` up, metres, `frame_id = smart_market_map`
+— matching `wideband-navigation/config/map.json`.
+

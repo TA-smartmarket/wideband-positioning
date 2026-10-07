@@ -15,6 +15,9 @@ Endpoints (see docs/API.md):
     PUT  /api/v1/scene                  save the 3D scene (pushes anchor config)
     GET  /api/v1/devices                known devices + last seen
     POST /api/v1/position               solve now (debug)
+    GET  /api/v1/navigation/position    trolley position (navigation contract)
+    GET  /api/v1/navigation/map         map metadata (dims from the scene)
+    GET  /api/v1/navigation/scene       static obstacles (navigation contract)
     GET  /  -> web UI
 
 State is kept in memory and broadcast on MQTT `<base>/state` (retained).
@@ -61,6 +64,16 @@ STATUS = {}           # device_id -> status dict
 SCENE = scene_mod.default_scene()   # room + anchors + obstacles (3D editor)
 NLOS = {}             # (anchor_id, tag_id) -> {"blocked","atten","sigma","bias"}
 NLOS_ENABLED = True   # inflate sigma / bias for blocked paths
+
+# --- navigation integration (wideband-navigation contract) ------------------
+# These constants mirror navigation_core/docs/data_contract.md + integration.md.
+# The navigation core consumes processed positions (x_m, y_m, quality, valid)
+# and a static scene envelope (scene.room + scene.obstacles) — never raw ranges.
+NAV_SCHEMA_VERSION = 1
+NAV_TROLLEY_ID = "TROLLEY_01"
+NAV_FRAME_ID = "smart_market_map"
+NAV_MAP_ID = "SMART_MARKET_MAIN"
+NAV_MAP_VERSION = 1
 
 # --- OTA -------------------------------------------------------------------
 # Each device gets its own key. It is generated here, stored with the device
@@ -148,6 +161,16 @@ APP = Flask(__name__)
 
 def now_ms():
     return int(time.time() * 1000)
+
+
+def monotonic_ms():
+    """Monotonic milliseconds for the navigation position contract.
+
+    navigation's `timestamp_ms` is used only for staleness detection, so it
+    must be a monotonic (uptime) clock rather than wall time — a clock change
+    would otherwise age a fresh sample out instantly or keep a stale one alive.
+    """
+    return time.monotonic_ns() // 1_000_000
 
 
 def device_id_of(cfg):
@@ -782,6 +805,44 @@ def broadcast_state():
 
 
 # ---------------------------------------------------------------------------
+# Navigation position over MQTT (push transport)
+#
+# The trolley can consume positions two ways: HTTP pull (GET
+# /api/v1/navigation/position) or MQTT push. This thread publishes the same
+# navigation position-contract document to `<base>/navigation/position` at
+# NAV_POS_PUSH_HZ. It never publishes `valid:false` samples: on a drop-out the
+# navigation core treats a missing sample as stale and enters POSITION_LOST,
+# which is safer than pushing a repeated stale value.
+# ---------------------------------------------------------------------------
+NAV_POS_PUSH_HZ = 10.0
+NAV_POS_PUSH_INTERVAL_S = 1.0 / NAV_POS_PUSH_HZ
+NAV_POS_TOPIC_SUFFIX = "/navigation/position"
+
+_nav_pos_thread = None
+_nav_pos_stop = threading.Event()
+
+
+def _nav_position_push_loop():
+    while not _nav_pos_stop.is_set():
+        doc = _nav_position_doc()
+        if doc is not None and doc["valid"]:
+            mqtt_publish(cfg['mqtt']['base_topic'] + NAV_POS_TOPIC_SUFFIX,
+                         json.dumps(doc))
+        _nav_pos_stop.wait(NAV_POS_PUSH_INTERVAL_S)
+
+
+def start_nav_position_push():
+    global _nav_pos_thread
+    if _nav_pos_thread is not None:
+        return
+    _nav_pos_thread = threading.Thread(target=_nav_position_push_loop,
+                                       name="nav-position-push", daemon=True)
+    _nav_pos_thread.start()
+    print(f"[nav] publishing position to MQTT "
+          f"'{cfg['mqtt']['base_topic']}{NAV_POS_TOPIC_SUFFIX}' @ {NAV_POS_PUSH_HZ} Hz")
+
+
+# ---------------------------------------------------------------------------
 # MQTT (paho)
 # ---------------------------------------------------------------------------
 
@@ -1362,6 +1423,168 @@ def api_position():
 
 
 # ---------------------------------------------------------------------------
+# navigation integration (wideband-navigation contract)
+#
+# The trolley (wideband-navigation) consumes the *processed* position and the
+# *static* scene, never raw ranges. Position is polled periodically (~10 Hz
+# target); the scene is fetched once per navigation session / map change.
+# ---------------------------------------------------------------------------
+
+def _nav_select_tag(requested):
+    """Pick the tag that becomes `TROLLEY_01`. An explicit `?tag=` wins; with
+    several online tags the most recent one is used, otherwise the first."""
+    with LOCK:
+        now = now_ms()
+        entries = list(TAG_POS.items())
+
+    if requested:
+        for tag, p in entries:
+            if tag == requested:
+                return tag, p
+        return None, None
+
+    # Prefer the tag with the freshest position that is still considered online.
+    fresh = [(tag, p) for tag, p in entries if now - p.get("ts", 0) < STALE_MS]
+    if fresh:
+        return max(fresh, key=lambda item: item[1].get("ts", 0))
+    if entries:
+        return entries[0]
+    return None, None
+
+
+def _nav_quality(p):
+    """EKF confidence clamped to [0, 1] and made JSON-finite."""
+    try:
+        quality = float(p.get("conf", 0.0))
+    except (TypeError, ValueError):
+        quality = 0.0
+    if not math.isfinite(quality):
+        quality = 0.0
+    return min(max(quality, 0.0), 1.0)
+
+
+def _nav_position_doc(requested=None, timestamp_ms=None):
+    """Build the navigation position-contract dict (or None when no tag exists).
+
+    Shared by the REST endpoint and the periodic MQTT push so both transports
+    emit byte-identical payloads. `timestamp_ms` defaults to a fresh monotonic
+    stamp when not supplied (the MQTT publisher batches one stamp per publish).
+    """
+    tag, p = _nav_select_tag(requested)
+    if tag is None:
+        return None
+
+    online = now_ms() - p.get("ts", 0) < STALE_MS
+    return {
+        "schema_version": NAV_SCHEMA_VERSION,
+        "trolley_id": NAV_TROLLEY_ID,
+        "frame_id": NAV_FRAME_ID,
+        "timestamp_ms": timestamp_ms if timestamp_ms is not None else monotonic_ms(),
+        "position": {"x_m": p["x"], "y_m": p["y"]},
+        "quality": _nav_quality(p),
+        "valid": online,
+    }
+
+
+def _nav_map_doc():
+    """Map metadata in the navigation /map contract, sourced from the scene."""
+    with LOCK:
+        room = dict(SCENE["room"])
+    return {
+        "map_id": NAV_MAP_ID,
+        "map_version": NAV_MAP_VERSION,
+        "frame_id": NAV_FRAME_ID,
+        "width_m": room["width"],
+        "height_m": room["depth"],
+        "origin_x_m": 0.0,
+        "origin_y_m": 0.0,
+    }
+
+
+def _nav_scene_doc():
+    """Static obstacle scene in the navigation scene contract (rot in radians)."""
+    with LOCK:
+        room = dict(SCENE["room"])
+        obstacles = list(SCENE.get("obstacles", []))
+
+    out_obstacles = []
+    for ob in obstacles:
+        # Positioning stores `rot` in degrees (scene.py). Navigation's obstacle
+        # parser reads `rot` directly as radians, so convert here at the
+        # integration boundary. This keeps positioning's stored unit and the
+        # UI (which labels the field "Rotation (°)") unchanged.
+        try:
+            rot_rad = math.radians(float(ob.get("rot", 0.0)))
+        except (TypeError, ValueError):
+            rot_rad = 0.0
+        out_obstacles.append({
+            "id": ob.get("id"),
+            "label": ob.get("label", ""),
+            "x": ob.get("x", 0.0),
+            "y": ob.get("y", 0.0),
+            "z": ob.get("z", 0.0),
+            "sx": ob.get("sx", 0.0),
+            "sy": ob.get("sy", 0.0),
+            "sz": ob.get("sz", 0.0),
+            "rot": rot_rad,
+            "atten": ob.get("atten", 1.0),
+        })
+
+    return {
+        "schema_version": NAV_SCHEMA_VERSION,
+        "map_id": NAV_MAP_ID,
+        "map_version": NAV_MAP_VERSION,
+        "frame_id": NAV_FRAME_ID,
+        "scene": {
+            "room": {"width": room["width"], "depth": room["depth"]},
+            "obstacles": out_obstacles,
+        },
+        "nlos_enabled": NLOS_ENABLED,
+    }
+
+
+@APP.route("/api/v1/navigation/position", methods=["GET"])
+def api_navigation_position():
+    """Current trolley position in the navigation position contract.
+
+    Response (single JSON object, no envelope):
+        {"schema_version":1,"trolley_id":"TROLLEY_01","frame_id":"smart_market_map",
+         "timestamp_ms":<monotonic ms>,"position":{"x_m":..,"y_m":..},
+         "quality":..,"valid":bool}
+    `valid` is false when no tag is online (position is stale/missing), so the
+    navigation core rejects it instead of driving on a dead estimate.
+    """
+    doc = _nav_position_doc(request.args.get("tag"))
+    if doc is None:
+        return jsonify({"ok": False,
+                        "error": "no tag position available"}), 404
+    return jsonify(doc)
+
+
+@APP.route("/api/v1/navigation/map", methods=["GET"])
+def api_navigation_map():
+    """Map metadata (dimensions/version/frame) sourced from the 3D scene.
+
+    navigation loads this once at startup so its map rectangle always matches
+    the positioning room instead of being hard-coded in config/map.json.
+    """
+    return jsonify(_nav_map_doc())
+
+
+@APP.route("/api/v1/navigation/scene", methods=["GET"])
+def api_navigation_scene():
+    """Static obstacle scene in the navigation scene contract.
+
+    Mirrors the GET /api/v1/scene envelope but drops the positioning-only
+    fields (anchors, tag_z, device_positions) and adds `map_id` /
+    `map_version` / `frame_id` so navigation can version-check the map before
+    enabling motion. `rot` is converted to radians here (positioning stores
+    degrees; navigation's parser reads radians).
+    """
+    return jsonify(_nav_scene_doc())
+
+
+# ---------------------------------------------------------------------------
 # web UI
 # ---------------------------------------------------------------------------
 
@@ -1401,6 +1624,7 @@ def main():
     _load_ota_tokens()
     if args.mqtt:
         mqtt_start()
+        start_nav_position_push()
 
     APP.run(host="0.0.0.0", port=args.port, threaded=True)
 

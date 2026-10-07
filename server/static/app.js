@@ -2185,18 +2185,37 @@ async function applyScreenPolicy() {
    ========================================================================== */
 let apiInfo = null;
 
+const API_METHOD_ORDER = ['GET', 'POST', 'PUT'];
+
 async function renderApi() {
   const host = $('apilist');
   try {
     apiInfo = await (await fetch('/api/v1/meta')).json();
   } catch (e) { host.innerHTML = '<p class="muted">Server unreachable.</p>'; return; }
 
-  host.innerHTML = apiInfo.endpoints.map((e, i) => `
-    <div class="ep" style="--i:${i}">
-      ${e.methods.map((m) => `<span class="m ${m}">${m}</span>`).join('')}
-      <span class="p">${esc(e.path)}</span>
-      ${e.doc ? `<div class="d">${esc(e.doc)}</div>` : ''}
-    </div>`).join('');
+  // Group endpoints by HTTP method so the tab reads like a reference card
+  // (GET / POST / PUT sections) instead of a flat, alphabetical dump.
+  const groups = new Map();
+  for (const e of apiInfo.endpoints) {
+    const m = e.methods.find((x) => API_METHOD_ORDER.includes(x)) || e.methods[0] || 'GET';
+    if (!groups.has(m)) groups.set(m, []);
+    groups.get(m).push(e);
+  }
+
+  let html = '';
+  for (const m of API_METHOD_ORDER) {
+    const eps = groups.get(m);
+    if (!eps || eps.length === 0) continue;
+    html += `<section class="api-group"><h4 class="api-method api-method-${m.toLowerCase()}">${m}</h4>`;
+    html += eps.map((e, i) => `
+      <div class="ep" style="--i:${i}">
+        ${e.methods.map((mm) => `<span class="m ${mm}">${mm}</span>`).join('')}
+        <span class="p">${esc(e.path)}</span>
+        ${e.doc ? `<div class="d">${esc(e.doc)}</div>` : ''}
+      </div>`).join('');
+    html += '</section>';
+  }
+  host.innerHTML = html;
 
   const base = (S.scene && S.state && S.state.site) || 'uwb/home';
   $('mqtttopics').innerHTML = `
@@ -2206,7 +2225,8 @@ async function renderApi() {
     <tr><td><code>uwb/home/status/&lt;id&gt;</code></td><td>device → server</td></tr>
     <tr><td><code>uwb/home/config/&lt;id&gt;</code></td><td>server → device</td></tr>
     <tr><td><code>uwb/home/cmd/&lt;id&gt;</code></td><td>server → device</td></tr>
-    <tr><td><code>uwb/home/state</code></td><td>server → all</td></tr>`;
+    <tr><td><code>uwb/home/state</code></td><td>server → all</td></tr>
+    <tr><td><code>uwb/home/navigation/position</code></td><td>server → all</td></tr>`;
 }
 
 /* ==========================================================================
