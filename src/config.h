@@ -9,12 +9,20 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+
+// MAX_DEVICES must be defined BEFORE including DW1000Ranging.h. That library
+// also #defines it (to 4), and without a guard it wins the include order: our
+// 10 here is skipped, so "id 1..4" passed while "id 5..10" printed
+// "id must be 1..10". The real value comes from -DMAX_DEVICES=10 in
+// platformio.ini (so the library's own .cpp sees it too); this #ifndef simply
+// keeps the header self-contained and avoids a redefinition.
+#ifndef MAX_DEVICES
+#define MAX_DEVICES 10      // ids 1..10 for both roles
+#endif
+
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.30"
-#ifndef MAX_DEVICES
-#define MAX_DEVICES     10      // ids 1..10 for both roles
-#endif
+#define FW_VERSION      "1.0.31"
 #define MAX_ANCHORS     10
 #define MAX_TAGS        10
 // Prefix for the setup access point. The advertised name is this plus a

@@ -46,7 +46,12 @@
 #define LEN_DATA 90
 
 //Max devices we put in the networkDevices array ! Each DW1000Device is 74 Bytes in SRAM memory for now.
+// Guarded so the project can raise it via -DMAX_DEVICES=10: this vendored
+// header compiles on its own (Ranging.cpp does not include config.h), so a
+// bare #define here would force 4 everywhere and silently reject IDs 5..10.
+#ifndef MAX_DEVICES
 #define MAX_DEVICES 4
+#endif
 
 //Default Pin for module:
 #define DEFAULT_RST_PIN 9
