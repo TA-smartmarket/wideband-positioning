@@ -16,10 +16,10 @@ Semua tautan di bawah sudah dicoba dan berhasil diunduh (status 200, header `%PD
 | 6 | `06_Yao_2021_Indoor_Positioning_Accuracy_UWB.pdf` | 2021 | Sensors 21(17):5731 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-21-05731/article_deploy/sensors-21-05731.pdf) · [DOI](https://doi.org/10.3390/s21175731) | [PMC8433727](https://pmc.ncbi.nlm.nih.gov/articles/PMC8433727/) |
 | 7 | `07_Kramaric_2025_Anchor_Placement_Localization.pdf` | 2025 | Sensors 25(16):5115 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-25-05115/article_deploy/sensors-25-05115.pdf) · [DOI](https://doi.org/10.3390/s25165115) | [PMC12389748](https://pmc.ncbi.nlm.nih.gov/articles/PMC12389748/) |
 | 8 | `08_Yang_2024_CIR_Feature_NLOS_Identification.pdf` | 2024 | Sensors 24(5):1703 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-24-01703/article_deploy/sensors-24-01703.pdf) · [DOI](https://doi.org/10.3390/s24051703) | [PMC10934496](https://pmc.ncbi.nlm.nih.gov/articles/PMC10934496/) |
-| 9 | `09_Kram_2019_UWB_CIR_Features_Complex_Env.pdf` | 2019 | Sensors 19(24):5547 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-19-05547/article_deploy/sensors-19-05547.pdf) · [DOI](https://doi.org/10.3390/s19245547) | — |
-| 10 | `10_Liu_2022_Sensor_Fusion_LowCost_UWB_IMU.pdf` | 2022 | Sensors 22(21):8156 | [PDF](https://res.mdpi.com/d_attachment/sensors/sensors-22-08156/article_deploy/sensors-22-08156.pdf) · [DOI](https://doi.org/10.3390/s22218156) | — |
+| 9 | `09_Hapsari_2025_Modified_DW_Anchor_Self_Calibration.pdf` | 2025 | IJIES 18(5):212–224 | [PDF](https://inass.org/wp-content/uploads/2025/01/2025063016-2.pdf) · [DOI](https://doi.org/10.22266/ijies2025.0630.16) | 212–224 |
+| 10 | `10_Hapsari_2025_UWB_Indoor_Tag_Localization_SMS_SLR.pdf` | 2025 | IEEE Access 13:21827–21852 | [PDF](https://ieeexplore.ieee.org/document/10528315) · [DOI](https://doi.org/10.1109/ACCESS.2024.3399476) | 21827–21852 |
 
-Total: 10 PDF (~32 MB, tidak ikut di-commit — lihat `.gitignore`).
+Total: 10 PDF (~32 MB + ~3 MB, tidak ikut di-commit — lihat `.gitignore`).
 
 ## Catatan tentang tautan
 
@@ -37,10 +37,11 @@ Total: 10 PDF (~32 MB, tidak ikut di-commit — lihat `.gitignore`).
 |---|---|---|
 | Hardware ESP32 + UWB | #1 | Arsitektur paling mirip: ESP32 + modul UWB + EKF |
 | Pelacakan (EKF) | #6, #4 | EKF, gate inovasi, uji Mahalanobis untuk menolak pengukuran |
-| Penanganan NLOS | #2, #3, #8, #9 | Deteksi NLOS, pembobotan, koreksi galat ranging |
+| Penanganan NLOS | #2, #3, #8 | Deteksi NLOS, pembobotan, koreksi galat ranging |
 | Geometri anchor | #7 | PDOP, anchor koplanar, pengaruh penempatan pada akurasi |
+| Self-calibration anchor | #9 | Konsensus Modified Deffuant-Weisbuch + klasifikasi LOS/NLOS/Multipath untuk posisi anchor otomatis |
+| Tren & peta riset | #10 | SMS + SLR, bibliometrik, taksonomi metrik, celah riset UWB indoor tag localization |
 | Dataset & protokol | #5 | ADS-TWR, dataset CIR, arsitektur MQTT |
-| Pengembangan lanjutan | #10 | Fusi UWB + IMU |
 
 Tabel review lengkap (format 8 kolom): [`../Jurnal_UWB_Indoor_Positioning.docx`](../Jurnal_UWB_Indoor_Positioning.docx)
 
