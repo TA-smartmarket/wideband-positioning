@@ -22,7 +22,7 @@
 
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.34"
+#define FW_VERSION      "1.0.35"
 #define MAX_ANCHORS     10
 #define MAX_TAGS        10
 // Prefix for the setup access point. The advertised name is this plus a

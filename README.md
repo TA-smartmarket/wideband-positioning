@@ -193,6 +193,7 @@ mode <nama>                mode PHY UWB (lihat 'show')
 filter on|off              filter smoothing jarak
 rate <ms>                  interval telemetry
 save                       simpan ke NVS
+portal [off]               buka/tutup setup portal (sama dengan tahan BOOT 3 s)
 reboot                     restart
 reset                      hapus config & reboot
 ```
@@ -210,10 +211,25 @@ save
 ```
 
 #### 4c. Lewat Setup Portal (AP)
-Saat pertama boot (belum ada config), board membuka **AP `UWB-Setup`**:
-1. HP/laptop → Wi-Fi → join **UWB-Setup**.
+Board membuka **AP `UWB-Setup-XXXX`** (4 digit unik per board, tertulis di
+OLED) bila:
+- belum ada config sama sekali (pertama boot), atau
+- Wi-Fi yang tersimpan tidak bisa disambungi selama ~20 detik
+  (mis. pindah ke jaringan lain), atau
+- dibuka manual: **tahan tombol BOOT 3 detik**, atau ketik `portal` di serial
+  (berguna untuk memindah satu board ke Wi-Fi baru tanpa mematikan yang lain).
+
+1. HP/laptop → Wi-Fi → join **UWB-Setup-XXXX** sesuai OLED board itu.
 2. Buka **`http://192.168.4.1`** → form serupa dengan web UI → isi → Save.
 3. Board reboot dengan config baru.
+
+**Semua board boleh dinyalakan bersamaan** (firmware ≥ 1.0.35). Selama portal
+terbuka, ranging UWB board itu dijeda dan board berhenti mencoba Wi-Fi lama
+selama ada HP tersambung ke portal. Sebelumnya, percobaan konek ulang tiap
+10 detik membuat access point pindah kanal sehingga HP terus terputus, dan tag
+yang sedang ranging membuat anchor crash (≤ 1.0.32), sehingga setup harus
+dilakukan satu per satu. Portal manual menutup sendiri setelah Save,
+`portal off`, atau 10 menit.
 
 ### Langkah 5 — Lihat Tracking-nya
 

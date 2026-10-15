@@ -33,6 +33,9 @@ struct Net {
     bool  wifi_up   = false;
     bool  mqtt_up   = false;
     bool  portal_on = false;
+    bool  portal_forced = false;     // opened by hand (serial / BOOT button)
+    unsigned long portal_since = 0;
+    bool  sta_paused = false;        // station stopped while a phone is on the portal
     unsigned long last_retry = 0;
     unsigned long last_cfg   = 0;
     uint32_t cfg_version = 0;
@@ -198,20 +201,29 @@ inline void syncConfigFromServer(bool force = false)
 // So: bring up WiFi (AP) first, give lwIP a moment, then begin() the server.
 // WIFI_AP_STA keeps the STA connection attempt alive while the portal is up.
 
-inline void portalStart()
+// forced = opened by hand (serial "portal" / BOOT held 3 s): it stays open even
+// while the node is on the network, until a save, "portal off" or 10 minutes.
+inline void portalStart(bool forced = false)
 {
-    if (net.portal_on) return;
+    if (net.portal_on) { net.portal_forced |= forced; return; }
 
     char ssid[48];
     apSsid(ssid, sizeof(ssid));
     const uint8_t ch = apChannel();
 
+    // The station's automatic reconnect rescans every channel after each
+    // failure and drags the soft-AP along, which dropped the phone on the
+    // portal over and over. wifiLoop() retries on its own, gently, instead.
+    WiFi.setAutoReconnect(false);
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(ssid, nullptr, ch);
     delay(300);                 // let the AP + lwIP come up before opening the socket
     g_portal.begin();
     net.portal_on = true;
-    Serial.printf("[ap] setup portal '%s' ch%u at http://192.168.4.1\n", ssid, ch);
+    net.portal_forced = forced;
+    net.portal_since = millis();
+    Serial.printf("[ap] setup portal '%s' ch%u at http://192.168.4.1%s\n", ssid, ch,
+                  forced ? " (opened by hand)" : "");
 }
 
 // Close the portal AND drop the access point. Previously the WebServer was
@@ -224,7 +236,10 @@ inline void portalStop()
     WiFi.softAPdisconnect(true);
     // back to plain station mode once we are on the network
     if (net.wifi_up) WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     net.portal_on = false;
+    net.portal_forced = false;
+    net.sta_paused = false;
     Serial.println("[ap] portal closed, access point down");
 }
 
@@ -256,6 +271,14 @@ inline void wifiLoop()
     static unsigned long last = 0;
     static uint8_t fails = 0;
 
+    // A portal opened by hand closes itself after 10 minutes once the node is
+    // on the network anyway, so an open AP is never left behind.
+    if (net.portal_on && net.portal_forced && net.wifi_up &&
+        millis() - net.portal_since > 600000UL) {
+        Serial.println(F("[ap] manual portal timed out"));
+        portalStop();
+    }
+
     if (net.wifi_up) {
         if (WiFi.status() != WL_CONNECTED) {
             net.wifi_up = false;
@@ -264,7 +287,8 @@ inline void wifiLoop()
         // Safety net: if the soft-AP is still broadcasting (e.g. it was started
         // before WiFi came up), take it down now. Otherwise "UWB-Setup" lingers
         // on the air forever after the node has joined the real network.
-        if (WiFi.getMode() == WIFI_AP_STA || WiFi.getMode() == WIFI_AP)
+        // A portal opened by hand is left alone (it is being used).
+        if (!net.portal_forced && (WiFi.getMode() == WIFI_AP_STA || WiFi.getMode() == WIFI_AP))
             portalStop();
         return;
     }
@@ -272,14 +296,38 @@ inline void wifiLoop()
         net.wifi_up = true;
         fails = 0;
         Serial.printf("[wifi] connected, ip %s\n", WiFi.localIP().toString().c_str());
-        portalStop();                        // reached the network, drop the AP
+        if (!net.portal_forced) portalStop();   // reached the network, drop the AP
         syncConfigFromServer(true);
         return;
     }
-    if (millis() - last > 10000) {           // retry; after 3 tries open the portal
+
+    // While a phone is on the setup portal the station must leave the radio
+    // alone: every connection attempt scans all channels and the soft-AP has
+    // to follow, so the phone was dropped every 10 s and the portal page kept
+    // failing. Retry only once nobody is connected to the portal.
+    if (net.portal_on && WiFi.softAPgetStationNum() > 0) {
+        if (!net.sta_paused) {
+            WiFi.disconnect();
+            net.sta_paused = true;
+            Serial.println(F("[wifi] portal in use: station paused"));
+        }
         last = millis();
-        if (cfg.wifi_ssid[0]) { WiFi.disconnect(); WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass); WiFi.setSleep(false); }
-        if (++fails >= 3 && !net.portal_on) {
+        return;
+    }
+
+    // Retry the network: every 10 s normally, the portal opens after the
+    // second failure (~20 s); with the portal open only once a minute, since
+    // each attempt briefly disturbs the access point.
+    const unsigned long every = net.portal_on ? 60000UL : 10000UL;
+    if (millis() - last > every) {
+        last = millis();
+        if (cfg.wifi_ssid[0]) {
+            WiFi.disconnect();
+            WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
+            WiFi.setSleep(false);
+            net.sta_paused = false;
+        }
+        if (++fails >= 2 && !net.portal_on) {
             Serial.println(F("[wifi] cannot connect -> starting setup portal"));
             portalStart();
         }

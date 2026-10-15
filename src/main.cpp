@@ -35,6 +35,7 @@ PubSubClient g_mqtt(g_wifi_client);
 WebServer    g_portal(80);
 WebServer    g_ota(3232);
 bool         ota_busy = false;   // set while an OTA download is running
+bool         radio_started = false;  // DW1000 initialised (role tag/anchor)
 char         eui_buf[40] = {0};  // this node's EUI, for restarting the radio
 
 
@@ -50,6 +51,7 @@ char         eui_buf[40] = {0};  // this node's EUI, for restarting the radio
 #define I2C_SDA  4
 #define I2C_SCL  5
 #define OLED_ADDR 0x3C
+#define BOOT_BTN  0          // the BOOT button; held 3 s it opens the setup portal
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
@@ -877,6 +879,7 @@ void printHelp()
         "  screen auto <sec>    idle seconds before dim/off (0 = never)\n"
         "  rate <ms>            telemetry interval\n"
         "  save                 persist to NVS\n"
+        "  portal [off]         open/close the setup portal (or hold BOOT 3 s)\n"
         "  reboot               restart\n"
         "  reset                erase config and reboot\n"
         "============================\n"));
@@ -994,6 +997,13 @@ void handleSerial()
         else if (!strcmp(cmd, "filter") && a1) cfg.range_filter = !strcmp(a1, "on");
         else if (!strcmp(cmd, "rate") && a1) cfg.update_ms = (uint16_t)atoi(a1);
         else if (!strcmp(cmd, "save")) { configSave(cfg); Serial.println("saved"); }
+        else if (!strcmp(cmd, "portal")) {
+            if (a1 && !strcmp(a1, "off")) portalStop();
+            else {
+                portalStart(true);
+                Serial.println(F("portal stays open until a save, 'portal off' or 10 min"));
+            }
+        }
         else if (!strcmp(cmd, "reboot")) { Serial.println("rebooting"); delay(100); ESP.restart(); }
         else if (!strcmp(cmd, "reset")) { configClear(); Serial.println("cleared, rebooting"); delay(200); ESP.restart(); }
         else Serial.println("unknown command, type ? for help");
@@ -1052,6 +1062,9 @@ void portalRegister()
         cfg.pos_y = g_portal.arg("py").toFloat();
         if (g_portal.arg("rw").toFloat() > 0) cfg.room_w = g_portal.arg("rw").toFloat();
         if (g_portal.arg("rh").toFloat() > 0) cfg.room_h = g_portal.arg("rh").toFloat();
+        // NVS write with the radio quiet (same reason as onServerConfig);
+        // the node restarts right after, which brings ranging back.
+        if (radio_started) otaQuiesceRadio();
         configSave(cfg);
 
         g_portal.send(200, "text/html",
@@ -1260,6 +1273,7 @@ void setup()
     Serial.printf("firmware %s\n", FW_VERSION);
 
     configLoad(cfg);
+    pinMode(BOOT_BTN, INPUT_PULLUP);
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -1310,19 +1324,51 @@ void setup()
         DW1000Ranging.startAsTag(eui, uwbModeBytes(cfg.uwb_mode), false);
     else
         DW1000Ranging.startAsAnchor(eui, uwbModeBytes(cfg.uwb_mode), false);
+    radio_started = true;
 
     wifiBegin();
     printHelp();
 }
 
+// Hold BOOT for 3 s to open the setup portal by hand, e.g. to move one node to
+// a new WiFi network while the others keep running. No serial cable needed.
+void bootButtonLoop()
+{
+    static unsigned long down_since = 0;
+    static bool fired = false;
+    if (digitalRead(BOOT_BTN) == LOW) {
+        if (!down_since) down_since = millis();
+        if (!fired && millis() - down_since > 3000) {
+            fired = true;
+            screenWake();
+            portalStart(true);
+        }
+    } else {
+        down_since = 0;
+        fired = false;
+    }
+}
+
 void loop()
 {
     handleSerial();
+    bootButtonLoop();
     portalLoop();
 
     if (cfg.role == ROLE_NONE) { delay(10); return; }
 
-    DW1000Ranging.loop();
+    // While the setup portal is open the node is being configured: ranging is
+    // paused so the tag and the anchors stop exchanging frames with it and the
+    // loop stays free for the portal page. Before this, powering every board
+    // at once meant the portal never became usable. Ranging resumes by itself
+    // once the portal closes (the library re-arms the receiver on inactivity).
+    static bool uwb_paused = false;
+    if (net.portal_on != uwb_paused) {
+        uwb_paused = net.portal_on;
+        Serial.println(uwb_paused ? F("[uwb] paused while the setup portal is open")
+                                  : F("[uwb] resumed"));
+    }
+    if (!uwb_paused) DW1000Ranging.loop();
     screenPowerLoop();
     wifiLoop();
     otaBegin();
