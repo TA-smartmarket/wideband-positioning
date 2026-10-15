@@ -13,6 +13,14 @@ tidak mempengaruhi hasil pengukuran; penjelasannya ada di komentar kode.
 Konvensi: koordinat ruang 2D `(x, y)` dalam meter, `z` untuk tinggi.
 Anchor = pemancar tetap dengan posisi diketahui; tag = perangkat yang dicari.
 
+> **Pembaruan Oktober 2026.** Tracker di **server** sudah diganti
+> (`server/tracker.py`): setiap sampel dipakai sekali pada waktu ukurnya, model
+> pengukuran memakai jarak miring langsung, state EKF ditambah offset jarak
+> bersama `b`, gate keras diganti update robust (Huber), dan bug tanda pada
+> least-squares §5 diperbaiki. Bagian §3–§6 di bawah masih menjelaskan
+> pipeline **device** (fallback). Penjelasan versi server dan buktinya:
+> [`PERBAIKAN_AKURASI.md`](PERBAIKAN_AKURASI.md).
+
 ## Daftar isi
 
 1. [Ikhtisar alur data](#1-ikhtisar-alur-data)
@@ -642,21 +650,25 @@ ini perlu ditinjau ulang.
 | `MAX_JUMP_M` | 5,0 m | `main.cpp` | lebih kecil = lebih agresif buang |
 | `RANGE_HIST` | 3 | `main.cpp` | lebih besar = lebih halus, lebih lambat |
 | `EMA_ALPHA` | 0,35 | `main.cpp` | →1 = ikut mentah, →0 = makin halus |
-| `sigma_a` | 1,0 m/s² | `ekf.h`, `app.py` | lebih besar = lebih responsif, lebih berisik |
-| `sigma_r` | 0,15 m | `ekf.h`, `app.py` | lebih besar = lebih percaya pengukuran |
-| `gate_sigma` | 3,0 | `ekf.h`, `app.py` | lebih kecil = lebih selektif |
+| `sigma_a` | 1,0 m/s² (device) · **0,8** (server) | `ekf.h`, `tracker.py` | lebih besar = lebih responsif, lebih berisik |
+| `sigma_r` | 0,15 m (device) · **0,12** (server) | `ekf.h`, `tracker.py` | lebih besar = **kurang** percaya pengukuran (lebih halus, lebih lambat) |
+| `gate_sigma` | 3,0 (device) | `ekf.h` | lebih kecil = lebih selektif |
+| `huber_k` / `gate` | 2,5 / 6,0 (server) | `tracker.py` | batas mulai down-weight / batas tolak |
+| `estimate_bias` | 1 (server) | `tracker.py` | estimasi offset jarak bersama (≥ 3 anchor) |
 | `nlos_factor` | 8,0 | `scene.py` | sigma maksimum saat terhalang penuh |
 | `bias_m` | 0,35 m | `scene.py` | koreksi NLOS positif |
 | `tag_z` (tinggi tag) | **1,3 m** | UI Setup → `scene.py` | tinggi tag saat memproyeksikan jarak; **atur ini sesuai ukuran sebenarnya** |
 | cap kovarians | 25 / 9 | `ekf.h`, `app.py` | batas P posisi / kecepatan |
-| threshold self-healing | 8 siklus | `app.py` | kecepatan pemulihan |
-| `update_ms` | 200 ms | `config.h` | laju siklus; mempengaruhi `dt` EKF |
+| threshold self-healing | 8 siklus (device) · 1,5 s tanpa sampel diterima (server) | `main.cpp`, `tracker.py` | kecepatan pemulihan |
+| `update_ms` | 200 ms | `config.h` | interval uplink tag (anchor 5×); FW ≤ 1.0.31 mengirim tiap 5× |
 
 **Catatan penyetelan.** `sigma_a` dan `sigma_r` menentukan **rasio kepercayaan**
-antara model gerak dan pengukuran. Menaikkan `sigma_r` membuat filter lebih
-mengikuti pengukuran (responsif, tapi berisik); menaikkan `sigma_a` membuat
-filter lebih mengikuti model (halus, tapi lambat bereaksi). Rasio inilah yang
-paling sering perlu disetel saat pengujian lapangan, bukan nilai absolutnya.
+antara model gerak dan pengukuran. Menaikkan `sigma_a` membuat filter lebih
+mengikuti pengukuran (responsif, tapi berisik); menaikkan `sigma_r` membuat
+filter lebih mengikuti model gerak (halus, tapi lambat bereaksi). Rasio inilah
+yang paling sering perlu disetel saat pengujian lapangan, bukan nilai
+absolutnya — dan sekarang bisa dicoba pada data rekaman yang sama:
+`python tools/evaluate.py LOG --path ... --replay --set sigma_a=1.2`.
 
 ---
 

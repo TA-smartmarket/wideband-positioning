@@ -22,7 +22,7 @@
 
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.31"
+#define FW_VERSION      "1.0.34"
 #define MAX_ANCHORS     10
 #define MAX_TAGS        10
 // Prefix for the setup access point. The advertised name is this plus a
@@ -293,6 +293,35 @@ inline void configSave(const Config &c)
     p.putUShort("ota_port", c.ota_port);
     p.putString("ota_tok", c.ota_token);
     p.end();
+}
+
+// Digest of every persisted field, member by member (no memcmp: struct padding
+// is undefined). Used to skip the NVS write when a config push carries the
+// values the node already has -- see onServerConfig().
+inline uint32_t configDigest(const Config &c)
+{
+    uint32_t h = 2166136261u;
+    auto mix = [&h](const void *p, size_t n) {
+        const uint8_t *b = static_cast<const uint8_t *>(p);
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    };
+    auto str = [&mix](const char *s) { mix(s, strlen(s) + 1); };
+    mix(&c.role, sizeof(c.role)); mix(&c.id, sizeof(c.id)); str(c.site);
+    str(c.wifi_ssid); str(c.wifi_pass); str(c.server_url); str(c.api_token);
+    mix(&c.mqtt_enabled, sizeof(c.mqtt_enabled)); str(c.mqtt_host);
+    mix(&c.mqtt_port, sizeof(c.mqtt_port)); str(c.mqtt_user); str(c.mqtt_pass);
+    str(c.mqtt_base);
+    mix(&c.pos_x, sizeof(c.pos_x)); mix(&c.pos_y, sizeof(c.pos_y));
+    mix(&c.pos_z, sizeof(c.pos_z));
+    mix(&c.room_w, sizeof(c.room_w)); mix(&c.room_h, sizeof(c.room_h));
+    mix(&c.uwb_mode, sizeof(c.uwb_mode)); mix(&c.range_filter, sizeof(c.range_filter));
+    mix(&c.update_ms, sizeof(c.update_ms)); str(c.anchor_map);
+    mix(&c.tag_z, sizeof(c.tag_z));
+    mix(&c.screen_mode, sizeof(c.screen_mode));
+    mix(&c.screen_timeout_s, sizeof(c.screen_timeout_s));
+    mix(&c.ota_enabled, sizeof(c.ota_enabled)); mix(&c.ota_port, sizeof(c.ota_port));
+    str(c.ota_token);
+    return h;
 }
 
 inline void configClear()

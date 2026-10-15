@@ -80,9 +80,12 @@ wideband-positioning/
 │   ├── ALGORITHMS.md     # penjelasan matematis tiap algoritma
 │   ├── Jurnal_UWB_Indoor_Positioning.docx   # tabel review 10 jurnal
 │   └── papers/           # PDF 10 paper rujukan + README berisi link
-├── tools/                # build_firmware.py (build + staging OTA), ota_debug.py
+├── tools/                # build_firmware.py (build + staging OTA), ota_debug.py,
+│                         # simulate.py (sebelum/sesudah), evaluate.py (analisis rekaman)
 └── server/
-    ├── app.py            # Flask: REST + MQTT ingest + solver + web UI (1 file)
+    ├── app.py            # Flask: REST + MQTT ingest + web UI + kalibrasi + rekam
+    ├── tracker.py        # engine tracking: dedup sampel, clock sync, EKF 5-state
+    ├── recorder.py       # perekam sesi (server/logs/*.jsonl)
     ├── scene.py          # geometri ruangan, penghalang, klasifikasi LOS/NLOS
     ├── static/           # web UI 3D (Three.js di-vendor di static/vendor/)
     ├── firmware/         # gambar OTA yang sudah di-build
@@ -296,7 +299,6 @@ Base topic default: `uwb/home` (bisa diganti lewat `base <topic>` / `--mqtt-base
 
 | Topic | Arah | Payload |
 |---|---|---|
-| `uwb/home/range` | device → server | satu baris jarak |
 | `uwb/home/telemetry` | device → server | batch telemetry |
 | `uwb/home/status/<device_id>` | device → server | status online (retained) |
 | `uwb/home/config/<device_id>` | server → device | config push (retained) |
@@ -499,67 +501,74 @@ curl -X PUT localhost:8080/api/v1/scene -H 'Content-Type: application/json' -d '
 
 ## ⚙️ Cara Kerja & Logika Penting
 
-Pipeline lokalisasi punya **3 tahap** (identik di device dan server):
+> Pipeline server ditulis ulang pada Oktober 2026 karena lintasan zig-zag.
+> Akar masalah, bukti simulasi sebelum/sesudah, dan protokol uji ada di
+> [`docs/PERBAIKAN_AKURASI.md`](docs/PERBAIKAN_AKURASI.md).
 
-### 1. Pre-filter (buang sampel liar)
-Filter bawaan library DW1000 **dimatikan sengaja** — itu low-pass yang menyimpan
-nilai sebelumnya di dalam `DW1000Device`, jadi satu sampel buruk diumpan-balik
-terus dan jarak melenceng jauh (terbukti di hardware: 1,5 m → 248 m). Diganti
-filter sendiri:
-- **outlier gate** — tolak lompatan > 5 m dari estimasi sekarang
-- **median-of-3** — buang spike satu sampel
-- **EMA ringan** (α = 0,35) untuk penghalusan
+### 1. Pengukuran (firmware ≥ 1.0.32)
+Setiap hasil two-way ranging masuk antrean dan dikirim **sekali** ke server,
+lengkap dengan nilai mentah (`raw`), waktu ukur (`ts`, `millis()` device) dan
+nomor urut (`seq`). Tag mengirim tiap 200 ms, anchor tiap 1 s.
 
-### 2. Bootstrap (fix pertama)
-Geometri tertutup:
-- **2 anchor** → perpotongan dua lingkaran = 2 kandidat cermin; dipilih yang
-  masuk batas ruangan. Kalau dua-duanya di dalam/luar → `ambiguous`.
-- **3+ anchor** → least-squares + 2 iterasi Gauss-Newton.
+Filter bawaan library DW1000 **dimatikan sengaja** — itu low-pass yang
+menyimpan nilai sebelumnya di dalam `DW1000Device`, jadi satu sampel buruk
+diumpan-balik terus (terbukti di hardware: 1,5 m → 248 m). Device masih
+menghitung versi ter-filter (gate 5 m + median-3 + EMA 0,35) untuk OLED dan
+solver lokal; server memakai nilai mentah.
 
-### 3. Tracking — **Extended Kalman Filter** (`src/ekf.h`, `server/app.py`)
+### 2. Server: setiap sampel sekali, pada waktunya (`server/tracker.py`)
+- Sampel di-dedup per link berdasarkan timestamp device (firmware lama yang
+  mengirim ulang nilai yang sama juga tertangani).
+- Jam tiap device dipetakan ke jam server (offset latensi minimum), dan EKF
+  memprediksi ke waktu ukur sebelum update.
+- Tag dan anchor sama-sama melaporkan hasil TWR yang sama; salinan tag yang
+  dipakai.
 
-Setelah fix pertama ada, **EKF** yang jalan. Disebut *Extended* karena model
-pengukurannya non-linear (jarak = akar kuadrat posisi):
-
-```
-State     : x = [ px, py, vx, vy ]ᵀ        posisi (m) + kecepatan (m/s)
-Gerak     : constant velocity,  x ← F x ,  P ← F P Fᵀ + Q
-Pengukuran: h(x) = √((px-ax)² + (py-ay)²)          ← non-linear
-Jacobian  : H = [ (px-ax)/d , (py-ay)/d , 0 , 0 ]  ← linearisasi
-Update    : y = z - h(x) ; S = H P Hᵀ + σr² ; K = P Hᵀ/S
-            x ← x + K y ; P ← (I - K H) P
-```
-
-- **Innovation gating**: pengukuran ditolak bila `|y| > 3·√S` (outlier NLOS /
-  pantulan), jadi estimasi tidak rusak — filter lanjut pakai model gerak.
-- **Tuning**: `σa = 1,0 m/s²` (proses), `σr = 0,15 m` (noise jarak).
-- **Confidence** = `1/(1+σ)` dengan `σ = √(P₀₀+P₁₁)` — makin banyak data
-  masuk, makin kecil σ, makin tinggi confidence (otomatis).
-- **Bonus**: EKF membawa state sebelumnya, jadi masalah **cermin 2-anchor tidak
-  bisa membalik** estimasi antar-siklus.
-
-Verifikasi (server, lintasan sintetis y = 1,0 → 1,6 m):
+### 3. Tracking — **Extended Kalman Filter** dengan bias jarak
 
 ```
-step 0  true_y=1.0 -> x=1.99 y=1.12  vy=0.00  sigma=0.270  used=2
-step 1  true_y=1.2 -> x=2.01 y=1.03  vy=-0.28 sigma=0.263  used=2
-step 2  true_y=1.4 -> x=2.01 y=1.46  vy=0.73  sigma=0.257  used=2
-step 3  true_y=1.6 -> x=2.01 y=1.64  vy=0.68  sigma=0.202  used=2
+State     : x = [ px, py, vx, vy, b ]ᵀ     posisi, kecepatan, offset jarak bersama
+Gerak     : constant velocity (σa = 0,8 m/s²); b random walk lambat
+Pengukuran: h(x) = √((px-ax)² + (py-ay)² + dz²) + b     dz = z_anchor − z_tag
+Jacobian  : H = [ (px-ax)/ρ , (py-ay)/ρ , 0 , 0 , 1 ]
+Update    : y = z − h(x) ; S = H P Hᵀ + σr² ; K = P Hᵀ/S   (σr = 0,12 m)
+            x ← x + K y ; P ← (I−KH) P (I−KH)ᵀ + K σr² Kᵀ   (Joseph)
 ```
+
+- **Jarak miring langsung** dipakai sebagai pengukuran (tanpa proyeksi
+  `√(r² − dz²)` yang memperbesar noise dekat anchor).
+- **`b`** = offset yang sama di semua jarak (delay antena DW1000 yang belum
+  dikalibrasi). Dengan ≥ 3 anchor ia teramati dan diestimasi online, seperti
+  *clock bias* pada GPS.
+- **Robust (Huber)**: inovasi ternormalisasi > 2,5 → noise dibesarkan;
+  > 6 → ditolak. Tidak ada sampel diterima 1,5 s → inisialisasi ulang.
+- **Bootstrap**: multilaterasi Gauss-Newton dari semua anchor.
+- **Kalibrasi per anchor** (`bias`, `scale`) dari titik statis yang diukur
+  dengan meteran laser — lihat bagian 🎯 di bawah.
+- **Confidence** = `1/(1+σ)` dengan `σ = √(P₀₀+P₁₁)`.
+
+Hasil simulasi (30 run, error radio sama untuk semua pipeline,
+`python tools/simulate.py`):
+
+| Pipeline | RMSE | Galat lintasan (XT-RMSE) |
+|---|---|---|
+| Lama (server `1aff68c` + FW 1.0.31) | 144 cm | 53 cm |
+| Baru + FW ≥ 1.0.32 | 23 cm | 13 cm |
+| Baru + FW ≥ 1.0.32 + kalibrasi | 21 cm | 11 cm |
 
 | Tahap | Device (tag) | Server |
 |---|---|---|
-| pre-filter | ya | — |
+| pre-filter | ya (OLED / fallback) | — (pakai `raw`) |
 | bootstrap | ya (standalone) | ya |
-| EKF tracking | ya (fallback) | **ya (utama)** |
+| EKF tracking | ya (fallback, model lama) | **ya (utama)** |
 
 ### 4. Tinggi tag — setelan yang paling mudah salah
 
 Radio mengukur jarak **miring 3D** antara anchor di langit-langit dan tag yang
-kamu bawa. Solver bekerja di lantai (2D), jadi komponen vertikal harus dibuang:
+kamu bawa. Posisi dicari di lantai (2D), jadi selisih tinggi masuk ke model:
 
 ```
-r_horizontal = √(r_3D² − (z_anchor − z_tag)²)
+r_3D = √(dx² + dy² + (z_anchor − z_tag)²)
 ```
 
 `z_anchor` kamu isi di editor 3D. **`z_tag` kamu ukur sendiri** di
@@ -585,8 +594,38 @@ Sensitivitasnya, dihitung dari range nyata 3,689 m:
 Detail matematis lengkap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 
 > Karena jarak radio ±10–30 cm noise di dalam ruangan (pantulan), EKF +
-> innovation gate sangat membantu. Kalau posisi masih melompat, tambahkan
+> update robust sangat membantu. Kalau posisi masih melompat, tambahkan
 > anchor ke-3 (posisi non-kolinear) untuk geometri yang sehat.
+
+---
+
+## 🎯 Kalibrasi & Uji Akurasi
+
+Tanpa motion-capture, ground truth yang bisa dipakai adalah **titik yang
+diukur** (uji statis) dan **lintasan yang diketahui** (garis lakban; galat
+diukur tegak lurus terhadap garis). Protokol lengkap:
+[`docs/PERBAIKAN_AKURASI.md`](docs/PERBAIKAN_AKURASI.md) §4.
+
+1. **Kalibrasi** — Setup → *Calibration & static test*: tag diam di titik yang
+   diukur, isi X/Y → **Measure here** (2–4 titik) → **Apply calibration**.
+2. **Uji statis** — sama, tapi *Keep as calibration point* tidak dicentang;
+   hasilnya mean error, σ, RMSE, CEP50/95.
+3. **Uji lintasan** — Setup → *Record session* → jalan di garis lakban → Stop →
+
+   ```bash
+   python tools/evaluate.py server/logs/<file>.jsonl --path 0.8,1.0 3.6,4.4 --min-speed 0.1
+   ```
+
+   `--replay --set sigma_a=1.2` memutar ulang paket mentah dengan parameter
+   lain pada data yang sama.
+
+| Method | Path | Fungsi |
+|---|---|---|
+| `POST` | `/api/v1/calibration/point` | `{"x","y","seconds","store"}` — kumpulkan di titik terukur |
+| `POST` | `/api/v1/calibration/apply` | hitung bias/scale per anchor |
+| `POST` | `/api/v1/calibration/clear` | hapus kalibrasi |
+| `GET`/`PUT` | `/api/v1/tracking` | parameter tracker (`sigma_a`, `sigma_r`, …) |
+| `POST` | `/api/v1/record/start` · `stop` · `mark` | rekam sesi ke `server/logs/` |
 
 ---
 
@@ -598,6 +637,8 @@ Detail matematis lengkap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §5.
 | Tidak ada jarak sama sekali | Pastikan anchor & tag ID unik, jarak masih jangkauan, power USB cukup |
 | Web map kosong | Cek `/api/v1/devices` — device online? Posisi anchor sudah diset? |
 | Posisi tag loncat/cermin | 2 anchor → mirror (tanda `ambiguous`). Pastikan kotak ruangan di web sama dengan ruangan asli, sebaiknya anchor tidak sebaris. Tambah anchor ke-3 untuk menghilangkannya |
+| Lintasan zig-zag / tertinggal | Pastikan semua board firmware ≥ 1.0.32 (tab Devices) — firmware lama hanya mengirim 1 sampel/detik. Inspector tag harus menunjukkan *Samples* ≈ 20–25/s dengan 4 anchor |
+| Lintasan melengkung / melebar | Koordinat atau tinggi anchor di scene tidak sesuai aslinya, atau belum kalibrasi. Lihat *Residual* tiap anchor di inspector tag: yang konsisten besar = anchor yang salah |
 | **Posisi tag konsisten terlalu jauh / terlihat "di belakang"** | Tinggi tag salah. Set **Setup → Tag height above floor** sesuai ukuran meteran (jangan ditebak), lalu Save. Salah 30 cm menggeser posisi puluhan cm |
 | Server tidak bisa diakses board | Board & server harus satu Wi-Fi; pakai IP LAN (`192.168.x.x`), bukan `127.0.0.1` |
 | MQTT tidak terima | Broker harus jalan (`mosquitto -v`); REST tetap jalan tanpa MQTT |

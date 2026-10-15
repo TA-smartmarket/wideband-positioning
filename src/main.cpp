@@ -71,6 +71,59 @@ struct RangeRec {
 RangeRec ranges[MAX_RANGES];
 uint8_t  range_count = 0;
 
+// ---------------------------------------------------------------------------
+// fresh-sample queue
+//
+// Every two-way-ranging result is queued here and sent to the server exactly
+// once, with its own timestamp and its RAW value; the server's tracker does
+// the filtering (server/tracker.py). Up to 1.0.31 only the latest filtered
+// value per link went out, once a second, so the server saw one sample per
+// anchor per second, ~0.5 s of EMA lag, and the same value again in every
+// packet -- which it then fused as if it were new.
+// ---------------------------------------------------------------------------
+#define SAMPLE_QUEUE 64
+#define MAX_BATCH    24          // samples per telemetry packet (~3.5 kB JSON)
+
+struct Sample {
+    char     src[12];
+    char     dst[12];
+    float    raw, filt, rx, fp, q;
+    uint32_t ts;
+    uint32_t seq;
+};
+Sample   sq[SAMPLE_QUEUE];
+uint8_t  sq_head = 0;            // oldest sample
+uint8_t  sq_count = 0;
+uint32_t sample_seq = 0;
+uint32_t samples_dropped = 0;    // queue overflow (uplink down), reported in status
+
+inline Sample &sqAt(uint8_t i) { return sq[(sq_head + i) % SAMPLE_QUEUE]; }
+
+void sqPush(const char *src, const char *dst, float raw, float filt,
+            float rx, float fp, float q, uint32_t ts)
+{
+    if (sq_count == SAMPLE_QUEUE) {          // full: drop the oldest
+        sq_head = (sq_head + 1) % SAMPLE_QUEUE;
+        sq_count--;
+        samples_dropped++;
+    }
+    Sample &s = sq[(sq_head + sq_count) % SAMPLE_QUEUE];
+    snprintf(s.src, sizeof(s.src), "%s", src);
+    snprintf(s.dst, sizeof(s.dst), "%s", dst);
+    s.raw = raw; s.filt = filt; s.rx = rx; s.fp = fp; s.q = q;
+    s.ts = ts;
+    s.seq = ++sample_seq;
+    sq_count++;
+}
+
+// Forget the n oldest samples once they are safely handed to the uplink.
+void sqDrop(uint8_t n)
+{
+    if (n > sq_count) n = sq_count;
+    sq_head = (sq_head + n) % SAMPLE_QUEUE;
+    sq_count -= n;
+}
+
 struct PosRec {
     char  id[16];
     float x, y;
@@ -207,10 +260,33 @@ void pushRange(const char *src, const char *dst, float range, float rx, float fp
     r.range = cfg.range_filter ? filterRange(src, dst, range) : range;
     r.rx = rx; r.fp = fp; r.quality = q;
     r.ts = millis();
+    sqPush(src, dst, range, r.range, rx, fp, q, r.ts);
 }
 
-// Build the telemetry JSON (docs/API.md section 3).
-String buildTelemetry()
+// Why the chip last restarted, reported in every status block so a crash loop
+// is visible on the server without a serial cable (brownout = power supply).
+const char *resetReasonName()
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+    }
+}
+
+// Build the telemetry JSON (docs/API.md section 3) from the n oldest queued
+// samples. "range" is the pre-filtered value (kept for older servers and the
+// OLED), "raw" the unfiltered measurement the server tracker uses, "ts" the
+// millis() at which it was measured and "seq" a per-device sample counter.
+String buildTelemetry(uint8_t n)
 {
     JsonDocument doc;
     char me[16];
@@ -221,15 +297,18 @@ String buildTelemetry()
     doc["ts"] = (uint32_t)millis();
 
     JsonArray ra = doc["ranges"].to<JsonArray>();
-    for (uint8_t i = 0; i < range_count; i++) {
+    for (uint8_t i = 0; i < n; i++) {
+        const Sample &s = sqAt(i);
         JsonObject o = ra.add<JsonObject>();
-        o["ts"] = ranges[i].ts;
-        o["src"] = ranges[i].src;
-        o["dst"] = ranges[i].dst;
-        jsonPutFloat(o, "range", ranges[i].range);
-        jsonPutFloat(o, "rx_power", ranges[i].rx);
-        jsonPutFloat(o, "fp_power", ranges[i].fp);
-        jsonPutFloat(o, "quality", ranges[i].quality);
+        o["ts"] = s.ts;
+        o["seq"] = s.seq;
+        o["src"] = s.src;
+        o["dst"] = s.dst;
+        jsonPutFloat(o, "range", s.filt);
+        jsonPutFloat(o, "raw", s.raw);
+        jsonPutFloat(o, "rx_power", s.rx);
+        jsonPutFloat(o, "fp_power", s.fp);
+        jsonPutFloat(o, "quality", s.q);
     }
 
     if (pos_count) {
@@ -255,6 +334,9 @@ String buildTelemetry()
     st["uptime_s"] = (millis() - boot_ms) / 1000;
     st["anchors_seen"] = anchors_seen;
     st["tags_seen"] = tags_seen;
+    st["samples_dropped"] = samples_dropped;
+    st["reset"] = resetReasonName();
+    st["heap_min"] = ESP.getMinFreeHeap();
     st["fw"] = FW_VERSION;
 
     String out;
@@ -297,60 +379,72 @@ void uplinkTask(void *)
 
 // Queue a batch for the uplink task. Never blocks the ranging loop.
 //
+// Returns false when the previous batch has not been sent yet: the caller then
+// keeps its samples queued and retries on the next tick. (It used to overwrite
+// the pending batch, which silently lost every sample in it.)
+//
 // The mutex may not exist yet during early boot, and taking a FreeRTOS
 // semaphore before the scheduler is running trips
 //   assert failed: xQueueSemaphoreTake queue.c:1554
 // so bail out instead of crashing.
-void queueRest(const String &body)
+bool queueRest(const String &body)
 {
-    if (pending_lock == nullptr) return;
-    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) return;
+    if (pending_lock == nullptr) return false;
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) return false;
+    bool queued = false;
     if (xSemaphoreTake(pending_lock, 0) == pdTRUE) {
-        pending_json = body;
-        pending_rest = true;
+        if (!pending_rest) {
+            pending_json = body;
+            pending_rest = true;
+            queued = true;
+        }
         xSemaphoreGive(pending_lock);
     }
+    return queued;
+}
+
+bool restSlotFree()
+{
+    if (pending_lock == nullptr) return false;
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) return false;
+    bool free_slot = false;
+    if (xSemaphoreTake(pending_lock, 0) == pdTRUE) {
+        free_slot = !pending_rest;
+        xSemaphoreGive(pending_lock);
+    }
+    return free_slot;
 }
 
 void publishTelemetry()
 {
-    String body = buildTelemetry();
+    const uint8_t n = sq_count < MAX_BATCH ? sq_count : MAX_BATCH;
 
-    // MQTT: non-blocking publishes, safe to do inline
-    if (net.mqtt_up) {
+    // MQTT first (non-blocking). The per-range "<base>/range" messages are no
+    // longer sent: they carried no device_id, so the server could not use them.
+    if (net.mqtt_up && cfg.mqtt_enabled) {
+        String body = buildTelemetry(n);
         char t[80];
         topic(t, sizeof(t), "telemetry");
-        mqttPublish(t, body);
-        for (uint8_t i = 0; i < range_count; i++) {
-            JsonDocument d;
-            d["ts"] = ranges[i].ts;
-            d["src"] = ranges[i].src;
-            d["dst"] = ranges[i].dst;
-            jsonPutFloat(d, "range", ranges[i].range);
-            jsonPutFloat(d, "rx_power", ranges[i].rx);
-            jsonPutFloat(d, "fp_power", ranges[i].fp);
-            jsonPutFloat(d, "quality", ranges[i].quality);
-            String s; serializeJson(d, s);
-            topic(t, sizeof(t), "range");
-            mqttPublish(t, s);
-        }
+        if (g_mqtt.publish(t, body.c_str())) { sqDrop(n); return; }
+        // publish failed (buffer / connection) -> fall back to REST below
     }
 
-    // REST: hand off to the uplink task (also the fallback when MQTT is down)
-    if (!net.mqtt_up || !cfg.mqtt_enabled) queueRest(body);
-    else queueRest("");          // nothing pending, keeps the slot clear
+    // REST: hand off to the uplink task. If the previous batch is still in
+    // flight the samples simply stay queued for the next tick.
+    if (!restSlotFree()) return;
+    if (queueRest(buildTelemetry(n))) sqDrop(n);
 
-    // NOTE: the range buffer is NOT cleared here. It used to be, which emptied
-    // `range_count` every telemetry cycle (~1 s). drawUi() then hit its
-    // "no range yet..." branch on the next frame, so the OLED flickered
-    // between the distance and that placeholder forever. Staleness is handled
-    // per record via the timestamp instead (see drawUi).
+    // NOTE: the latest-per-link `ranges[]` buffer is NOT cleared here; the
+    // OLED and the standalone solver read it, and staleness is handled per
+    // record via its timestamp (see drawUi).
 }
 
 // ---------------------------------------------------------------------------
 // standalone solver (tag only): uses ranges collected from anchors
 // ---------------------------------------------------------------------------
 AnchorFix fixes[MAX_ANCHORS];
+uint32_t  fix_ts[MAX_ANCHORS];     // when each fix's range was measured
+uint32_t  solve_prev_ms = 0;       // last standalone solve
 
 // Display power saving (defined with drawUi(); used from the ranging callback)
 void screenWake();
@@ -448,6 +542,7 @@ void solveLocally()
         fixes[n].x = ax; fixes[n].y = ay;
         fixes[n].range = r2d;
         fixes[n].valid = true;
+        fix_ts[n] = ranges[i].ts;
         n++;
     }
     if (n < 2) { pos_count = 0; return; }
@@ -468,16 +563,23 @@ void solveLocally()
         ekf_last_solve_ms = now;
     }
 
-    uint8_t used = 0;
-    for (uint8_t i = 0; i < n; i++)
+    // Each range is used once: the latest-per-link buffer still holds the
+    // previous value when no new exchange happened, and fusing it again would
+    // make the filter over-confident (the bug the server had).
+    uint8_t used = 0, fresh = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (fix_ts[i] <= solve_prev_ms) continue;
+        fresh++;
         if (ekfUpdateRange(tag_ekf, fixes[i].x, fixes[i].y, fixes[i].range))
             used++;
+    }
+    solve_prev_ms = millis();
 
     // Self-healing: if every measurement keeps being rejected the filter has
     // lost the track (its covariance is at the cap). Restart it from the
     // current geometry instead of coasting on a stale estimate. Mirrors the
     // EKF_REJECTS logic in server/app.py.
-    if (used == 0) {
+    if (used == 0 && fresh > 0) {
         ekf_rejects++;
         if (ekf_rejects >= 8) {
             Position p = solvePosition(fixes, n, cfg.room_w, cfg.room_h);
@@ -489,7 +591,7 @@ void solveLocally()
                         used++;
             }
         }
-    } else {
+    } else if (used > 0) {
         ekf_rejects = 0;
     }
 
@@ -1011,6 +1113,7 @@ void onServerConfig(JsonObjectConst doc)
         return;
     }
 
+    const uint32_t stored = configDigest(cfg);
     bool changed = false;
 
     if (doc["role"].is<const char *>()) {
@@ -1116,10 +1219,25 @@ void onServerConfig(JsonObjectConst doc)
         if (u["update_ms"].is<int>()) cfg.update_ms = (uint16_t)u["update_ms"].as<int>();
     }
 
+    // Same values as already stored (the JSON can still differ, e.g. a server
+    // that sends bookkeeping fields): do NOT touch the flash.
+    if (!changed && configDigest(cfg) == stored) {
+        Serial.println("[cfg] same values, nothing to store");
+        return;
+    }
+
+    // Writing NVS disables the flash cache, and the DW1000 IRQ handler is not
+    // in IRAM: a radio interrupt during the write crashes the node -- the same
+    // failure the OTA path guards against. Anchors listen permanently (~40
+    // interrupts/s), so an NVS rewrite every 15 s made them crash every few
+    // minutes. Quiesce the radio for the write, then restart so ranging comes
+    // back from a clean state. (Real config changes are rare.)
+    otaQuiesceRadio();
     configSave(cfg);
     storeAppliedHash(incoming);
-    Serial.println("[cfg] applied config from server");
-    if (changed) { delay(200); ESP.restart(); }
+    Serial.println("[cfg] applied config from server, restarting");
+    delay(200);
+    ESP.restart();
 }
 
 void onServerCommand(const char *cmd, JsonObjectConst args)
@@ -1217,9 +1335,17 @@ void loop()
     mqttLoop();
     syncConfigFromServer();
 
-    if (millis() - last_telem_ms > (unsigned long)cfg.update_ms * 5) {
+    // The tag carries every anchor's range on one clock, so it is the primary
+    // source and uplinks at update_ms (5 Hz by default). Anchors report the
+    // same exchanges again; they only matter when the tag's uplink is down,
+    // so they batch for 5x longer to keep the WiFi quiet.
+    const unsigned long period = (cfg.role == ROLE_TAG)
+                                     ? (unsigned long)cfg.update_ms
+                                     : (unsigned long)cfg.update_ms * 5;
+    if (millis() - last_telem_ms > period) {
         last_telem_ms = millis();
-        if (range_count) { solveLocally(); publishTelemetry(); }
+        if (range_count) solveLocally();
+        if (sq_count) publishTelemetry();
     }
 
     drawUi();

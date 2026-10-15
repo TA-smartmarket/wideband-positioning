@@ -34,7 +34,9 @@ import time
 
 from flask import Flask, jsonify, request, send_from_directory
 
+import recorder
 import scene as scene_mod
+import tracker
 
 # ---------------------------------------------------------------------------
 # config model
@@ -245,6 +247,13 @@ def merged_config(role, did):
         cfg = copy.deepcopy(BASE_CFG)
         if known:
             cfg.update(entry)
+        # Server bookkeeping must never reach the device. `last_seen` changes
+        # on every packet, so the config looked new on every 15-s poll and the
+        # node rewrote its whole NVS each time. A flash write disables the
+        # cache while the DW1000 IRQ handler is not in IRAM: anchors, which
+        # take radio interrupts constantly, crashed every 1.5-3 minutes.
+        for k in ("last_seen", "_auto"):
+            cfg.pop(k, None)
         cfg["device_id"] = key
         cfg["role"] = role
         cfg["id"] = did
@@ -297,174 +306,47 @@ def merged_config(role, did):
 
 
 # ---------------------------------------------------------------------------
-# solver (mirror of src/solver.h)
-# ---------------------------------------------------------------------------
-
-def solve_2d(fixes, room_w, room_h):
-    """fixes: list of (x, y, range). Returns dict or None."""
-    if len(fixes) < 2:
-        return None
-
-    use_room = room_w > 0 and room_h > 0
-
-    if len(fixes) == 2:
-        (x1, y1, r1), (x2, y2, r2) = fixes
-        dx, dy = x2 - x1, y2 - y1
-        d = math.hypot(dx, dy)
-        if d < 1e-4:
-            return None
-        if d > r1 + r2 or d < abs(r1 - r2):
-            return {"x": (x1 + x2) / 2, "y": (y1 + y2) / 2,
-                    "confidence": 0.1, "ambiguous": True}
-        aa = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d)
-        hh = math.sqrt(max(r1 * r1 - aa * aa, 0.0))
-        mx, my = x1 + aa * dx / d, y1 + aa * dy / d
-        c = [(mx + hh * dy / d, my - hh * dx / d),
-             (mx - hh * dy / d, my + hh * dx / d)]
-        if use_room:
-            inside = [(i, pt) for i, pt in enumerate(c)
-                      if 0 <= pt[0] <= room_w and 0 <= pt[1] <= room_h]
-            if len(inside) == 1:
-                i, pt = inside[0]
-                return {"x": pt[0], "y": pt[1], "confidence": 0.5,
-                        "ambiguous": False}
-        # tie / no room: nearest to centre
-        cx, cy = room_w / 2, room_h / 2
-        pt = min(c, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
-        return {"x": pt[0], "y": pt[1], "confidence": 0.5, "ambiguous": True}
-
-    # 3+ anchors: linearised least squares + Gauss-Newton refinement
-    (x0, y0, r0) = fixes[0]
-    A0 = A1 = B0 = B1 = C = 0.0
-    for (xi, yi, ri) in fixes[1:]:
-        ax, ay = 2.0 * (xi - x0), 2.0 * (yi - y0)
-        b = (ri * ri - r0 * r0) - xi * xi + x0 * x0 - yi * yi + y0 * y0
-        A0 += ax * ax; A1 += ax * ay; B0 += ax * b; B1 += ay * b; C += ay * ay
-    det = A0 * C - A1 * A1
-    if abs(det) < 1e-9:
-        return None
-    px = (B0 * C - B1 * A1) / det
-    py = (A0 * B1 - A1 * B0) / det
-
-    for _ in range(2):  # Gauss-Newton
-        j0 = j1 = j2 = e0 = e1 = 0.0
-        for (xi, yi, ri) in fixes:
-            ddx, ddy = px - xi, py - yi
-            dist = math.hypot(ddx, ddy) + 1e-9
-            res = dist - ri
-            j0 += ddx * ddx / (dist * dist)
-            j1 += ddx * ddy / (dist * dist)
-            j2 += ddy * ddy / (dist * dist)
-            e0 += ddx * res / dist
-            e1 += ddy * res / dist
-        dj = j0 * j2 - j1 * j1
-        if abs(dj) < 1e-12:
-            break
-        px -= (j2 * e0 - j1 * e1) / dj
-        py -= (j0 * e1 - j1 * e0) / dj
-
-    ss = sum((math.hypot(px - xi, py - yi) - ri) ** 2 for xi, yi, ri in fixes)
-    rms = math.sqrt(ss / len(fixes))
-    conf = max(0.0, min(1.0, 1.0 - rms))
-    return {"x": px, "y": py, "confidence": conf, "ambiguous": False}
-
-
-# ---------------------------------------------------------------------------
-# Extended Kalman Filter (mirror of src/ekf.h)
+# tracking — see server/tracker.py for the model and why it is built this way
 #
-#   state x = [px, py, vx, vy], constant-velocity motion, range measurement
-#   h(x) = ||p - a_i|| is non-linear -> linearised with the Jacobian
-#   H = [(px-ax)/d, (py-ay)/d, 0, 0]. Innovation gating rejects NLOS outliers.
+# Every telemetry packet goes to ENGINE.ingest(), which uses each range sample
+# exactly once, at the time it was measured, and runs the EKF on slant ranges
+# with an online range-offset state. The old recompute-everything-on-every-
+# packet loop (which re-used stale ranges as new evidence and zig-zagged) is
+# gone; tools/simulate.py reproduces both for comparison.
 # ---------------------------------------------------------------------------
-EKF_N = 4
+ENGINE = tracker.Engine()
+RECORDER = recorder.Recorder(os.path.join(os.path.dirname(__file__), "logs"))
+CAL_JOBS = []          # active calibration/static-test collectors
 
 
-class TagEKF:
-    def __init__(self, px, py, sigma_a=1.0, sigma_r=0.15):
-        self.x = [px, py, 0.0, 0.0]
-        self.P = [[1.0, 0, 0, 0],
-                  [0, 1.0, 0, 0],
-                  [0, 0, 4.0, 0],
-                  [0, 0, 0, 4.0]]
-        self.sigma_a = sigma_a
-        self.sigma_r = sigma_r
-        self.last_ms = now_ms()
-        self.updates = 0
-
-    # x = F x , P = F P F^T + Q   (constant velocity)
-    def predict(self, dt):
-        if dt <= 0:
-            return
-        dt = min(dt, 2.0)
-        self.x[0] += self.x[2] * dt
-        self.x[1] += self.x[3] * dt
-
-        P = self.P
-        FP = [[P[0][j] + dt * P[2][j] for j in range(4)],
-              [P[1][j] + dt * P[3][j] for j in range(4)],
-              [P[2][j] for j in range(4)],
-              [P[3][j] for j in range(4)]]
-        FPFt = [[FP[i][0] + dt * FP[i][2], FP[i][1] + dt * FP[i][3],
-                 FP[i][2], FP[i][3]] for i in range(4)]
-
-        dt2, dt3, dt4 = dt * dt, dt ** 3, dt ** 4
-        q = self.sigma_a ** 2
-        Q = [[q * dt4 / 4, 0, q * dt3 / 2, 0],
-             [0, q * dt4 / 4, 0, q * dt3 / 2],
-             [q * dt3 / 2, 0, q * dt2, 0],
-             [0, q * dt3 / 2, 0, q * dt2]]
-        self.P = [[FPFt[i][j] + Q[i][j] for j in range(4)] for i in range(4)]
-
-        # Bound the covariance: when measurements are rejected for a long time
-        # (heavy NLOS) P grows without limit and sigma became meaningless
-        # (observed 11 m). Cap the position/velocity variance so confidence
-        # stays interpretable and the filter cannot "give up" on the room.
-        for i, cap in ((0, 25.0), (1, 25.0), (2, 9.0), (3, 9.0)):
-            if self.P[i][i] > cap:
-                self.P[i][i] = cap
-
-    # one scalar range measurement to anchor (ax, ay); returns True if accepted
-    # sigma_r may be overridden per measurement (NLOS paths are noisier).
-    def update_range(self, ax, ay, rng, gate_sigma=3.0, sigma_r=None):
-        if rng <= 0.01:
-            return False
-        sr = self.sigma_r if sigma_r is None else sigma_r
-        dx, dy = self.x[0] - ax, self.x[1] - ay
-        d = math.hypot(dx, dy) or 1e-3
-
-        H = [dx / d, dy / d, 0.0, 0.0]                    # Jacobian
-        innov = rng - d                                    # y = z - h(x)
-
-        PHt = [sum(self.P[i][k] * H[k] for k in range(4)) for i in range(4)]
-        S = sum(H[i] * PHt[i] for i in range(4)) + sr ** 2
-        if S < 1e-9:
-            return False
-
-        if abs(innov) > gate_sigma * math.sqrt(S):         # innovation gate
-            return False
-
-        K = [PHt[i] / S for i in range(4)]
-        for i in range(4):
-            self.x[i] += K[i] * innov
-
-        Pn = [[self.P[i][j] - K[i] * sum(H[k] * self.P[k][j] for k in range(4))
-               for j in range(4)] for i in range(4)]
-        self.P = Pn
-        self.updates += 1
-        return True
-
-    def position(self):
-        return self.x[0], self.x[1], self.x[2], self.x[3]
-
-    def sigma(self):
-        return math.sqrt(max(self.P[0][0], 0.0) + max(self.P[1][1], 0.0))
+def configure_engine(reset=False):
+    """Load the current scene (anchors, room, tag height, calibration, tuning)
+    into the tracker. reset=True when the geometry changed: every track built
+    against the old geometry is wrong."""
+    with LOCK:
+        extra = {}
+        for dk, dc in DEVICES.items():
+            if dc.get("role") == "anchor" and not dc.get("_auto"):
+                p = dc.get("position") or {}
+                extra[dk] = (p.get("x", 0.0), p.get("y", 0.0), p.get("z", 2.2))
+        ENGINE.configure(SCENE, NLOS_ENABLED, extra_anchors=extra, nlos_mod=scene_mod)
+        if reset:
+            ENGINE.reset()
+            TAG_POS.clear()
 
 
-EKF = {}        # tag_id -> TagEKF
-EKF_REJECTS = {}  # tag_id -> consecutive rejected cycles
+def _on_sample(tag, s):
+    """Engine hook: one range sample consumed (feeds calibration jobs)."""
+    anchor, raw = s[1], s[2]
+    for job in CAL_JOBS:
+        if job["tag"] == tag:
+            job["ranges"].setdefault(anchor, []).append(raw)
 
 
-def anchor_xyz(device_id, fallback_id=None):
+ENGINE.on_sample = _on_sample
+
+
+def anchor_xyz(device_id):
     """Anchor position: the 3D scene is the source of truth, the device config
     is the fallback (so a device that was configured before the scene existed
     still works)."""
@@ -479,155 +361,42 @@ def anchor_xyz(device_id, fallback_id=None):
     return None
 
 
-def geometry_check(fixes):
-    """Detect range pairs that are geometrically impossible.
-
-    For two anchors the triangle inequality must hold:
-        |r1 - r2| <= d <= r1 + r2
-    Violations mean at least one range is wrong (usually NLOS: the signal
-    bounced, so the measured distance is longer than the straight line).
-    Returns (ok, slack) where slack is how far outside the bound we are.
-    """
-    if len(fixes) < 2:
-        return True, 0.0
-    worst = 0.0
-    for i in range(len(fixes)):
-        for j in range(i + 1, len(fixes)):
-            (x1, y1, r1), (x2, y2, r2) = fixes[i], fixes[j]
-            d = math.hypot(x2 - x1, y2 - y1)
-            if d < 1e-6:
-                continue
-            if r1 + r2 < d:
-                worst = max(worst, d - (r1 + r2))
-            elif abs(r1 - r2) > d:
-                worst = max(worst, abs(r1 - r2) - d)
-    return worst <= 0.0, worst
+def publish_estimate(tag, est, now):
+    """Store one tracker estimate as the tag's current position."""
+    TAG_POS[tag] = {"x": est["x"], "y": est["y"], "z": est["z"],
+                    "vx": est["vx"], "vy": est["vy"],
+                    "sigma": est["sigma"],
+                    "range_bias": est["range_bias"],
+                    "geometry_ok": est["geometry_ok"],
+                    "geometry_slack": est["geometry_slack"],
+                    "rate_hz": est["rate_hz"], "used": est["used"],
+                    "conf": est["confidence"], "amb": est["ambiguous"],
+                    "links": est["links"],
+                    "ts": now, "src": "server"}
+    for a, info in est["links"].items():
+        NLOS[(a, tag)] = {"blocked": info.get("blocked", False),
+                          "atten": info.get("atten", 0.0),
+                          "sigma": info.get("sigma"), "bias": info.get("bias"),
+                          "obstacles": info.get("obstacles", [])}
+    for job in CAL_JOBS:
+        if job["tag"] == tag:
+            job["est"].append((est["x"], est["y"]))
+    if RECORDER.active:
+        RECORDER.write({"k": "est", "t": now, "tag": tag,
+                        "x": round(est["x"], 4), "y": round(est["y"], 4),
+                        "vx": round(est["vx"], 3), "vy": round(est["vy"], 3),
+                        "sigma": round(est["sigma"], 4),
+                        "b": round(est["range_bias"], 4), "used": est["used"]})
 
 
 def recompute_positions():
-    """Recompute all tag positions: geometric solver for the first fix, then
-    the EKF tracks each tag over time (see class TagEKF).
-
-    Obstacles in the scene make this NLOS-aware: a blocked anchor→tag path gets
-    an inflated measurement sigma (so the EKF trusts it less, or rejects it via
-    the innovation gate) plus a small positive bias (UWB NLOS reads long)."""
-    global NLOS
-    now = now_ms()
+    """Current estimate of every tracked tag (debug endpoint)."""
     out = {}
-    tags = {dk for dk, dc in DEVICES.items() if dc.get("role") == "tag"}
-    for (a, t) in RANGES.keys():
-        tags.add(t)
-
     with LOCK:
-        room = dict(SCENE["room"])
-        obstacles = list(SCENE.get("obstacles", []))
-        # Height of the tag above the floor, set by the operator in the UI.
-        # It is what the 3D range is projected against, so it must come from
-        # the scene rather than a constant in the code.
-        tag_z = float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z))
-
-    for tag in tags:
-        fixes, anchors_used = [], []
-        links = []
-        for (a, t), r in RANGES.items():
-            if t != tag:
-                continue
-            if now - r.get("recv_ts", r["ts"]) > STALE_MS:
-                continue
-            pos = anchor_xyz(a)
-            if not pos:
-                continue
-            ax, ay, az = pos
-            dz = az - tag_z
-            rng2d = scene_mod.horizontal_range(r["range"], dz)
-            if rng2d <= 0.01:
-                continue
-            fixes.append((ax, ay, rng2d))
-            anchors_used.append(a)
-            links.append((a, ax, ay, az, rng2d))
-
-        if len(fixes) < 2:
-            continue
-
-        # --- bootstrap: closed-form fix for the first estimate --------------
-        if tag not in EKF:
-            sol = solve_2d(fixes, room["width"], room["depth"])
-            if not sol:
-                continue
-            EKF[tag] = TagEKF(sol["x"], sol["y"])
-        else:
-            EKF[tag].predict((now - EKF[tag].last_ms) / 1000.0)
-            EKF[tag].last_ms = now
-
-        # --- track: one range update per anchor, NLOS-aware ------------------
-        used = 0
-        link_info = {}
-        for (a, ax, ay, az, rng2d) in links:
-            blockers = scene_mod.los_blockers(
-                (ax, ay, az), (EKF[tag].x[0], EKF[tag].x[1], tag_z),
-                obstacles) if NLOS_ENABLED else []
-            sigma = scene_mod.measurement_sigma(blockers, EKF[tag].sigma_r)
-            bias = scene_mod.nlos_bias(blockers)
-            link_info[a] = {
-                "blocked": bool(blockers),
-                "atten": max([ob.get("atten", 1.0) for ob in blockers], default=0.0),
-                "sigma": sigma,
-                "bias": bias,
-                "obstacles": [ob["id"] for ob in blockers],
-            }
-            if EKF[tag].update_range(ax, ay, rng2d + bias, sigma_r=sigma):
-                used += 1
-
-        NLOS.update({(a, tag): info for a, info in link_info.items()})
-
-        # Self-healing: if every measurement keeps being rejected (heavy NLOS
-        # reflections), the filter has lost the track and its covariance is at
-        # the cap. Restart it from the current geometry instead of coasting on
-        # a stale estimate forever.
-        if used == 0:
-            EKF_REJECTS[tag] = EKF_REJECTS.get(tag, 0) + 1
-            if EKF_REJECTS[tag] >= 8:
-                sol = solve_2d(fixes, room["width"], room["depth"])
-                if sol:
-                    EKF[tag] = TagEKF(sol["x"], sol["y"])
-                    EKF_REJECTS[tag] = 0
-                    used = sum(1 for (_a, ax, ay, _az, rng2d) in links
-                               if EKF[tag].update_range(ax, ay, rng2d))
-        else:
-            EKF_REJECTS[tag] = 0
-
-        px, py, vx, vy = EKF[tag].position()
-
-        # Never report a position outside the room: with only two anchors an
-        # inconsistent range pair can push the estimate far away (observed
-        # x = -38 m). Clamp to the room rectangle and, if we had to clamp,
-        # drop the velocity so the filter does not keep flying outward.
-        margin = 0.5
-        cx = min(max(px, -margin), room["width"] + margin)
-        cy = min(max(py, -margin), room["depth"] + margin)
-        if abs(cx - px) > 1e-6 or abs(cy - py) > 1e-6:
-            EKF[tag].x[0], EKF[tag].x[1] = cx, cy
-            EKF[tag].x[2] *= 0.2
-            EKF[tag].x[3] *= 0.2
-            EKF[tag].P[0][0] = max(EKF[tag].P[0][0], 0.5)
-            EKF[tag].P[1][1] = max(EKF[tag].P[1][1], 0.5)
-            px, py = cx, cy
-
-        sigma = EKF[tag].sigma()
-
-        ok_geo, slack = geometry_check(fixes)
-
-        out[tag] = {
-            "ts": now, "src": "server", "id": tag,
-            "x": px, "y": py, "z": tag_z,
-            "vx": vx, "vy": vy,
-            "confidence": 1.0 / (1.0 + sigma),
-            "sigma": sigma, "ambiguous": False,
-            "geometry_ok": ok_geo, "geometry_slack": slack,
-            "updates": EKF[tag].updates, "used": used,
-            "ranges": {a: RANGES[(a, tag)]["range"] for a in anchors_used},
-            "links": link_info,
-        }
+        for tag in list(ENGINE.tracks):
+            est = ENGINE.estimate(tag)
+            if est:
+                out[tag] = est
     return out
 
 
@@ -669,51 +438,59 @@ def ingest_telemetry(payload, source):
         if payload.get("status"):
             handle_status(payload["device_id"], payload["status"])
 
+        if not did or not cfg:
+            # e.g. a bare per-range MQTT message: no reporter, no clock to map
+            # its timestamp with, so it cannot be used for tracking
+            return {}
+
+        now = now_ms()
+        if RECORDER.active:
+            RECORDER.write({"k": "rx", "t": now, "dev": did, "p": payload})
+
         for r in payload.get("ranges", []):
             src, dst = r.get("src"), r.get("dst")
             if not src or not dst:
                 continue
             tag = dst if src.startswith("anchor") else src
             anc = src if src.startswith("anchor") else dst
-            if payload.get("device_id") != did or not cfg:
-                continue
-            # Device clocks are millis()-based (uptime), so they cannot be
-            # compared with the server epoch. Keep both: `ts` for display and
-            # `recv_ts` for staleness, which is what the solver uses.
+            # latest value per link, for the UI (the tracker keeps its own)
             RANGES[(anc, tag)] = {
-                "range": r.get("range", 0.0), "rx": r.get("rx_power", 0.0),
+                "range": r.get("raw", r.get("range", 0.0)),
+                "rx": r.get("rx_power", 0.0),
                 "fp": r.get("fp_power", 0.0), "q": r.get("quality", 0.0),
-                "ts": r.get("ts", 0), "recv_ts": now_ms(),
+                "ts": r.get("ts", 0), "recv_ts": now,
             }
             if cfg.get("role") == "anchor":
                 cfg.setdefault("position", BASE_CFG["position"])
 
+        if any(a not in ENGINE.anchors for a in
+               {r.get("src") for r in payload.get("ranges", [])
+                if str(r.get("src", "")).startswith("anchor")}):
+            configure_engine()            # a new anchor was just auto-placed
+
+        touched = ENGINE.ingest(did, payload, now)
+        positions = {}
+        for tag in touched:
+            est = ENGINE.estimate(tag, now)
+            if est:
+                positions[tag] = est
+                publish_estimate(tag, est, now)
+
         for p in payload.get("positions", []):
-            # The server EKF is authoritative; a device estimate is only used
-            # as a fallback when the server has no track yet (otherwise it
-            # would wipe sigma/vx/vy every cycle).
-            if p["id"] in EKF:
+            # The server track is authoritative; a device estimate is only
+            # shown while the server has no track of that tag yet.
+            tr = ENGINE.tracks.get(p.get("id"))
+            if tr is not None and tr.f is not None:
                 continue
             TAG_POS[p["id"]] = {"x": p["x"], "y": p["y"],
                                 "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
                                 "sigma": p.get("sigma", 0.0),
                                 "conf": p.get("confidence", 0.5),
                                 "amb": p.get("ambiguous", False),
-                                "ts": now_ms(), "src": "device"}
+                                "ts": now, "src": "device"}
 
-        if did and did in DEVICES and payload.get("device_id"):
-            DEVICES[did]["last_seen"] = now_ms()
+        DEVICES[did]["last_seen"] = now
 
-    positions = recompute_positions()
-    with LOCK:
-        for tag, sol in positions.items():
-            TAG_POS[tag] = {"x": sol["x"], "y": sol["y"],
-                            "vx": sol.get("vx", 0.0), "vy": sol.get("vy", 0.0),
-                            "sigma": sol.get("sigma", 0.0),
-                            "geometry_ok": sol.get("geometry_ok", True),
-                            "geometry_slack": sol.get("geometry_slack", 0.0),
-                            "conf": sol["confidence"], "amb": sol["ambiguous"],
-                            "ts": sol["ts"], "src": "server"}
     broadcast_state()
     return positions
 
@@ -753,6 +530,8 @@ def build_state():
                      "z": p.get("z", scene_mod.DEFAULT_TAG_Z),   # solved value, already tag_z
                      "vx": p.get("vx", 0.0), "vy": p.get("vy", 0.0),
                      "sigma": p.get("sigma", 0.0),
+                     "range_bias": p.get("range_bias"),
+                     "rate_hz": p.get("rate_hz"), "used": p.get("used"),
                      "geometry_ok": p.get("geometry_ok", True),
                      "geometry_slack": p.get("geometry_slack", 0.0),
                      "confidence": p["conf"], "ambiguous": p["amb"],
@@ -784,6 +563,9 @@ def build_state():
             "last_seen": dc.get("last_seen", 0),
             "ip": st.get("ip"), "rssi": st.get("rssi"), "fw": st.get("fw"),
             "uptime_s": st.get("uptime_s"),
+            # firmware >= 1.0.32: why the node last restarted, and its lowest
+            # free heap since boot (crash / leak diagnostics)
+            "reset": st.get("reset"), "heap_min": st.get("heap_min"),
         })
 
     return {"site": BASE_CFG["site"], "ts": now, "room": room,
@@ -978,8 +760,7 @@ def api_config_put():
     with LOCK:
         RANGES.clear()
         NLOS.clear()
-    EKF.clear()
-    EKF_REJECTS.clear()
+    configure_engine(reset=True)
     broadcast_state()
     return jsonify({"ok": True, "config": devcfg})
 
@@ -1019,7 +800,16 @@ def api_scene_put():
         return jsonify({"ok": False, "error": "bad json"}), 400
 
     with LOCK:
-        SCENE = scene_mod.normalise_scene(body.get("scene", body))
+        incoming = body.get("scene", body)
+        # The 3D editor sends room/anchors/obstacles only. Calibration and
+        # tracking settings live in the same scene file but are edited through
+        # their own endpoints, so an editor save must not wipe them.
+        if isinstance(incoming, dict):
+            incoming = dict(incoming)
+            for k in ("calibration", "tracking"):
+                if k not in incoming and k in SCENE:
+                    incoming[k] = SCENE[k]
+        SCENE = scene_mod.normalise_scene(incoming)
         if "nlos_enabled" in body:
             global NLOS_ENABLED
             NLOS_ENABLED = bool(body["nlos_enabled"])
@@ -1057,9 +847,7 @@ def api_scene_put():
     with LOCK:
         RANGES.clear()
         NLOS.clear()
-    EKF.clear()
-    EKF_REJECTS.clear()
-    recompute_positions()
+    configure_engine(reset=True)
     broadcast_state()
     return jsonify({"ok": True, "scene": SCENE, "pushed": pushed})
 
@@ -1423,6 +1211,249 @@ def api_position():
 
 
 # ---------------------------------------------------------------------------
+# calibration + static accuracy test
+#
+# Put the tag on a spot whose (x, y) you measured with the laser meter, keep it
+# still, and call /calibration/point. The server collects every raw range for
+# `seconds` and compares it with the true slant distance to each anchor
+# (anchor x, y, z from the scene; tag height from the scene). That gives
+#   * the range error per anchor  -> calibration (antenna delay, cable, etc.)
+#   * the position error           -> a static accuracy test with real ground truth
+# ---------------------------------------------------------------------------
+
+def _median(v):
+    s = sorted(v)
+    n = len(s)
+    return 0.0 if n == 0 else (s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2]))
+
+
+def _quantile(v, q):
+    s = sorted(v)
+    return s[min(int(round(q * (len(s) - 1))), len(s) - 1)] if s else 0.0
+
+
+def position_stats(est, x, y):
+    """Static accuracy of estimates est=[(x, y)] around the truth (x, y)."""
+    if not est:
+        return None
+    n = len(est)
+    mx = sum(p[0] for p in est) / n
+    my = sum(p[1] for p in est) / n
+    err = [math.hypot(px - x, py - y) for px, py in est]
+    spread = [math.hypot(px - mx, py - my) for px, py in est]
+    return {"n": n, "mean_x": mx, "mean_y": my,
+            "mean_error": math.hypot(mx - x, my - y),          # accuracy (bias)
+            "std": math.sqrt(sum(d * d for d in spread) / n),   # precision
+            "rmse": math.sqrt(sum(e * e for e in err) / n),
+            "cep50": _quantile(err, 0.50), "cep95": _quantile(err, 0.95),
+            "max": max(err)}
+
+
+def _default_tag():
+    with LOCK:
+        live = [t for t, p in TAG_POS.items() if now_ms() - p.get("ts", 0) < STALE_MS]
+        return (live or list(ENGINE.tracks) or ["tag-1"])[0]
+
+
+@APP.route("/api/v1/calibration", methods=["GET"])
+def api_calibration_get():
+    """Stored calibration points and the per-anchor correction in use."""
+    with LOCK:
+        return jsonify({"ok": True, "calibration": SCENE.get("calibration", {}),
+                        "jobs": [{"tag": j["tag"], "until": j["until"]} for j in CAL_JOBS]})
+
+
+@APP.route("/api/v1/calibration/point", methods=["POST"])
+def api_calibration_point():
+    """Collect at a measured spot: {"x":..,"y":..,"seconds":15,"store":true}.
+
+    Blocks for `seconds`. Returns the range error per anchor and the position
+    error (mean error, std, RMSE, CEP50/95). store=true keeps the point for
+    /calibration/apply; store=false is a pure static accuracy test.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        x, y = float(body["x"]), float(body["y"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "x and y (metres) are required"}), 400
+    seconds = min(max(float(body.get("seconds", 15)), 3.0), 120.0)
+    tag = body.get("tag") or _default_tag()
+    label = str(body.get("label") or f"({x:.2f}, {y:.2f})")
+    store = bool(body.get("store", True))
+
+    job = {"tag": tag, "ranges": {}, "est": [], "until": now_ms() + int(seconds * 1000)}
+    with LOCK:
+        CAL_JOBS.append(job)
+        if RECORDER.active:
+            RECORDER.write({"k": "mark", "t": now_ms(), "label": label, "x": x, "y": y,
+                            "phase": "static-start"})
+    time.sleep(seconds)
+    with LOCK:
+        CAL_JOBS.remove(job)
+        if RECORDER.active:
+            RECORDER.write({"k": "mark", "t": now_ms(), "label": label, "x": x, "y": y,
+                            "phase": "static-end"})
+        tag_z = float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z))
+
+    per_anchor = {}
+    for aid, vals in sorted(job["ranges"].items()):
+        pos = anchor_xyz(aid)
+        if not pos or len(vals) < 3:
+            continue
+        ax, ay, az = pos
+        true = math.sqrt((x - ax) ** 2 + (y - ay) ** 2 + (tag_z - az) ** 2)
+        mean = sum(vals) / len(vals)
+        med = _median(vals)
+        per_anchor[aid] = {"n": len(vals), "true": round(true, 4),
+                           "median": round(med, 4), "mean": round(mean, 4),
+                           "std": round(math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals)), 4),
+                           "error": round(med - true, 4)}
+    if not per_anchor:
+        return jsonify({"ok": False, "error": f"no ranges from {tag} in {seconds:.0f} s"}), 409
+
+    point = {"label": label, "x": x, "y": y, "tag": tag, "tag_z": tag_z,
+             "t": now_ms(), "seconds": seconds, "anchors": per_anchor}
+    if store:
+        with LOCK:
+            SCENE.setdefault("calibration", {}).setdefault("points", []).append(point)
+            save_scene()
+    return jsonify({"ok": True, "stored": store, "point": point,
+                    "position": position_stats(job["est"], x, y)})
+
+
+@APP.route("/api/v1/calibration/apply", methods=["POST"])
+def api_calibration_apply():
+    """Fit the per-anchor range correction from the stored points.
+
+    measured = scale * true + bias. With points spread over >= 1 m of distance
+    both are fitted (least squares); otherwise bias only (scale = 1).
+    """
+    with LOCK:
+        cal = SCENE.setdefault("calibration", {})
+        pts = cal.get("points") or []
+        by_anchor = {}
+        for p in pts:
+            for aid, a in (p.get("anchors") or {}).items():
+                by_anchor.setdefault(aid, []).append((a["true"], a["median"]))
+        fitted = {}
+        for aid, obs in by_anchor.items():
+            trues = [t for t, _ in obs]
+            if len(obs) >= 2 and max(trues) - min(trues) >= 1.0:
+                n = len(obs)
+                mt = sum(trues) / n
+                mm = sum(m for _, m in obs) / n
+                sxx = sum((t - mt) ** 2 for t in trues)
+                sxy = sum((t - mt) * (m - mm) for t, m in obs)
+                scale = min(max(sxy / sxx, 0.9), 1.1)
+                bias = mm - scale * mt
+            else:
+                scale = 1.0
+                bias = sum(m - t for t, m in obs) / len(obs)
+            resid = [m - (scale * t + bias) for t, m in obs]
+            fitted[aid] = {"bias": round(bias, 4), "scale": round(scale, 5),
+                           "points": len(obs),
+                           "residual_rms": round(math.sqrt(sum(r * r for r in resid) / len(resid)), 4)}
+        cal["anchors"] = fitted
+        save_scene()
+    configure_engine(reset=True)
+    return jsonify({"ok": True, "anchors": fitted})
+
+
+@APP.route("/api/v1/calibration/clear", methods=["POST"])
+def api_calibration_clear():
+    """Forget calibration: {"points":true,"anchors":true} (both by default)."""
+    body = request.get_json(silent=True) or {}
+    with LOCK:
+        cal = SCENE.setdefault("calibration", {})
+        if body.get("points", True):
+            cal["points"] = []
+        if body.get("anchors", True):
+            cal["anchors"] = {}
+        save_scene()
+    configure_engine(reset=True)
+    return jsonify({"ok": True, "calibration": SCENE["calibration"]})
+
+
+@APP.route("/api/v1/tracking", methods=["GET", "PUT"])
+def api_tracking():
+    """Tracker tuning (sigma_a, sigma_r, huber_k, gate, ...). PUT a subset."""
+    if request.method == "PUT":
+        body = request.get_json(silent=True) or {}
+        with LOCK:
+            tr = SCENE.setdefault("tracking", {})
+            for k, v in body.items():
+                if k in tracker.DEFAULT_TRACKING:
+                    try:
+                        tr[k] = float(v)
+                    except (TypeError, ValueError):
+                        return jsonify({"ok": False, "error": f"bad value for {k}"}), 400
+            save_scene()
+        configure_engine()
+    with LOCK:
+        return jsonify({"ok": True, "params": tracker.tracking_params(SCENE),
+                        "defaults": tracker.DEFAULT_TRACKING})
+
+
+# ---------------------------------------------------------------------------
+# session recording (server/logs/*.jsonl, analysed by tools/evaluate.py)
+# ---------------------------------------------------------------------------
+
+@APP.route("/api/v1/record", methods=["GET"])
+def api_record_status():
+    """Recorder status and the recorded sessions."""
+    return jsonify({"ok": True, **RECORDER.status(), "files": RECORDER.list()})
+
+
+@APP.route("/api/v1/record/start", methods=["POST"])
+def api_record_start():
+    """Start recording: {"name":"garis-AB","note":"jalan lurus A->B"}."""
+    body = request.get_json(silent=True) or {}
+    with LOCK:
+        path = RECORDER.start(body.get("name", "sesi"), body.get("note", ""),
+                              copy.deepcopy(SCENE),
+                              {"nlos_enabled": NLOS_ENABLED,
+                               "tracking": tracker.tracking_params(SCENE)},
+                              t=now_ms())
+    print(f"[record] -> {path}")
+    return jsonify({"ok": True, **RECORDER.status()})
+
+
+@APP.route("/api/v1/record/stop", methods=["POST"])
+def api_record_stop():
+    """Stop recording."""
+    with LOCK:
+        path = RECORDER.stop()
+    return jsonify({"ok": True, "file": os.path.basename(path) if path else None})
+
+
+@APP.route("/api/v1/record/mark", methods=["POST"])
+def api_record_mark():
+    """Marker in the recording: {"label":"di titik A","x":0.5,"y":1.0}."""
+    body = request.get_json(silent=True) or {}
+    if not RECORDER.active:
+        return jsonify({"ok": False, "error": "not recording"}), 409
+    mark = {"k": "mark", "t": now_ms(), "label": str(body.get("label", "mark"))}
+    for k in ("x", "y"):
+        if k in body:
+            try:
+                mark[k] = float(body[k])
+            except (TypeError, ValueError):
+                pass
+    with LOCK:
+        RECORDER.write(mark)
+    return jsonify({"ok": True, "mark": mark})
+
+
+@APP.route("/api/v1/record/file/<path:name>", methods=["GET"])
+def api_record_file(name):
+    """Download one recorded session."""
+    if "/" in name or "\\" in name or not name.endswith(".jsonl"):
+        return jsonify({"ok": False, "error": "bad name"}), 400
+    return send_from_directory(RECORDER.dir, name, mimetype="application/x-ndjson",
+                               as_attachment=True)
+
+
+# ---------------------------------------------------------------------------
 # navigation integration (wideband-navigation contract)
 #
 # The trolley (wideband-navigation) consumes the *processed* position and the
@@ -1621,6 +1652,7 @@ def main():
 
     print(f"[server] http://0.0.0.0:{args.port}" + ("  (token auth)" if args.token else ""))
     load_scene()
+    configure_engine(reset=True)
     _load_ota_tokens()
     if args.mqtt:
         mqtt_start()

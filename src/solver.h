@@ -115,11 +115,15 @@ inline Position solvePosition(const AnchorFix *a, uint8_t n, float room_w, float
     const double det = A[0] * C - A[1] * A[1];
     if (fabs(det) < 1e-9) return r;
 
-    double px = (B[0] * C - B[1] * A[1]) / det;
-    double py = (A[0] * B[1] - A[1] * B[0]) / det;
+    // Subtracting the equations gives  2(xi-x0) x + 2(yi-y0) y = -b , so the
+    // normal-equation solution is the NEGATIVE of the expression below. The
+    // missing minus used to return the point mirrored through the origin
+    // (1.2, 3.7) -> (-1.2, -3.7), and two Gauss-Newton steps could not undo it.
+    double px = -(B[0] * C - B[1] * A[1]) / det;
+    double py = -(A[0] * B[1] - A[1] * B[0]) / det;
 
-    // one Gauss-Newton refinement on the true (non-linear) residual
-    for (uint8_t it = 0; it < 2; it++) {
+    // Gauss-Newton refinement on the true (non-linear) residual
+    for (uint8_t it = 0; it < 5; it++) {
         double j0 = 0, j1 = 0, j2 = 0, e0 = 0, e1 = 0;
         for (uint8_t i = 0; i < m; i++) {
             const double dx = px - f[i].x, dy = py - f[i].y;

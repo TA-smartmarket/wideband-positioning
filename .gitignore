@@ -17,3 +17,6 @@ server/ota_tokens.json
 # run the download again or copy the files when needed.
 docs/papers/*.pdf
 contoh_gambar
+
+# recorded sessions (tools/evaluate.py)
+server/logs/

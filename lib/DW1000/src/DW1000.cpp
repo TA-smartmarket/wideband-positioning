@@ -183,7 +183,8 @@ void DW1000Class::begin(uint8_t irq, uint8_t rst)
 	// attach interrupt
 	// attachInterrupt(_irq, DW1000Class::handleInterrupt, CHANGE); // todo interrupt for ESP8266
 	// TODO throw error if pin is not a interrupt pin
-	attachInterrupt(digitalPinToInterrupt(_irq), DW1000Class::handleInterrupt, RISING); // todo interrupt for ESP8266
+	// The ISR only flags the event; poll() does the SPI work from the loop.
+	attachInterrupt(digitalPinToInterrupt(_irq), DW1000Class::isr, RISING); // todo interrupt for ESP8266
 }
 
 void DW1000Class::manageLDE()
@@ -970,6 +971,28 @@ void DW1000Class::tune()
 /* ###########################################################################
  * #### Interrupt handling ###################################################
  * ######################################################################### */
+
+volatile boolean DW1000Class::_irqPending = false;
+
+// In IRAM and without any SPI: safe to run while the flash cache is disabled
+// (NVS / OTA writes) and never touches the SPI bus mutex.
+void IRAM_ATTR DW1000Class::isr()
+{
+	_irqPending = true;
+}
+
+void DW1000Class::poll()
+{
+	// The level is checked as well as the edge flag: if another event arrives
+	// while the previous one is being handled, the IRQ line simply stays high
+	// and no new rising edge (hence no new flag) is produced.
+	if (!_irqPending && digitalRead(_irq) != HIGH)
+	{
+		return;
+	}
+	_irqPending = false;
+	handleInterrupt();
+}
 
 void DW1000Class::handleInterrupt()
 {

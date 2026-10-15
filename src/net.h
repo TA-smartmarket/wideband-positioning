@@ -138,6 +138,12 @@ inline void mqttEnsureConnected()
     if (millis() - net.last_retry < 3000) return;
     net.last_retry = millis();
 
+    // PubSubClient's default buffer is 256 bytes. A telemetry batch (and the
+    // config the server pushes) is several times that, and publish() simply
+    // returns false for anything bigger -- so over MQTT nothing arrived.
+    static bool sized = false;
+    if (!sized) sized = g_mqtt.setBufferSize(4096);
+
     char id[24];
     deviceId(cfg, id, sizeof(id));
     g_mqtt.setServer(cfg.mqtt_host, cfg.mqtt_port);
@@ -237,6 +243,11 @@ inline void wifiBegin()
     }
     WiFi.mode(WIFI_AP_STA);     // STA now, AP only if the portal is needed
     WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
+    // Modem sleep (the ESP32 default) holds outgoing frames until the next
+    // beacon: LAN round trips were ~60 ms and the tag's 5 Hz uplink stalled
+    // for seconds, after which the server saw a 1.7-s-old backlog. The nodes
+    // are USB powered, so keep the radio awake.
+    WiFi.setSleep(false);
     Serial.printf("[wifi] connecting to %s\n", cfg.wifi_ssid);
 }
 
@@ -267,7 +278,7 @@ inline void wifiLoop()
     }
     if (millis() - last > 10000) {           // retry; after 3 tries open the portal
         last = millis();
-        if (cfg.wifi_ssid[0]) { WiFi.disconnect(); WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass); }
+        if (cfg.wifi_ssid[0]) { WiFi.disconnect(); WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass); WiFi.setSleep(false); }
         if (++fails >= 3 && !net.portal_on) {
             Serial.println(F("[wifi] cannot connect -> starting setup portal"));
             portalStart();

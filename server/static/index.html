@@ -105,6 +105,37 @@
         <button id="ota-push-all" class="primary">⬆ Push to all online</button>
       </div>
       <div id="ota-result" class="muted" style="margin-top:8px"></div>
+
+      <h3 style="margin-top:16px">Calibration &amp; static test</h3>
+      <p class="muted">Put the tag still on a spot you measured with the laser
+         meter (same origin as the anchors), enter its X/Y and press Measure.
+         The server compares every raw range with the true distance to each
+         anchor and reports the position error there. Measure 2–4 spots, then
+         Apply to correct each anchor's range bias.</p>
+      <div class="row">
+        <label>X (m)<input id="cal-x" type="number" step="0.01"></label>
+        <label>Y (m)<input id="cal-y" type="number" step="0.01"></label>
+        <label>Seconds<input id="cal-sec" type="number" min="3" max="120" step="1" value="15"></label>
+      </div>
+      <label><input id="cal-store" type="checkbox" checked> Keep as calibration point
+        (untick for a pure accuracy test)</label>
+      <div class="row btns">
+        <button id="cal-measure" class="primary">📍 Measure here</button>
+        <button id="cal-apply">Apply calibration</button>
+        <button id="cal-clear">Clear</button>
+      </div>
+      <div id="cal-result" class="muted" style="margin-top:8px"></div>
+
+      <h3 style="margin-top:16px">Record session</h3>
+      <p class="muted">Records every raw packet and estimate to
+         <code>server/logs/</code>. Analyse with
+         <code>python tools/evaluate.py &lt;file&gt; --path x1,y1 x2,y2</code>.</p>
+      <label>Session name<input id="rec-name" type="text" placeholder="line-A-B"></label>
+      <div class="row btns">
+        <button id="rec-toggle" class="primary">⏺ Start recording</button>
+        <button id="rec-mark">Mark</button>
+      </div>
+      <div id="rec-status" class="muted" style="margin-top:8px"></div>
     </section>
 
     <!-- ------------------------------------------------------- DEVICES -->

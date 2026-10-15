@@ -1664,6 +1664,8 @@ function showSelection() {
         <tr><td>Speed</td><td>${Math.hypot(t.vx || 0, t.vy || 0).toFixed(2)} m/s</td></tr>
         <tr><td>1σ</td><td>${fmt(t.sigma)} m</td></tr>
         <tr><td>Confidence</td><td>${((t.confidence ?? 0) * 100).toFixed(0)}%</td></tr>
+        <tr><td>Range offset</td><td>${t.range_bias === undefined ? '—' : (t.range_bias * 100).toFixed(1) + ' cm'}</td></tr>
+        <tr><td>Samples</td><td>${t.rate_hz ?? '—'}/s (${t.used ?? '—'} used)</td></tr>
         <tr><td>Status</td><td>${t.online ? 'live' : 'offline'}</td></tr>
       </table>
       <h4>Links</h4>${linksTable(t)}
@@ -1672,11 +1674,14 @@ function showSelection() {
 }
 
 function linksTable(t) {
+  // Residual = measured minus predicted range at the last update; a link that
+  // is consistently far off (or rejected) points at NLOS or a wrong anchor
+  // position in the scene.
   const rows = Object.entries(t.links || {}).map(([aid, i]) => `
-    <tr><td>${aid}</td><td>${fmt(t.ranges?.[aid])} m</td>
+    <tr><td>${aid}</td><td>${fmt(i.range ?? t.ranges?.[aid])} m</td>
         <td>${i.blocked ? '<span class="bad">NLOS</span>' : '<span class="good">LOS</span>'}</td>
-        <td>σ ${fmt(i.sigma)}</td></tr>`).join('');
-  return rows ? `<table class="kv"><tr><th>Anchor</th><th>Range</th><th>Path</th><th>Noise</th></tr>${rows}</table>`
+        <td>${i.residual === undefined ? '—' : (i.residual * 100).toFixed(0) + ' cm'}${i.accepted === false ? ' <span class="bad">✕</span>' : ''}</td></tr>`).join('');
+  return rows ? `<table class="kv"><tr><th>Anchor</th><th>Range</th><th>Path</th><th>Residual</th></tr>${rows}</table>`
               : '<p class="muted">No links yet.</p>';
 }
 
@@ -1992,7 +1997,7 @@ function setTab(name) {
   });
   if (name === 'devices') renderDevices();
   if (name === 'api') renderApi();
-  if (name === 'setup') loadOta();
+  if (name === 'setup') { loadOta(); loadCal(); loadRec(); }
 }
 
 /* ==========================================================================
@@ -2045,6 +2050,107 @@ async function renderDevices() {
       } catch (e) { toast('Key rotation failed'); }
     };
   });
+}
+
+/* ==========================================================================
+   Calibration / static accuracy test (POST /api/v1/calibration/*)
+   ========================================================================== */
+const cm = (v) => (v === undefined || v === null) ? '—' : (v * 100).toFixed(1) + ' cm';
+
+function calTable(cal) {
+  const a = cal?.anchors || {};
+  const rows = Object.entries(a).map(([id, c]) =>
+    `<tr><td>${esc(id)}</td><td>${cm(c.bias)}</td><td>${(c.scale ?? 1).toFixed(4)}</td><td>${c.points ?? '—'}</td></tr>`).join('');
+  const pts = (cal?.points || []).length;
+  return (rows ? `<table class="kv"><tr><th>Anchor</th><th>Bias</th><th>Scale</th><th>Pts</th></tr>${rows}</table>`
+               : '<p class="muted">No calibration applied.</p>') +
+         `<p class="muted">${pts} stored point(s).</p>`;
+}
+
+async function loadCal() {
+  try {
+    const d = await (await fetch('/api/v1/calibration')).json();
+    $('cal-result').innerHTML = calTable(d.calibration);
+  } catch (e) { /* offline */ }
+}
+
+async function calMeasure() {
+  const x = parseFloat($('cal-x').value), y = parseFloat($('cal-y').value);
+  const seconds = parseFloat($('cal-sec').value) || 15;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) { toast('Enter the measured X and Y first.'); return; }
+  const btn = $('cal-measure');
+  btn.disabled = true;
+  $('cal-result').innerHTML = `<p>Collecting for ${seconds} s — keep the tag still…</p>`;
+  try {
+    const r = await fetch('/api/v1/calibration/point', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ x, y, seconds, store: $('cal-store').checked }),
+    });
+    const d = await r.json();
+    if (!d.ok) { $('cal-result').textContent = d.error || 'failed'; Audio2.error(); return; }
+    const rows = Object.entries(d.point.anchors).map(([id, a]) =>
+      `<tr><td>${esc(id)}</td><td>${a.n}</td><td>${a.true.toFixed(3)}</td><td>${a.median.toFixed(3)}</td><td>${cm(a.error)}</td><td>${cm(a.std)}</td></tr>`).join('');
+    const p = d.position;
+    $('cal-result').innerHTML =
+      `<table class="kv"><tr><th>Anchor</th><th>n</th><th>True</th><th>Measured</th><th>Error</th><th>σ</th></tr>${rows}</table>` +
+      (p ? `<table class="kv" style="margin-top:6px">
+        <tr><td>Mean position</td><td>${p.mean_x.toFixed(3)}, ${p.mean_y.toFixed(3)} m</td></tr>
+        <tr><td>Accuracy (mean error)</td><td>${cm(p.mean_error)}</td></tr>
+        <tr><td>Precision (σ)</td><td>${cm(p.std)}</td></tr>
+        <tr><td>RMSE / CEP50 / CEP95</td><td>${cm(p.rmse)} / ${cm(p.cep50)} / ${cm(p.cep95)}</td></tr>
+      </table>` : '<p class="muted">No position estimates during the window.</p>') +
+      `<p class="muted">${d.stored ? 'Stored as a calibration point — press Apply when done.' : 'Accuracy test only (not stored).'}</p>`;
+    Audio2.success();
+  } catch (e) {
+    $('cal-result').textContent = 'Server unreachable.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function calApply() {
+  const d = await (await fetch('/api/v1/calibration/apply', { method: 'POST' })).json();
+  toast(d.ok ? `Calibration applied to ${Object.keys(d.anchors).length} anchor(s).` : 'Apply failed.');
+  loadCal();
+}
+
+async function calClear() {
+  if (!confirm('Forget every calibration point and correction?')) return;
+  await fetch('/api/v1/calibration/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  toast('Calibration cleared.');
+  loadCal();
+}
+
+/* ==========================================================================
+   Session recording (POST /api/v1/record/*)
+   ========================================================================== */
+async function loadRec() {
+  try {
+    const d = await (await fetch('/api/v1/record')).json();
+    $('rec-toggle').textContent = d.active ? '⏹ Stop recording' : '⏺ Start recording';
+    $('rec-mark').disabled = !d.active;
+    const files = (d.files || []).slice(0, 6).map((f) =>
+      `<li><a href="/api/v1/record/file/${encodeURIComponent(f.file)}">${esc(f.file)}</a> <span class="muted">${(f.size / 1024).toFixed(0)} kB</span></li>`).join('');
+    $('rec-status').innerHTML = (d.active ? `<p>● Recording <code>${esc(d.file)}</code> — ${d.lines} lines</p>` : '') +
+      (files ? `<ul style="margin:4px 0 0 16px;padding:0">${files}</ul>` : '');
+  } catch (e) { /* offline */ }
+}
+
+async function recToggle() {
+  const st = await (await fetch('/api/v1/record')).json();
+  const url = st.active ? '/api/v1/record/stop' : '/api/v1/record/start';
+  await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify({ name: $('rec-name').value || 'session' }) });
+  toast(st.active ? 'Recording stopped.' : 'Recording…');
+  loadRec();
+}
+
+async function recMark() {
+  const label = prompt('Marker label (e.g. "at point B")', 'mark');
+  if (label === null) return;
+  await fetch('/api/v1/record/mark', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                       body: JSON.stringify({ label }) });
+  loadRec();
 }
 
 /* ==========================================================================
@@ -2403,6 +2509,11 @@ function initUi() {
   };
   $('ota-push-all').onclick = () => pushOta('all');
   $('scr-apply').onclick = applyScreenPolicy;
+  $('cal-measure').onclick = calMeasure;
+  $('cal-apply').onclick = calApply;
+  $('cal-clear').onclick = calClear;
+  $('rec-toggle').onclick = recToggle;
+  $('rec-mark').onclick = recMark;
 
   addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -2494,7 +2605,9 @@ loadScene().then(() => { setView('iso'); playIntro(); });
 applyTheme(localStorage.getItem('uwb-theme') || 'dark');
 setPalette(document.documentElement.dataset.theme);   // 3D colours before the first build
 poll();
-setInterval(poll, 500);
+// 5 Hz: the server now updates at the tag's uplink rate (firmware 1.0.32),
+// so a slower poll would draw the trail as a coarse polyline.
+setInterval(poll, 200);
 
 // Small read-only hook used by the automated UI tests (camera distance,
 // pending zoom momentum, held keys). Harmless in normal use.

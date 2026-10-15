@@ -79,9 +79,11 @@ Sent as a batch. `ranges` and `status` may both be present.
   "ranges": [
     {
       "ts": 1727880000123,
+      "seq": 5121,
       "src": "anchor-1",
       "dst": "tag-1",
       "range": 2.731,
+      "raw": 2.744,
       "rx_power": -71.04,
       "fp_power": -74.20,
       "quality": 0.87
@@ -107,10 +109,29 @@ Sent as a batch. `ranges` and `status` may both be present.
 }
 ```
 
-- `range` — metres. `rx_power`/`fp_power` — dBm. `quality` — 0..1.
+- `range` — metres, pre-filtered on the device (gate + median-3 + EMA).
+  `raw` — the unfiltered two-way-ranging result (firmware ≥ 1.0.32); the
+  server tracker uses `raw` when present. `rx_power`/`fp_power` — dBm.
+  `quality` — 0..1.
+- `ranges` holds **every sample measured since the previous packet**, each
+  sent exactly once (firmware ≥ 1.0.32). Older firmware sent the latest value
+  per link again in every packet; the server deduplicates by `ts`, so both
+  work.
+- `ts` (per range) — the device's `millis()` when the sample was measured.
+  `ts` (packet) — `millis()` when the packet was built. The server maps each
+  device clock to its own (minimum-latency offset) and applies every sample at
+  the time it was measured.
+- `seq` — per-device sample counter (diagnostics: gaps = lost samples).
+- `status.samples_dropped` — samples lost because the uplink was down.
+- `status.reset` — why the chip last restarted (`poweron`, `software`,
+  `panic`, `int_wdt`, `task_wdt`, `brownout`, …); `status.heap_min` — lowest
+  free heap since boot. Shown per device in `/api/v1/state` → `devices[]`.
 - `positions` — only the **tag** may include locally solved positions
-  (`"source": "device"`); the server ignores/merges them.
-- `ts` — device `millis()`-based epoch ms. Server stamps `recv_ts` itself.
+  (`"source": "device"`); the server shows them only while it has no track of
+  its own for that tag.
+- Rates: the tag sends every `update_ms` (default 200 ms), anchors every
+  `5 × update_ms`. The tag's copies win; the anchors' copies of the same
+  exchanges are only used when the tag has sent nothing for 10 s.
 
 ---
 
@@ -126,7 +147,17 @@ required on `/api/v1/*` **only if** the server was started with a token.
 | `GET`  | `/api/v1/state` | Current world state (section 6) |
 | `GET`  | `/api/v1/devices` | List known devices + last seen |
 | `PUT`  | `/api/v1/config` | Web UI writes config for a device |
-| `POST` | `/api/v1/position` | Solve now from current ranges (debug) |
+| `POST` | `/api/v1/position` | Current tracker estimate of every tag (debug) |
+| `GET`  | `/api/v1/calibration` | Stored calibration points + per-anchor correction |
+| `POST` | `/api/v1/calibration/point` | `{"x","y","seconds":15,"store":true}` — tag held still on a measured spot; returns range error per anchor + position error (mean error, σ, RMSE, CEP50/95). Blocks for `seconds` |
+| `POST` | `/api/v1/calibration/apply` | Fit `measured = scale·true + bias` per anchor from the stored points |
+| `POST` | `/api/v1/calibration/clear` | Forget points and/or corrections |
+| `GET`/`PUT` | `/api/v1/tracking` | Tracker tuning (`sigma_a`, `sigma_r`, `huber_k`, `gate`, …) |
+| `GET`  | `/api/v1/record` | Recorder status + recorded sessions |
+| `POST` | `/api/v1/record/start` | `{"name","note"}` — record every packet + estimate to `server/logs/*.jsonl` |
+| `POST` | `/api/v1/record/stop` | Stop recording |
+| `POST` | `/api/v1/record/mark` | `{"label","x","y"}` — marker in the recording |
+| `GET`  | `/api/v1/record/file/<name>` | Download a recording |
 | `GET`  | `/api/v1/navigation/position` | Trolley position in the navigation contract (section 8) |
 | `GET`  | `/api/v1/navigation/scene` | Static obstacles in the navigation contract (section 8) |
 | `GET`  | `/` | Web UI (live map + config) |
@@ -145,7 +176,6 @@ Base topic from config: `base_topic` (e.g. `uwb/home`).
 
 | Topic | Dir | Retained | Payload |
 |---|---|---|---|
-| `<base>/range` | device → server | no | one range object (section 3) |
 | `<base>/telemetry` | device → server | no | full telemetry object |
 | `<base>/config/<device_id>` | server → device | **yes** | config object |
 | `<base>/cmd/<device_id>` | server → device | no | `{"cmd":"reboot"}` |
@@ -155,8 +185,12 @@ Base topic from config: `base_topic` (e.g. `uwb/home`).
 Device behaviour:
 1. On connect, publish its `status` (retained) and subscribe to
    `<base>/config/<device_id>` + `<base>/cmd/<device_id>`.
-2. Publish every range to `<base>/range` plus a batch to `<base>/telemetry`;
-   batch to REST every `update_ms * 5` or when MQTT is down.
+2. Publish batches of fresh samples to `<base>/telemetry` (tag every
+   `update_ms`, anchors every `5 × update_ms`); REST when MQTT is down or the
+   publish fails. The MQTT client buffer is 4 kB (PubSubClient's 256-byte
+   default silently dropped every telemetry batch). The old per-range
+   `<base>/range` messages are no longer sent — they carried no `device_id`,
+   so the server could never map their timestamps.
 3. On a `config/<device_id>` message → apply partial config, persist to NVS
    (reboot when role/id changed). On `cmd/<device_id>` → run the command.
 
@@ -196,29 +230,30 @@ not pick a room-interior solution — the position is a mirror guess.
 
 ## 7. Localisation rules (server)
 
-The pipeline is **pre-filter → bootstrap → EKF tracking** (full maths in
-`docs/ARCHITECTURE.md` §5).
+Implemented in `server/tracker.py`; the reasoning and the before/after
+evidence are in `docs/PERBAIKAN_AKURASI.md`.
 
-1. Collect the most recent range per `(anchor, tag)` pair (age < `stale_ms`,
-   default 2000 ms). Ranges arrive already pre-filtered by the device
-   (median + outlier gate; the library's own low-pass is disabled).
-2. Need ≥ 2 anchor ranges for a tag, with known anchor positions.
-3. **Bootstrap (first fix only)** — closed-form geometry:
-   - **2 anchors** → circle intersection gives two candidates; pick the one
-     inside `room` bounds. If both or neither are inside → `ambiguous: true`,
-     the one closer to room centre is used.
-   - **3+ anchors** → least-squares multilateration (linearised, 2 unknowns).
-4. **Tracking (after the first fix)** — **Extended Kalman Filter**
-   (`class TagEKF`), state `[px, py, vx, vy]`:
-   - `predict(dt)` with the constant-velocity model + process noise `sigma_a`;
-   - one scalar `update_range(ax, ay, z)` per anchor, linearised Jacobian
-     `H = [(px-ax)/d, (py-ay)/d, 0, 0]`;
-   - **innovation gating**: `|z - h(x)| > 3·sqrt(S)` → measurement rejected
-     (NLOS/outlier) and skipped.
-5. `confidence` = `1 / (1 + sigma)` with `sigma = sqrt(P00 + P11)` from the
-   EKF covariance (shrinks as measurements accumulate). `vx`/`vy` (m/s) and
-   `sigma` are included in the tag state.
-6. Positions are recomputed on every ingest and broadcast on `<base>/state`.
+1. **Each sample once, at its own time.** Samples are deduplicated per
+   `(reporter, anchor, tag)` by their device `ts`, ordered, and applied at
+   `device_ts + clock_offset(reporter)`.
+2. **One source per tag** — the tag's own reports are used (all its ranges
+   share one clock); anchors' copies only when the tag has sent nothing for
+   10 s. Ranges longer than the farthest room corner + 1.5 m are dropped.
+3. **Range correction** — `r = (raw − bias_i) / scale_i` from the calibration
+   (`scene.calibration.anchors`), then the NLOS bias of a blocked path.
+4. **Bootstrap** — slant-range multilateration (closed form + Gauss-Newton on
+   `sqrt(dx² + dy² + dz²)`) from all anchors heard in the last 0.7 s (3 are
+   enough after 2 s). Not shown until it has absorbed 2 samples per anchor.
+5. **EKF** — state `[px, py, vx, vy, b]`, Singer velocity model (`sigma_a`
+   0.8 m/s², velocity correlation time `vel_tau_s` 1 s), `b` = range offset shared by all anchors (estimated online when
+   there are ≥ 3 anchors). Measurement `h = sqrt((px−ax)² + (py−ay)² + dz²) + b`
+   with `dz = anchor_z − tag_z` — no projection of the range onto the floor.
+6. **Robust update** — normalised innovation `|ν| > 2.5` → measurement noise
+   inflated (Huber); `|ν| > 6` → rejected. No accepted sample for 1.5 s →
+   re-initialised from multilateration.
+7. `confidence = 1 / (1 + sigma)`, `sigma = sqrt(P00 + P11)`; the tag state
+   also carries `range_bias` (b), `rate_hz` (samples/s), `used` (accepted/s)
+   and per-link `residual` / `accepted`.
 
 ---
 

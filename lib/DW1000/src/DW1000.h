@@ -47,7 +47,21 @@ public:
 	@param[in] rst The reset line/pin for hard resets of ICs that connect to the Arduino. Value 0xff means soft reset.
 	*/
 	static void begin(uint8_t irq, uint8_t rst = 0xff);
-	
+
+	/**
+	Services a pending DW1000 interrupt. Must be called from the main loop
+	(DW1000Ranging::loop() does it).
+
+	The interrupt handler used to run entirely inside the ISR, reading the
+	status register over SPI. On the ESP32 every SPI transaction takes a
+	FreeRTOS mutex; taking it from an ISR asserts ("panic"), and when the main
+	loop already held the bus the ISR spun until the interrupt watchdog reset
+	the chip ("int_wdt"). Anchors, which receive every frame in the network,
+	crashed every few minutes. The ISR now only raises a flag and this
+	function does the SPI work in task context.
+	*/
+	static void poll();
+
 	/** 
 	Selects a specific DW1000 chip for communication. In case of a single DW1000 chip in use
 	this call only needs to be done once at start up, but is still mandatory. Other than a call
@@ -471,7 +485,11 @@ public:
 	// whether debounce clock is active
 	static boolean _debounceClockEnabled;
 
-	/* Arduino interrupt handler */
+	/* Arduino interrupt handler: only flags the event (see poll()) */
+	static void isr();
+	static volatile boolean _irqPending;
+
+	/* Event processing, called from poll() in task context */
 	static void handleInterrupt();
 	
 	/* Allow MAC frame filtering . */
