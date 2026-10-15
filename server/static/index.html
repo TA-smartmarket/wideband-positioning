@@ -106,6 +106,30 @@
       </div>
       <div id="ota-result" class="muted" style="margin-top:8px"></div>
 
+      <h3 style="margin-top:16px">Tracker</h3>
+      <p class="muted">Positioning algorithm and its main tuning. Applied at
+         once (the track restarts), no server restart needed.</p>
+      <label>Algorithm
+        <select id="trk-algo">
+          <option value="ekf">EKF (default)</option>
+          <option value="ekf_nlos">EKF + NLOS test (Fan &amp; Du 2022)</option>
+          <option value="wls_rkf">WLS-RKF (Fan &amp; Du 2022)</option>
+        </select>
+      </label>
+      <div class="row">
+        <label>Accel noise (m/s²)<input id="trk-sa" type="number" step="0.1" min="0.05"></label>
+        <label>Range noise (m)<input id="trk-sr" type="number" step="0.01" min="0.01"></label>
+      </div>
+      <div class="row">
+        <label>Velocity τ (s)<input id="trk-tau" type="number" step="0.1" min="0"></label>
+        <label>NLOS χ²<input id="trk-chi" type="number" step="0.1" min="1"></label>
+      </div>
+      <div class="row btns">
+        <button id="trk-apply" class="primary">Apply</button>
+        <button id="trk-reset">Defaults</button>
+      </div>
+      <div id="trk-result" class="muted" style="margin-top:8px"></div>
+
       <h3 style="margin-top:16px">Calibration &amp; static test</h3>
       <p class="muted">Put the tag still on a spot you measured with the laser
          meter (same origin as the anchors), enter its X/Y and press Measure.

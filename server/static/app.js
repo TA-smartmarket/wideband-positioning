@@ -1997,7 +1997,7 @@ function setTab(name) {
   });
   if (name === 'devices') renderDevices();
   if (name === 'api') renderApi();
-  if (name === 'setup') { loadOta(); loadCal(); loadRec(); }
+  if (name === 'setup') { loadOta(); loadCal(); loadRec(); loadTracking(); }
 }
 
 /* ==========================================================================
@@ -2050,6 +2050,49 @@ async function renderDevices() {
       } catch (e) { toast('Key rotation failed'); }
     };
   });
+}
+
+/* ==========================================================================
+   Tracker algorithm + tuning (GET/PUT /api/v1/tracking)
+   ========================================================================== */
+const TRK_FIELDS = { 'trk-sa': 'sigma_a', 'trk-sr': 'sigma_r', 'trk-tau': 'vel_tau_s', 'trk-chi': 'nlos_chi2' };
+let trkDefaults = {};
+
+function showTracking(d) {
+  trkDefaults = d.defaults || trkDefaults;
+  $('trk-algo').value = d.params.algorithm;
+  for (const [id, key] of Object.entries(TRK_FIELDS)) $(id).value = d.params[key];
+  $('trk-chi').disabled = d.params.algorithm === 'ekf';
+}
+
+async function loadTracking() {
+  try { showTracking(await (await fetch('/api/v1/tracking')).json()); } catch (e) { /* offline */ }
+}
+
+async function putTracking(body) {
+  const r = await fetch('/api/v1/tracking', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const d = await r.json();
+  if (!d.ok) { $('trk-result').textContent = d.error || 'failed'; Audio2.error(); return; }
+  showTracking(d);
+  $('trk-result').textContent = `Active: ${d.params.algorithm} — the track restarts with the new setting.`;
+  Audio2.success();
+}
+
+function applyTracking() {
+  const body = { algorithm: $('trk-algo').value };
+  for (const [id, key] of Object.entries(TRK_FIELDS)) {
+    const v = parseFloat($(id).value);
+    if (Number.isFinite(v)) body[key] = v;
+  }
+  putTracking(body);
+}
+
+function resetTracking() {
+  const body = { algorithm: trkDefaults.algorithm || 'ekf' };
+  for (const key of Object.values(TRK_FIELDS)) if (key in trkDefaults) body[key] = trkDefaults[key];
+  putTracking(body);
 }
 
 /* ==========================================================================
@@ -2509,6 +2552,8 @@ function initUi() {
   };
   $('ota-push-all').onclick = () => pushOta('all');
   $('scr-apply').onclick = applyScreenPolicy;
+  $('trk-apply').onclick = applyTracking;
+  $('trk-reset').onclick = resetTracking;
   $('cal-measure').onclick = calMeasure;
   $('cal-apply').onclick = calApply;
   $('cal-clear').onclick = calClear;

@@ -64,6 +64,11 @@ BODY_NOISE = 0.05
 LOSS_P = 0.08                        # whole exchange lost
 REPORT_LOSS_P = 0.03                 # only the RANGE_REPORT to the tag lost
 CAL_RESIDUAL = 0.03                  # bias error left after calibration (1 sigma)
+# --scenario wall: a wall between the right half of the room and one anchor,
+# i.e. sustained strong NLOS like the statue in Fan & Du 2022 (paper 4)
+WALL_ANCHOR = "anchor-3"             # the anchor at (4.5, 0)
+WALL_X = 2.25                        # tag x beyond this -> path through the wall
+WALL_BIAS = (0.5, 0.9)               # NLOS excess range (m)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +144,7 @@ class FwRangeFilter:
         return self.out
 
 
-def simulate_radio(scene, segs, rng, duration_s):
+def simulate_radio(scene, segs, rng, duration_s, wall=False):
     """Every two-way-ranging exchange: list of dicts with true time (ms),
     anchor id, range value, and which side received it."""
     anchors = scene["anchors"]
@@ -163,6 +168,8 @@ def simulate_radio(scene, segs, rng, duration_s):
                 r += BODY_BIAS + abs(rng.gauss(0, BODY_NOISE))
             if rng.random() < OUTLIER_P:
                 r += rng.uniform(*OUTLIER_RANGE)
+            if wall and a["id"] == WALL_ANCHOR and px > WALL_X:
+                r += rng.uniform(*WALL_BIAS)
             out.append({"t": tm, "anchor": a["id"], "r": r,
                         "tag_rx": rng.random() >= REPORT_LOSS_P})
         t += POLL_PERIOD_MS + rng.uniform(0, 10)
@@ -260,11 +267,13 @@ def run_legacy(legacy, scene, stream):
     return track
 
 
-def run_new(scene, stream, calibration=None):
+def run_new(scene, stream, calibration=None, tracking=None):
     eng = tracker.Engine()
     sc = json.loads(json.dumps(scene))
     if calibration:
         sc["calibration"] = {"anchors": calibration}
+    if tracking:
+        sc["tracking"] = tracking
     eng.configure(sc, True, nlos_mod=scene_mod)
     track = []
     for recv, dev, payload in stream:
@@ -318,33 +327,60 @@ def main():
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--no-plot", action="store_true")
-    ap.add_argument("--out", default=str(ROOT / "docs" / "img" / "sim_before_after.png"))
+    ap.add_argument("--out", default=None, help="plot file (default under docs/img/)")
+    ap.add_argument("--compare", choices=("before_after", "algorithms"), default="before_after",
+                    help="before_after: old vs new pipeline; algorithms: EKF vs WLS-RKF (paper 4)")
+    ap.add_argument("--scenario", choices=("default", "wall"), default="default",
+                    help="wall: one anchor behind a wall for half of the room (strong NLOS)")
     args = ap.parse_args()
+    wall = args.scenario == "wall"
+    out = args.out or str(ROOT / "docs" / "img" /
+                          f"sim_{args.compare}{'_wall' if wall else ''}.png")
 
     scene = DEFAULT_SCENE
     segs = build_truth()
     duration = segs[-1][1] + 1.0
 
-    legacy = load_legacy()
-    names = {"A": "Lama: server 1aff68c + FW 1.0.31",
-             "B": "Server baru + FW 1.0.31 (tanpa OTA)",
-             "C": "Server baru + FW 1.0.32 (raw 5 Hz)",
-             "D": "C + kalibrasi bias per anchor"}
+    if args.compare == "before_after":
+        legacy = load_legacy()
+        names = {"A": "Lama: server 1aff68c + FW 1.0.31",
+                 "B": "Server baru + FW 1.0.31 (tanpa OTA)",
+                 "C": "Server baru + FW 1.0.32 (raw 5 Hz)",
+                 "D": "C + kalibrasi bias per anchor"}
+    else:
+        names = {"C": "EKF (tracker proyek)",
+                 "E": "WLS-RKF (Fan & Du 2022)",
+                 "G": "EKF + uji NLOS Fan & Du",
+                 "D": "EKF + kalibrasi",
+                 "F": "WLS-RKF + kalibrasi",
+                 "H": "EKF + uji NLOS + kalibrasi"}
+    wls = {"algorithm": "wls_rkf"}
+    hyb = {"algorithm": "ekf_nlos"}
     agg = {k: [] for k in names}
     jumps_agg = {k: 0 for k in names}
     first = None
     for run in range(args.runs):
         rng = random.Random(args.seed + run)
-        ex, bias = simulate_radio(scene, segs, rng, duration)
+        ex, bias = simulate_radio(scene, segs, rng, duration, wall=wall)
         s_old = telemetry_stream(scene, ex, random.Random(rng.random()), duration, "1.0.31")
         s_new = telemetry_stream(scene, ex, random.Random(rng.random()), duration, "1.0.32")
         cal = {a: {"bias": b + rng.gauss(0, CAL_RESIDUAL), "scale": 1.0} for a, b in bias.items()}
-        tracks = {
-            "A": run_legacy(legacy, scene, s_old),
-            "B": run_new(scene, s_old)[0],
-            "C": run_new(scene, s_new)[0],
-            "D": run_new(scene, s_new, cal)[0],
-        }
+        if args.compare == "before_after":
+            tracks = {
+                "A": run_legacy(legacy, scene, s_old),
+                "B": run_new(scene, s_old)[0],
+                "C": run_new(scene, s_new)[0],
+                "D": run_new(scene, s_new, cal)[0],
+            }
+        else:
+            tracks = {
+                "C": run_new(scene, s_new)[0],
+                "E": run_new(scene, s_new, tracking=wls)[0],
+                "G": run_new(scene, s_new, tracking=hyb)[0],
+                "D": run_new(scene, s_new, cal)[0],
+                "F": run_new(scene, s_new, cal, tracking=wls)[0],
+                "H": run_new(scene, s_new, cal, tracking=hyb)[0],
+            }
         for k, tr in tracks.items():
             m = metrics(segs, tr, duration)
             if m:
@@ -353,7 +389,9 @@ def main():
         if first is None:
             first = tracks
 
-    print(f"\n{args.runs} Monte-Carlo runs, walk {sum(math.dist(a, b) for a, b in zip(WAYPOINTS, WAYPOINTS[1:])):.1f} m "
+    print(f"\nscenario: {args.scenario}" + (f" ({WALL_ANCHOR} +{WALL_BIAS[0]}..{WALL_BIAS[1]} m "
+          f"while x > {WALL_X})" if wall else ""))
+    print(f"{args.runs} Monte-Carlo runs, walk {sum(math.dist(a, b) for a, b in zip(WAYPOINTS, WAYPOINTS[1:])):.1f} m "
           f"at {SPEED} m/s, room {scene['room']['width']} x {scene['room']['depth']} m, "
           f"{len(scene['anchors'])} anchors\n")
     hdr = f"{'pipeline':40s} {'RMSE':>7s} {'XT-RMSE':>8s} {'XT-P95':>7s} {'XT-max':>7s} {'Hz':>5s} {'jump>0.5m':>9s}"
@@ -371,18 +409,20 @@ def main():
     print("jump    = displayed position moved > 0.5 m between two updates (per run)")
 
     if not args.no_plot:
-        plot(scene, segs, first, names, summary, args.out)
+        plot(scene, segs, first, names, summary, out, wall)
 
 
-def plot(scene, segs, tracks, names, summary, out):
+def plot(scene, segs, tracks, names, summary, out, wall=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 4, figsize=(18, 5.6), sharey=True)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.5 * len(names), 5.6), sharey=True)
     w, d = scene["room"]["width"], scene["room"]["depth"]
     for ax, (k, name) in zip(axes, names.items()):
         ax.add_patch(plt.Rectangle((0, 0), w, d, fill=False, lw=1, color="#888"))
+        if wall:
+            ax.axvspan(WALL_X, w, color="#e9c46a", alpha=0.18, lw=0)
         for a in scene["anchors"]:
             ax.plot(a["x"], a["y"], "s", color="#2a9d8f", ms=8)
         tx = [p[0] for p in WAYPOINTS]
@@ -402,7 +442,9 @@ def plot(scene, segs, tracks, names, summary, out):
         ax.grid(alpha=0.25)
     axes[0].set_ylabel("y (m)")
     axes[0].legend(loc="center", fontsize=8)
-    fig.suptitle("Simulasi lintasan persegi + diagonal (0,8 m/s) — lintasan sama, error radio sama", fontsize=11)
+    fig.suptitle("Simulasi lintasan persegi + diagonal (0,8 m/s) — lintasan sama, error radio sama"
+                 + (f"  ·  area kuning: {WALL_ANCHOR} terhalang dinding (+{WALL_BIAS[0]}–{WALL_BIAS[1]} m)"
+                    if wall else ""), fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=130)

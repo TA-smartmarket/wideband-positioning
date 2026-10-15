@@ -1382,7 +1382,12 @@ def api_tracking():
         with LOCK:
             tr = SCENE.setdefault("tracking", {})
             for k, v in body.items():
-                if k in tracker.DEFAULT_TRACKING:
+                if k == "algorithm":
+                    if v not in tracker.ALGORITHMS:
+                        return jsonify({"ok": False, "error": f"algorithm must be one of "
+                                        f"{', '.join(tracker.ALGORITHMS)}"}), 400
+                    tr[k] = v
+                elif k in tracker.DEFAULT_TRACKING:
                     try:
                         tr[k] = float(v)
                     except (TypeError, ValueError):

@@ -24,8 +24,9 @@ truth-free "straightness" number (RMS distance to that line).
     # /api/v1/calibration/point, which are picked up automatically)
     python tools/evaluate.py LOG --point 1.5,2.0
 
-    # try other tuning on the same data
+    # try other tuning / another algorithm on the same data
     python tools/evaluate.py LOG --path ... --replay --set sigma_a=1.2 --set sigma_r=0.10
+    python tools/evaluate.py LOG --point 1.3,0.6 --replay --set algorithm=wls_rkf
 """
 import argparse
 import json
@@ -118,9 +119,10 @@ def best_fit_line(pts):
 
 def path_metrics(pts, path):
     d = [path_dist(x, y, path) for x, y in pts]
+    # RMS and the 90th percentile are what Fan & Du 2022 (paper 4) report
     out = {"n": len(d), "xt_mean": sum(d) / len(d),
            "xt_rmse": math.sqrt(sum(v * v for v in d) / len(d)),
-           "xt_p95": q(d, 0.95), "xt_max": max(d)}
+           "xt_p90": q(d, 0.90), "xt_p95": q(d, 0.95), "xt_max": max(d)}
     if len(path) == 2 and len(pts) >= 5:
         rms, ang = best_fit_line(pts)
         truth = math.degrees(math.atan2(path[1][1] - path[0][1], path[1][0] - path[0][0]))
@@ -139,7 +141,8 @@ def static_metrics(pts, x, y):
             "mean_error": math.hypot(mx - x, my - y),
             "std": math.sqrt(sum(v * v for v in spread) / n),
             "rmse": math.sqrt(sum(v * v for v in err) / n),
-            "cep50": q(err, 0.5), "cep95": q(err, 0.95), "max": max(err)}
+            "cep50": q(err, 0.5), "cep90": q(err, 0.90), "cep95": q(err, 0.95),
+            "max": max(err)}
 
 
 def fmt(m):
@@ -196,7 +199,10 @@ def main():
         overrides = {}
         for kv in args.set:
             k, v = kv.split("=")
-            overrides[k] = float(v)
+            try:
+                overrides[k] = float(v)
+            except ValueError:
+                overrides[k] = v              # e.g. algorithm=wls_rkf
         label = "replay" + (" " + " ".join(args.set) if args.set else "")
         tracks[label] = window(replay(meta, rx, overrides, tag))
 
