@@ -1,0 +1,16 @@
+{
+  "note": "Uji statis dari panel 'Calibration & static test' (ruangan 9,8 x 6,82 m, tinggi tag 2,0 m). Angka disalin dari tangkapan layar dashboard. Input 'true' saat uji = (9,80; 6,82), yaitu posisi anchor-3, bukan posisi tag sebenarnya.",
+  "tag_z": 2.0,
+  "anchors": {"anchor-2": [0.0, 0.0, 1.74], "anchor-3": [9.8, 6.82, 1.74],
+              "anchor-4": [0.0, 6.82, 1.74], "anchor-5": [9.8, 0.0, 2.2]},
+  "tests": [
+    {"name": "T1", "x": 1.283, "y": 5.726, "sigma_cm": 5.6, "note": "4 anchor online",
+     "ranges": {"anchor-2": [6.735, 28], "anchor-3": [9.450, 30], "anchor-4": [2.505, 40], "anchor-5": [10.995, 26]}},
+    {"name": "T2", "x": 4.128, "y": 3.243, "sigma_cm": 6.7, "note": "anchor-4 tampil offline di dashboard",
+     "ranges": {"anchor-2": [6.150, 35], "anchor-3": [7.640, 25], "anchor-4": [6.260, 21], "anchor-5": [7.340, 26]}},
+    {"name": "T3", "x": 1.277, "y": 5.705, "sigma_cm": 7.6, "note": "4 anchor online",
+     "ranges": {"anchor-2": [6.740, 21], "anchor-3": [9.480, 25], "anchor-4": [2.500, 34], "anchor-5": [10.980, 24]}},
+    {"name": "T4", "x": 1.291, "y": 5.727, "sigma_cm": 5.9, "note": "4 anchor online",
+     "ranges": {"anchor-2": [6.720, 27], "anchor-3": [9.460, 27], "anchor-4": [2.505, 30], "anchor-5": [10.980, 24]}}
+  ]
+}
