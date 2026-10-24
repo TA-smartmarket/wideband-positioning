@@ -308,6 +308,98 @@ def alur_ekf():
     return d.save()
 
 
+# ---------------------------------------------------------------------------
+# docs/img/alur_algoritma — the full algorithm of server/tracker.py
+# ---------------------------------------------------------------------------
+def alur_algoritma():
+    d = Diagram("../img/alur_algoritma", 1080, 1480)
+    term = f"rounded=1;arcSize=50;{DATA}"
+    opt = f"{OURS}dashed=1;dashPattern=6 4;"
+    yes, no = "fontColor=#2D7600;", "fontColor=#B20000;"
+
+    # --- column A: one range sample ---
+    start = d.box(210, 10, 260, 60, f"<b>Paket telemetri tag</b><br>{small('(±3–5 paket/detik)')}", term, fs=15)
+    a_in = d.circle(60, 110)
+    take = d.box(210, 100, 260, 60, "Ambil sampel jarak<br>berikutnya", OURS, fs=15)
+    d1 = d.decision(200, 190, 280, 110, "Sampel baru &amp;<br>jarak masuk akal?")
+    skip = d.box(10, 215, 140, 60, "Abaikan<br>sampel", OLD, fs=15)
+    c1 = d.circle(60, 300)
+    tconv = d.box(210, 330, 260, 64, "Waktu device → server", OURS, fs=15)
+    cal = d.box(210, 425, 260, 92, f"<b>Koreksi kalibrasi</b><br>{small('jarak − offset anchor dari kalibrasi<br>statis; belum dikalibrasi → offset<br>dipelajari EKF')}", OURS, fs=15)
+    d2 = d.decision(200, 545, 280, 110, "Track tag<br>sudah ada?")
+    init = d.box(10, 690, 270, 100, f"Inisialisasi<br>{small('median sampel 0,7 s tiap anchor<br>→ multilaterasi; tanpa kalibrasi,<br>offset jarak b ikut dicari')}", OURS, fs=15)
+    c2 = d.circle(125, 822)
+
+    # --- column B: EKF ---
+    pred = d.box(580, 10, 240, 64, f"Prediksi EKF ke waktu sampel<br>{small('mode diam: kecepatan = 0')}", OURS, fs=15)
+    d.text(830, 6, 245, 80,
+           "<b>State EKF</b>: x, y, vx, vy<br>(+ offset jarak b dan offset<br>tiap anchor d₁…d₄ bila belum<br>dikalibrasi)", fs=13)
+    res = d.box(580, 100, 240, 64, "Hitung residu ternormalisasi<br>e = (z − h(x)) / √S", OURS, fs=15)
+    d3 = d.decision(570, 190, 260, 110, "|e| ≤ 6 ?")
+    rej = d.box(870, 196, 180, 84, f"Tolak sampel<br>{small('1,5 s semua ditolak →<br>inisialisasi ulang')}", OLD, fs=15)
+    c3 = d.circle(940, 290)
+    dl = d.decision(560, 330, 280, 115, "Mode diam &amp; e &gt; 1 ?<br>(jarak kepanjangan)")
+    drop = d.box(870, 352, 190, 86, f"<b>Buang</b> sampel<br>{small('badan menghalangi; hanya<br>bila ≥ 3 anchor lain ada')}", OLD, fs=15)
+    c5 = d.circle(940, 462)
+    upd = d.box(580, 480, 240, 64, f"Update EKF robust<br>{small('bobot turun bila e &gt; 1 atau e &lt; −2,5')}", OURS, fs=15)
+    zupt = d.box(580, 572, 240, 84, f"Perbarui <b>mode diam</b><br>{small('masuk: v &lt; 0,2 m/s selama 0,4 s<br>keluar: 3 dari 4 |e| &gt; 1,5')}", OURS, fs=15)
+    clamp = d.box(580, 684, 240, 56, "Batasi posisi<br>dalam ruangan", OURS, fs=15)
+    d4 = d.decision(570, 765, 260, 110, "Masih ada sampel<br>di paket ini?")
+    c4 = d.circle(940, 800)
+
+    # --- output, once per packet ---
+    d5 = d.decision(560, 905, 280, 120, "≥ 3 anchor diterima<br>dalam 1,5 s &amp; σ ≤ 0,5 m?")
+    hold = d.box(880, 923, 180, 84, f"<b>Tahan</b> posisi valid<br>terakhir<br>{small('valid = false')}", OLD, fs=15)
+    d6 = d.decision(570, 1060, 260, 110, "Haluskan jalur?<br>(centang di Setup)")
+    smooth = d.box(290, 1073, 230, 84, f"<b>Rata-rata</b><br>{small('3 posisi terakhir')}", OURS, fs=15)
+    pas = d.box(580, 1200, 240, 64, "Pakai keluaran EKF<br>langsung", OURS, fs=15)
+    out = d.box(580, 1290, 240, 70, f"<b>Kirim posisi</b><br>{small('x, y, σ, valid → navigasi &amp; dashboard')}", DATA, fs=15)
+    trail = d.box(860, 1385, 210, 84, f"Dashboard: jejak digambar<br>{small('rata-rata ±3 titik<br>(sebelum &amp; sesudah)')}", opt, fs=14)
+    end = d.box(580, 1395, 240, 60, "<b>Selesai</b>, tunggu<br>paket berikutnya", term, fs=15)
+
+    d.edge(start, take)
+    d.edge(a_in, take)
+    d.edge(take, d1)
+    d.edge(d1, tconv, "Ya", yes)
+    d.edge(d1, skip, "Tidak", no)
+    d.edge(skip, c1)
+    d.edge(tconv, cal)
+    d.edge(cal, d2)
+    d.edge(d2, init, "Tidak", no + "exitX=0;exitY=0.5;entryX=0.5;entryY=0;")
+    d.edge(init, c2)
+    d.edge(d2, pred, "Ya", yes + "exitX=1;exitY=0.5;entryX=0;entryY=0.5;")
+    d.edge(pred, res)
+    d.edge(res, d3)
+    d.edge(d3, dl, "Ya", yes)
+    d.edge(d3, rej, "Tidak", no)
+    d.edge(rej, c3)
+    d.edge(dl, drop, "Ya", yes)
+    d.edge(dl, upd, "Tidak", no)
+    d.edge(drop, c5)
+    d.edge(upd, zupt)
+    d.edge(zupt, clamp)
+    d.edge(clamp, d4)
+    d.edge(d4, c4, "Ya", yes)
+    d.edge(d4, d5, "Tidak", no)
+    d.edge(d5, d6, "Ya", yes)
+    d.edge(d5, hold, "Tidak", no)
+    d.edge(d6, smooth, "Ya", yes)
+    d.edge(d6, pas, "Tidak", no)
+    d.edge(pas, out)
+    d.edge(smooth, out, "", "exitX=0.5;exitY=1;entryX=0;entryY=0.5;")
+    d.edge(hold, out, "", "exitX=0.5;exitY=1;entryX=1;entryY=0.5;")
+    d.edge(out, end)
+    d.edge(out, trail, "", "dashed=1;exitX=1;exitY=0.85;entryX=0.5;entryY=0;")
+    d.text(10, 940, 270, 190,
+           "<b>A</b> = kembali ke \"Ambil sampel jarak berikutnya\"<br>"
+           "kotak putus-putus = hanya tampilan<br>"
+           "z = jarak terukur, h(x) = jarak dari posisi<br>estimasi ke anchor (+ offset b + d bila<br>belum dikalibrasi)<br>"
+           "S = varians residu yang diharapkan,<br>e = residu ternormalisasi<br>"
+           "(e &gt; 0: jarak lebih panjang dari dugaan)<br>"
+           "mode diam = zero-velocity update", fs=13)
+    return d.save()
+
+
 def export_png(path, scale=2):
     exe = r"C:\Program Files\draw.io\draw.io.exe"
     out = path.with_suffix(".png")
@@ -318,6 +410,6 @@ def export_png(path, scale=2):
 
 
 if __name__ == "__main__":
-    for fn in (sistem_saat_ini, sistem_usulan, alur_ekf):
+    for fn in (sistem_saat_ini, sistem_usulan, alur_ekf, alur_algoritma):
         p = fn()
         print("wrote", p.name, "->", export_png(p).name)

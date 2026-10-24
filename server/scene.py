@@ -94,7 +94,8 @@ def normalise_scene(raw):
     out = {"room": room, "anchors": anchors, "obstacles": obstacles,
            "tag_z": _norm_tag_z(raw)}
     # Range calibration (per-anchor bias/scale + the measured points behind it)
-    # and tracker tuning are stored with the scene so they survive a restart.
+    # and the tracker's smoothing switch are stored with the scene so they
+    # survive a restart.
     # They are validated where they are used (server/tracker.py).
     for k in ("calibration", "tracking"):
         if isinstance(raw.get(k), dict):

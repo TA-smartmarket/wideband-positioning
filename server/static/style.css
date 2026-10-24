@@ -304,6 +304,41 @@ html, body {
 #tabs button:hover { border-bottom-color: var(--line); }
 
 #palette { position: absolute; left: 12px; bottom: 14px; display: flex; gap: 6px; }
+
+/* What the 3D elements stand for; bottom-right of the viewport. */
+#legend {
+  position: absolute; right: 12px; bottom: 14px; max-width: 330px;
+  background: var(--surface); border: 1px solid var(--line);
+  padding: 6px 10px; font-family: var(--font-mono); font-size: 10.5px;
+  line-height: 1.55; color: var(--ink-dim);
+}
+#legend summary { cursor: pointer; color: var(--ink); list-style: none; user-select: none; }
+#legend summary::-webkit-details-marker { display: none; }
+#legend summary::before { content: '▸ '; color: var(--accent); }
+#legend details[open] summary::before { content: '▾ '; }
+#legend details[open] summary { margin-bottom: 4px; }
+#legend b { color: var(--ink); font-weight: 500; }
+#legend .lg-line, #legend .lg-dash { display: inline-block; width: 16px; margin-right: 6px;
+  vertical-align: middle; border-top: 2px solid; }
+#legend .lg-dash { border-top-style: dashed; }
+#legend .lg-ring { display: inline-block; width: 10px; height: 10px; margin: 0 9px 0 3px;
+  vertical-align: middle; border: 1.5px solid; border-radius: 50%; }
+#legend .lg-box { display: inline-block; width: 6px; height: 12px; margin: 0 11px 0 5px;
+  vertical-align: middle; }
+
+#legend .lg-cond span { display: inline-block; width: 9px; height: 9px; margin: 0 4px 0 6px;
+  vertical-align: middle; }
+#legend .lg-cond span:first-child { margin-left: 22px; }
+.lamp { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px;
+  vertical-align: middle; }
+
+/* Terms with an explanation on hover. */
+.tip { text-decoration: underline dotted var(--ink-faint); text-underline-offset: 3px; cursor: help; }
+
+details.glossary summary { cursor: pointer; font-size: 12px; color: var(--ink); }
+details.glossary dl { margin: 8px 0 0; font-size: 12px; }
+details.glossary dt { color: var(--ink); margin-top: 8px; font-weight: 500; }
+details.glossary dd { margin: 2px 0 0; color: var(--ink-dim); line-height: 1.45; }
 #palette .pal { display: flex; align-items: center; gap: 8px; }
 #palette .pal span { width: 9px; height: 9px; display: inline-block; }
 
@@ -561,6 +596,7 @@ footer .hint b { color: var(--ink); font-weight: 500; }
   #viewbar { left: 12px; right: 12px; justify-content: flex-start; }
   #hud { top: auto; bottom: 12px; left: 12px; right: 12px; }
   #palette { bottom: 60px; left: 12px; flex-wrap: wrap; }
+  #legend { display: none; }
 }
 
 /* Respect a reduced-motion preference: the glitch and the blinking dots are

@@ -32,7 +32,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "server"))
 import scene as scene_mod   # noqa: E402
-import tracker              # noqa: E402
+import tracker_lab          # noqa: E402  (the tracker with the studies' settings)
+tracker = tracker_lab.tracker   # the server's; other tools use it as sim.tracker
 
 LEGACY_COMMIT = "1aff68c"
 
@@ -268,7 +269,7 @@ def run_legacy(legacy, scene, stream):
 
 
 def run_new(scene, stream, calibration=None, tracking=None):
-    eng = tracker.Engine()
+    eng = tracker_lab.LabEngine()
     sc = json.loads(json.dumps(scene))
     if calibration:
         sc["calibration"] = {"anchors": calibration}
@@ -281,7 +282,8 @@ def run_new(scene, stream, calibration=None, tracking=None):
         for tag in tags:
             est = eng.estimate(tag, recv)
             if est:
-                track.append((recv, est["x"], est["y"]))
+                track.append((recv, est["x"], est["y"], est.get("valid", True), est["t"],
+                              est.get("still", False), est["vx"], est["vy"]))
     return track, eng
 
 
@@ -299,7 +301,7 @@ def metrics(segs, track, duration_s, warmup_s=2.0):
     while t < duration_s * 1000:
         while j + 1 < len(track) and track[j + 1][0] <= t:
             j += 1
-        _, x, y = track[j]
+        x, y = track[j][1], track[j][2]
         tx, ty = truth_at(segs, t / 1000)
         err.append(math.hypot(x - tx, y - ty))
         xt.append(cross_track(segs, x, y))
@@ -308,6 +310,7 @@ def metrics(segs, track, duration_s, warmup_s=2.0):
     n_upd = len(track)
     span = (track[-1][0] - track[0][0]) / 1000 or 1
     return {
+        "mae": sum(err) / len(err),
         "rmse": math.sqrt(sum(e * e for e in err) / len(err)),
         "xt_rmse": math.sqrt(sum(e * e for e in xt) / len(xt)),
         "xt_p95": xs[int(0.95 * (len(xs) - 1))],
@@ -322,14 +325,26 @@ def jumps(track, thresh=0.5):
                if math.hypot(b[1] - a[1], b[2] - a[2]) > thresh)
 
 
+def jitter(track):
+    """RMS of the second difference of the displayed position (m): the
+    sideways stipple of the drawn line, zero for uniform straight motion."""
+    if len(track) < 3:
+        return 0.0
+    acc = []
+    for a, b, c in zip(track, track[1:], track[2:]):
+        acc.append((a[1] - 2 * b[1] + c[1]) ** 2 + (a[2] - 2 * b[2] + c[2]) ** 2)
+    return math.sqrt(sum(acc) / len(acc))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--out", default=None, help="plot file (default under docs/img/)")
-    ap.add_argument("--compare", choices=("before_after", "algorithms"), default="before_after",
-                    help="before_after: old vs new pipeline; algorithms: EKF vs WLS-RKF (paper 4)")
+    ap.add_argument("--compare", choices=("before_after",), default="before_after",
+                    help="before_after: old vs new pipeline (windowing variants: "
+                         "tools/smoothing_study.py)")
     ap.add_argument("--scenario", choices=("default", "wall"), default="default",
                     help="wall: one anchor behind a wall for half of the room (strong NLOS)")
     args = ap.parse_args()
@@ -347,15 +362,7 @@ def main():
                  "B": "Server baru + FW 1.0.31 (tanpa OTA)",
                  "C": "Server baru + FW 1.0.32 (raw 5 Hz)",
                  "D": "C + kalibrasi bias per anchor"}
-    else:
-        names = {"C": "EKF (tracker proyek)",
-                 "E": "WLS-RKF (Fan & Du 2022)",
-                 "G": "EKF + uji NLOS Fan & Du",
-                 "D": "EKF + kalibrasi",
-                 "F": "WLS-RKF + kalibrasi",
-                 "H": "EKF + uji NLOS + kalibrasi"}
-    wls = {"algorithm": "wls_rkf"}
-    hyb = {"algorithm": "ekf_nlos"}
+    jit_agg = {k: [] for k in names}
     agg = {k: [] for k in names}
     jumps_agg = {k: 0 for k in names}
     first = None
@@ -372,20 +379,12 @@ def main():
                 "C": run_new(scene, s_new)[0],
                 "D": run_new(scene, s_new, cal)[0],
             }
-        else:
-            tracks = {
-                "C": run_new(scene, s_new)[0],
-                "E": run_new(scene, s_new, tracking=wls)[0],
-                "G": run_new(scene, s_new, tracking=hyb)[0],
-                "D": run_new(scene, s_new, cal)[0],
-                "F": run_new(scene, s_new, cal, tracking=wls)[0],
-                "H": run_new(scene, s_new, cal, tracking=hyb)[0],
-            }
         for k, tr in tracks.items():
             m = metrics(segs, tr, duration)
             if m:
                 agg[k].append(m)
             jumps_agg[k] += jumps(tr)
+            jit_agg[k].append(jitter(tr))
         if first is None:
             first = tracks
 
@@ -394,7 +393,8 @@ def main():
     print(f"{args.runs} Monte-Carlo runs, walk {sum(math.dist(a, b) for a, b in zip(WAYPOINTS, WAYPOINTS[1:])):.1f} m "
           f"at {SPEED} m/s, room {scene['room']['width']} x {scene['room']['depth']} m, "
           f"{len(scene['anchors'])} anchors\n")
-    hdr = f"{'pipeline':40s} {'RMSE':>7s} {'XT-RMSE':>8s} {'XT-P95':>7s} {'XT-max':>7s} {'Hz':>5s} {'jump>0.5m':>9s}"
+    hdr = (f"{'pipeline':40s} {'RMSE':>7s} {'XT-RMSE':>8s} {'XT-P95':>7s} {'XT-max':>7s} "
+           f"{'jitter':>7s} {'Hz':>5s} {'jump>0.5m':>9s}")
     print(hdr)
     print("-" * len(hdr))
     summary = {}
@@ -402,10 +402,12 @@ def main():
         ms = agg[k]
         avg = {f: sum(m[f] for m in ms) / len(ms) for f in ms[0]}
         summary[k] = avg
+        jit = sum(jit_agg[k]) / len(jit_agg[k])
         print(f"{name:40s} {avg['rmse']:7.3f} {avg['xt_rmse']:8.3f} {avg['xt_p95']:7.3f} "
-              f"{avg['xt_max']:7.3f} {avg['rate']:5.1f} {jumps_agg[k] / args.runs:9.1f}")
+              f"{avg['xt_max']:7.3f} {jit:7.3f} {avg['rate']:5.1f} {jumps_agg[k] / args.runs:9.1f}")
     print("\nRMSE    = error vs truth at the same instant (includes latency)")
     print("XT-*    = cross-track: distance to the true path (straightness)")
+    print("jitter  = RMS second difference of the displayed position (stipple of the line)")
     print("jump    = displayed position moved > 0.5 m between two updates (per run)")
 
     if not args.no_plot:

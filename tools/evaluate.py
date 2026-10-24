@@ -24,9 +24,9 @@ truth-free "straightness" number (RMS distance to that line).
     # /api/v1/calibration/point, which are picked up automatically)
     python tools/evaluate.py LOG --point 1.5,2.0
 
-    # try other tuning / another algorithm on the same data
+    # try other tuning / another window on the same data
     python tools/evaluate.py LOG --path ... --replay --set sigma_a=1.2 --set sigma_r=0.10
-    python tools/evaluate.py LOG --point 1.3,0.6 --replay --set algorithm=wls_rkf
+    python tools/evaluate.py LOG --point 1.3,0.6 --replay --set post_filter=none
 """
 import argparse
 import json
@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "server"))
 import scene as scene_mod   # noqa: E402
 import tracker              # noqa: E402
+import tracker_lab          # noqa: E402
 
 
 def load(path):
@@ -63,11 +64,12 @@ def load(path):
 
 
 def replay(meta, rx, overrides, tag=None):
-    """Feed every recorded packet through server/tracker.py again."""
+    """Feed every recorded packet through server/tracker.py again (with --set
+    overrides: through tools/tracker_lab.py, where every value is adjustable)."""
     scene = json.loads(json.dumps(meta["scene"]))
     if overrides:
         scene.setdefault("tracking", {}).update(overrides)
-    eng = tracker.Engine()
+    eng = tracker_lab.LabEngine() if overrides else tracker.Engine()
     eng.configure(scene, meta.get("nlos_enabled", True), nlos_mod=scene_mod)
     out = []
     for o in rx:
@@ -77,7 +79,7 @@ def replay(meta, rx, overrides, tag=None):
             e = eng.estimate(t, o["t"])
             if e:
                 out.append({"t": o["t"], "tag": t, "x": e["x"], "y": e["y"],
-                            "b": e["range_bias"]})
+                            "b": e["range_bias"], "v": int(e["valid"]), "h": int(e["held"])})
     return out
 
 
@@ -202,7 +204,7 @@ def main():
             try:
                 overrides[k] = float(v)
             except ValueError:
-                overrides[k] = v              # e.g. algorithm=wls_rkf
+                overrides[k] = v              # e.g. post_filter=linfit
         label = "replay" + (" " + " ".join(args.set) if args.set else "")
         tracks[label] = window(replay(meta, rx, overrides, tag))
 

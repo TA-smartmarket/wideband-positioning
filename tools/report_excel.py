@@ -356,7 +356,7 @@ def avg(vals):
 
 
 def static_rows(cfg):
-    """Per test and anchor: measured, geometric distance, residual after bias."""
+    """Per test and anchor: measured, geometric distance, residual after the common offset."""
     out = []
     for t in cfg["tests"]:
         rows = []
@@ -414,7 +414,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
     ]
     if resid:
         items.append(("Konsistensi jarak antar-anchor", math.sqrt(sum(r * r for r in resid) / len(resid)),
-                      "cm", "Uji statis dashboard. RMS selisih jarak tiap anchor setelah bias "
+                      "cm", "Uji statis dashboard. RMS selisih jarak tiap anchor setelah offset jarak "
                       "antena dikoreksi; kecil berarti keempat anchor 'sepakat'."))
     items.append(("Laju update posisi", rate, "hz", "Pengukuran. Banyaknya posisi baru per detik."))
     if sim:
@@ -444,7 +444,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
                "mewakili alat sebenarnya.", 2)
         s.note(f"3. Dari simulasi itu, perkiraan akurasi ±"
                f"{avg([p['sim']['mean_err'] for p in sim['points']]) * 100:.0f} cm saat diam dan "
-               f"RMSE {sim['walk']['rmse'] * 100:.0f} cm saat berjalan. Penyebab utamanya bias "
+               f"RMSE {sim['walk']['rmse'] * 100:.0f} cm saat berjalan. Penyebab utamanya offset "
                "tiap anchor yang belum dikalibrasi; kalibrasi di 2–4 titik terukur akan "
                "menurunkannya.", 2)
         s.note(f"4. Laju update hardware {rate:.1f} Hz, lebih rendah dari simulasi "
@@ -482,7 +482,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
                      len(r["stops"]), avg([e["sigma"] for e in est]) * 100,
                      avg([e["b"] for e in est]) * 100])
     s.table(["Rekaman", "Durasi (s)", "Jumlah posisi", "Laju (Hz)", "Panjang lintasan (m)",
-             "Titik diam", "σ EKF (cm)", "Bias jarak (cm)"], rows,
+             "Titik diam", "Margin error ±σ (cm)", "Offset jarak b (cm)"], rows,
             [None, "s", "n", "hz", "m", "n", "cm", "cm"])
     s.section("B. Titik diam")
     s.note("Isi kolom kuning dengan posisi tag sebenarnya yang diukur dengan meteran laser "
@@ -494,7 +494,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
             for n, i, st in stops]
     a, b = s.table(["Rekaman", "Titik", "Durasi (s)", "Sampel", "X rata-rata (m)",
                     "Y rata-rata (m)", "CEP50 (cm)", "CEP95 (cm)", "Simpangan maks (cm)",
-                    "σ EKF (cm)", "X sebenarnya (m)", "Y sebenarnya (m)", "Galat (cm)"],
+                    "Margin error ±σ (cm)", "X sebenarnya (m)", "Y sebenarnya (m)", "Galat (cm)"],
                    rows, [None, None, "s", "n", "m3", "m3", "cm", "cm", "cm", "cm", "m3", "m3",
                           "cm"], inputs=(10, 11))
     for r in range(a, b + 1):
@@ -524,7 +524,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
         rows.append(["Rata-rata", None, None, avg([r[3] for r in rows]), avg([r[4] for r in rows]),
                      math.sqrt(sum(x * x for x in resid) / len(resid)),
                      max(abs(x) for x in resid), ""])
-        s.table(["Uji", "X estimasi (m)", "Y estimasi (m)", "Presisi σ (cm)", "Bias bersama (cm)",
+        s.table(["Uji", "X estimasi (m)", "Y estimasi (m)", "Presisi σ (cm)", "Offset jarak b (cm)",
                  "Residu RMS (cm)", "Residu maks (cm)", "Catatan"], rows,
                 [None, "m3", "m3", "cm", "cm", "cm", "cm", None], bold_last=True)
         s.section("B. Detail jarak tiap anchor")
@@ -533,7 +533,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
             for aid, rng_, n, d, diff, bb, res in rr:
                 rows.append([t["name"], aid, n, rng_, d, diff, res])
         s.table(["Uji", "Anchor", "Sampel", "Jarak terukur (m)", "Jarak geometri (m)",
-                 "Selisih (m)", "Residu setelah bias (cm)"], rows,
+                 "Selisih (m)", "Residu setelah offset (cm)"], rows,
                 [None, None, "n", "m3", "m3", "m3", "cm"])
         s.section("Cara membaca")
         s.note("Selisih = jarak terukur − jarak dari posisi estimasi ke anchor. Bagian yang sama "
@@ -548,12 +548,12 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
     if sim:
         s = Sheet(wb, "3 Simulasi", [22, 11, 11, 13, 13, 13, 13, 13, 13])
         s.title("3. Perbandingan Hardware dan Simulasi",
-                "Simulasi memakai ruangan, posisi anchor, tinggi tag, dan bias yang sama dengan "
+                "Simulasi memakai ruangan, posisi anchor, tinggi tag, dan offset jarak yang sama dengan "
                 "hardware. Di simulasi posisi benar diketahui, sehingga akurasi bisa dihitung.")
         s.section("Pengaturan simulasi")
-        s.kv([("Bias jarak bersama", sim["bias_common"] * 100, "cm", "sama dengan yang terlihat di hardware"),
+        s.kv([("Offset jarak bersama (b)", sim["bias_common"] * 100, "cm", "sama dengan yang terlihat di hardware"),
               ("Noise jarak (1σ)", sim["noise"] * 100, "cm", "noise two-way ranging saat LOS"),
-              ("Sebaran bias tiap anchor (1σ)", 8, "cm", "anchor belum dikalibrasi"),
+              ("Sebaran offset tiap anchor (1σ)", 8, "cm", "anchor belum dikalibrasi"),
               ("Outlier / paket hilang", f"{sim['outlier_p']:.0%} / {sim['loss_p']:.0%}", None,
                "lonjakan jarak akibat multipath dan paket yang tidak sampai"),
               ("Pengulangan", f"{sim['runs']} × {sim['static_s']:g} s per titik", None,
@@ -592,7 +592,7 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
     # ============================== 4 Per Anchor ==============================
     s = Sheet(wb, "4 Per Anchor", [16, 12, 11, 10, 12, 13, 12, 13, 12, 13])
     s.title("4. Kualitas Tiap Anchor",
-            "Residu = jarak terukur − (jarak 3D dari posisi rata-rata titik diam + bias). Residu "
+            "Residu = jarak terukur − (jarak 3D dari posisi rata-rata titik diam + offset jarak). Residu "
             "besar atau porsi outlier tinggi menandakan NLOS (terhalang) pada anchor itu.")
     rows = []
     for r in recs:
@@ -621,8 +621,8 @@ def build(logs, out_dir, fname="Laporan_Akurasi_UWB.xlsx"):
         for e, v in zip(r["est"], speed_series(r["est"])):
             rows.append([r["name"], e["s"], e["x"], e["y"], v, e["sigma"] * 100, e["b"] * 100,
                          e.get("used")])
-    s.table(["Rekaman", "Waktu (s)", "X (m)", "Y (m)", "Kecepatan (m/s)", "σ (cm)",
-             "Bias (cm)", "Sampel dipakai"], rows,
+    s.table(["Rekaman", "Waktu (s)", "X (m)", "Y (m)", "Kecepatan (m/s)", "Margin error ±σ (cm)",
+             "Offset jarak b (cm)", "Sampel dipakai"], rows,
             [None, "0.00", "m3", "m3", "m", "cm", "cm", "n"])
     s.ws.freeze_panes = "A2"
 

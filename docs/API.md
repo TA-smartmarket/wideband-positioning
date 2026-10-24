@@ -152,7 +152,7 @@ required on `/api/v1/*` **only if** the server was started with a token.
 | `POST` | `/api/v1/calibration/point` | `{"x","y","seconds":15,"store":true}` — tag held still on a measured spot; returns range error per anchor + position error (mean error, σ, RMSE, CEP50/95). Blocks for `seconds` |
 | `POST` | `/api/v1/calibration/apply` | Fit `measured = scale·true + bias` per anchor from the stored points |
 | `POST` | `/api/v1/calibration/clear` | Forget points and/or corrections |
-| `GET`/`PUT` | `/api/v1/tracking` | Tracker tuning (`sigma_a`, `sigma_r`, `huber_k`, `gate`, …) |
+| `GET`/`PUT` | `/api/v1/tracking` | The algorithm is fixed; its one setting is "smooth the path". `GET` → `{"ok", "smooth", "calibrated", "params"}` (`calibrated`: every anchor has a calibration entry, so the offsets come from it instead of being learned; `params`: the fixed values, read-only). `PUT {"smooth": true\|false}` switches the smoothing and is stored in the scene; any other key → `400` |
 | `GET`  | `/api/v1/record` | Recorder status + recorded sessions |
 | `POST` | `/api/v1/record/start` | `{"name","note"}` — record every packet + estimate to `server/logs/*.jsonl` |
 | `POST` | `/api/v1/record/stop` | Stop recording |
@@ -242,18 +242,41 @@ evidence are in `docs/PERBAIKAN_AKURASI.md`.
 3. **Range correction** — `r = (raw − bias_i) / scale_i` from the calibration
    (`scene.calibration.anchors`), then the NLOS bias of a blocked path.
 4. **Bootstrap** — slant-range multilateration (closed form + Gauss-Newton on
-   `sqrt(dx² + dy² + dz²)`) from all anchors heard in the last 0.7 s (3 are
-   enough after 2 s). Not shown until it has absorbed 2 samples per anchor.
-5. **EKF** — state `[px, py, vx, vy, b]`, Singer velocity model (`sigma_a`
-   0.8 m/s², velocity correlation time `vel_tau_s` 1 s), `b` = range offset shared by all anchors (estimated online when
-   there are ≥ 3 anchors). Measurement `h = sqrt((px−ax)² + (py−ay)² + dz²) + b`
-   with `dz = anchor_z − tag_z` — no projection of the range onto the floor.
-6. **Robust update** — normalised innovation `|ν| > 2.5` → measurement noise
-   inflated (Huber); `|ν| > 6` → rejected. No accepted sample for 1.5 s →
+   `sqrt(dx² + dy² + dz²)`) from the median range of every anchor heard in the
+   last 0.7 s (3 are enough after 2 s). On a cold start (range offset `b` not
+   known yet) with 4+ anchors, `b` is found by a 1-D search (−0.5…1.5 m) for
+   the smallest residual. Not shown until it has absorbed 2 samples per anchor.
+5. **EKF** — state `[px, py, vx, vy, b, d₁…dₙ]`, Singer velocity model
+   (`sigma_a` 0.8 m/s², velocity correlation time `vel_tau_s` 1 s). `b` = range
+   offset shared by all anchors (antenna delay), `dᵢ` = each anchor's own offset.
+   When every anchor is calibrated (`calibrated: true`) both stay 0 — the
+   calibration already removed them; otherwise `b` is estimated and `dᵢ` is
+   learned while the trolley moves. Measurement
+   `h = sqrt((px−ax)² + (py−ay)² + dz²) + b + dᵢ` with `dz = anchor_z − tag_z`.
+6. **Robust update** — normalised innovation `ν > 1` (range longer than
+   expected, `huber_k_long`) or `ν < −2.5` → measurement noise inflated
+   (Huber); `|ν| > 6` → rejected. No accepted sample for 1.5 s →
    re-initialised from multilateration.
-7. `confidence = 1 / (1 + sigma)`, `sigma = sqrt(P00 + P11)`; the tag state
-   also carries `range_bias` (b), `rate_hz` (samples/s), `used` (accepted/s)
-   and per-link `residual` / `accepted`.
+7. **Standing still** (always on) — once the EKF speed stayed below 0.2 m/s
+   for 0.4 s the velocity is pinned to 0 and the process noise drops to
+   0.05 m/s² (`still: true` meanwhile), until 3 of the last 4 ranges disagree
+   by > 1.5σ. While standing, a range that comes in more than 1σ too LONG (a
+   body in the way) is dropped, as long as ≥ 3 other anchors had an accepted
+   range in the last 1.5 s.
+8. **Validity** — `valid` only while ≥ 3 anchors had an accepted range in the
+   last 1.5 s and `sigma ≤ 0.5 m`; otherwise the last valid position is
+   **held** (`held: true`) instead of a guess from one or two anchors.
+8b. **Smooth the path** (the only setting, on by default) — the position
+   reported is the mean of the last 3 filter outputs (never across a gap
+   > 4 s); off → the EKF output unchanged. Range and position windows from the
+   research (median/regression windows, the 20 × 20 mean) are not in the
+   server; they live in `tools/tracker_lab.py`.
+9. `confidence = 1 / (1 + sigma)`, `sigma = sqrt(P00 + P11)`; the tag state
+   also carries `range_bias` (the range offset b), `anchor_offsets` (dᵢ per
+   anchor), `offset_warning` (anchors whose dᵢ exceeds 20 cm: their scene
+   position is probably wrong), `rate_hz` (samples/s), `used` (accepted/s),
+   `valid`, `held`, `still` (standing-still mode), `anchors_fresh` and
+   per-link `residual` / `accepted`.
 
 ---
 
@@ -286,7 +309,9 @@ otherwise the freshest online tag wins.
 - `timestamp_ms` is **monotonic** (`time.monotonic_ns()`), not wall clock —
   navigation uses it only for staleness detection.
 - `quality` is the EKF confidence, clamped to `[0, 1]`.
-- `valid` is `false` when the tag position is stale/offline (`STALE_MS = 5000`).
+- `valid` is `false` when the tracker holds the position (fewer than 3
+  anchors heard recently, or sigma above 0.5 m) or the position is older than
+  `NAV_STALE_MS = 1500` ms. A held position must not be used for steering.
 - Returns `404` only when no tag position has ever been seen.
 
 ### `GET /api/v1/navigation/map`

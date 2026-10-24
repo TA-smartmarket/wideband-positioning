@@ -14,6 +14,7 @@ Endpoints (see docs/API.md):
     GET  /api/v1/scene                  room + anchors + obstacles (3D editor)
     PUT  /api/v1/scene                  save the 3D scene (pushes anchor config)
     GET  /api/v1/devices                known devices + last seen
+    GET/PUT /api/v1/tracking            the tracker (fixed) and its smoothing switch
     POST /api/v1/position               solve now (debug)
     GET  /api/v1/navigation/position    trolley position (navigation contract)
     GET  /api/v1/navigation/map         map metadata (dims from the scene)
@@ -52,13 +53,15 @@ BASE_CFG = {
     "room": {"width": 5.0, "height": 4.0},
     "uwb": {"mode": "longdata_range_lowpower",
             "range_filter": True, "update_ms": 200},
-    # OLED power saving on the node (the device stays online)
-    "display": {"mode": "dim", "timeout_s": 60},
+    # OLED on the node: always on by default; the Setup checkbox switches to
+    # "off after 60 s idle" to save power (the device stays online either way)
+    "display": {"mode": "always", "timeout_s": 0},
 }
 
 DEVICES = {}          # device_id -> config dict (merged)
 LOCK = threading.RLock()
 STALE_MS = 5000       # device offline threshold
+NAV_STALE_MS = 1500   # a navigation position older than this is not valid
 
 RANGES = {}           # (anchor_id, tag_id) -> {"range","rx","fp","q","ts"}
 TAG_POS = {}          # tag_id -> {"x","y","conf","amb","ts","src"}
@@ -371,6 +374,11 @@ def publish_estimate(tag, est, now):
                     "geometry_slack": est["geometry_slack"],
                     "rate_hz": est["rate_hz"], "used": est["used"],
                     "conf": est["confidence"], "amb": est["ambiguous"],
+                    "valid": est.get("valid", True), "held": est.get("held", False),
+                    "still": est.get("still", False),
+                    "anchors_fresh": est.get("anchors_fresh"),
+                    "anchor_offsets": est.get("anchor_offsets", {}),
+                    "offset_warning": est.get("offset_warning", []),
                     "links": est["links"],
                     "ts": now, "src": "server"}
     for a, info in est["links"].items():
@@ -379,14 +387,17 @@ def publish_estimate(tag, est, now):
                           "sigma": info.get("sigma"), "bias": info.get("bias"),
                           "obstacles": info.get("obstacles", [])}
     for job in CAL_JOBS:
-        if job["tag"] == tag:
+        if job["tag"] == tag and not est.get("held", False):
             job["est"].append((est["x"], est["y"]))
     if RECORDER.active:
         RECORDER.write({"k": "est", "t": now, "tag": tag,
                         "x": round(est["x"], 4), "y": round(est["y"], 4),
                         "vx": round(est["vx"], 3), "vy": round(est["vy"], 3),
                         "sigma": round(est["sigma"], 4),
-                        "b": round(est["range_bias"], 4), "used": est["used"]})
+                        "b": round(est["range_bias"], 4), "used": est["used"],
+                        "v": int(bool(est.get("valid", True))),
+                        "h": int(bool(est.get("held", False))),
+                        "st": int(bool(est.get("still", False)))})
 
 
 def recompute_positions():
@@ -535,6 +546,11 @@ def build_state():
                      "geometry_ok": p.get("geometry_ok", True),
                      "geometry_slack": p.get("geometry_slack", 0.0),
                      "confidence": p["conf"], "ambiguous": p["amb"],
+                     "valid": p.get("valid", True) and now - p["ts"] < NAV_STALE_MS,
+                     "held": p.get("held", False), "still": p.get("still", False),
+                     "anchors_fresh": p.get("anchors_fresh"),
+                     "anchor_offsets": p.get("anchor_offsets", {}),
+                     "offset_warning": p.get("offset_warning", []),
                      "online": now - p["ts"] < STALE_MS, "last_seen": p["ts"],
                      "source": p.get("src", "server"),
                      "ip": STATUS.get(tag, {}).get("ip"),
@@ -875,6 +891,8 @@ def load_scene(path=None):
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         SCENE = scene_mod.normalise_scene(data.get("scene", data))
+        # tuning saved by older versions: only the smoothing setting remains
+        SCENE["tracking"] = {"smooth": int(tracker.tracking_params(SCENE)["smooth"])}
         NLOS_ENABLED = bool(data.get("nlos_enabled", True))
         print(f"[scene] loaded {path} "
               f"({len(SCENE['anchors'])} anchors, {len(SCENE['obstacles'])} obstacles)")
@@ -1376,27 +1394,23 @@ def api_calibration_clear():
 
 @APP.route("/api/v1/tracking", methods=["GET", "PUT"])
 def api_tracking():
-    """Tracker tuning (sigma_a, sigma_r, huber_k, gate, ...). PUT a subset."""
+    """The tracker: one fixed algorithm (server/tracker.py). The only setting is
+    PUT {"smooth": true|false}, the smoothed path; "calibrated" tells whether
+    the range offsets come from the static calibration or are learned."""
     if request.method == "PUT":
         body = request.get_json(silent=True) or {}
+        other = sorted(k for k in body if k != "smooth")
+        if other or "smooth" not in body:
+            return jsonify({"ok": False, "error": "only 'smooth' can be set; the algorithm "
+                            f"is fixed (got {', '.join(other) or 'nothing'})"}), 400
         with LOCK:
-            tr = SCENE.setdefault("tracking", {})
-            for k, v in body.items():
-                if k == "algorithm":
-                    if v not in tracker.ALGORITHMS:
-                        return jsonify({"ok": False, "error": f"algorithm must be one of "
-                                        f"{', '.join(tracker.ALGORITHMS)}"}), 400
-                    tr[k] = v
-                elif k in tracker.DEFAULT_TRACKING:
-                    try:
-                        tr[k] = float(v)
-                    except (TypeError, ValueError):
-                        return jsonify({"ok": False, "error": f"bad value for {k}"}), 400
+            SCENE["tracking"] = {"smooth": 1 if body["smooth"] else 0}
             save_scene()
         configure_engine()
     with LOCK:
-        return jsonify({"ok": True, "params": tracker.tracking_params(SCENE),
-                        "defaults": tracker.DEFAULT_TRACKING})
+        params = tracker.tracking_params(SCENE)
+        return jsonify({"ok": True, "smooth": params["smooth"] >= 0.5,
+                        "calibrated": ENGINE.calibrated, "params": params})
 
 
 # ---------------------------------------------------------------------------
@@ -1510,7 +1524,9 @@ def _nav_position_doc(requested=None, timestamp_ms=None):
     if tag is None:
         return None
 
-    online = now_ms() - p.get("ts", 0) < STALE_MS
+    # valid only while the tracker could fix the position (3+ anchors, small
+    # sigma) and it is recent: a held or stale position must not steer
+    online = now_ms() - p.get("ts", 0) < NAV_STALE_MS and p.get("valid", True)
     return {
         "schema_version": NAV_SCHEMA_VERSION,
         "trolley_id": NAV_TROLLEY_ID,

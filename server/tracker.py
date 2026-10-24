@@ -36,38 +36,46 @@ The rules here are the textbook ones that were missing:
    been accepted for a while the track is re-initialised from multilateration.
 6. **Per-anchor range calibration** (bias + scale) measured with the tag at
    known points — see /api/v1/calibration in app.py.
+7. **Range offsets from the calibration, or learned.** With a static
+   calibration of every anchor the offsets are taken from it and kept; without
+   one the shared offset b and each anchor's d_i are learned online.
+8. **No position from too little data.** A position is valid only while 3+
+   anchors have recent accepted ranges; otherwise the last valid position is
+   held and flagged invalid instead of a guess from one or two anchors.
+9. **Standing still.** A zero-velocity mode pins the velocity to 0 while the
+   trolley stands, and while it stands a range that came in too long is
+   dropped (a shopper between tag and anchor only ever lengthens a range).
+10. **Optional smoothing** of the path shown: the mean of the last 3 positions.
+
+The algorithm is fixed (docs/ALGORITHMS.md; chosen by simulation in
+docs/hasil-simulasi/RISET_JENDELA.md); only the smoothing can be switched.
+The research variants it was compared against — windows on the ranges or the
+position, other offset handling, tunable values — are in tools/tracker_lab.py.
 
 Everything here is plain Python (no numpy) so the server keeps its two
 dependencies, and the same code runs in tools/simulate.py and
 tools/evaluate.py for offline replay.
 """
 
+import bisect
 import math
 
 # ---------------------------------------------------------------------------
 # tuning
 # ---------------------------------------------------------------------------
-DEFAULT_TRACKING = {
-    # Positioning algorithm:
-    #   "ekf"     position EKF on slant ranges (this project's tracker)
-    #   "wls_rkf" Fan & Du 2022 (docs/papers/04): one Kalman filter per anchor
-    #             range, chi-square NLOS test, weighted least squares position
-    #   "ekf_nlos" the EKF, plus the per-anchor range filter and NLOS test of
-    #             Fan & Du: a range judged NLOS gets the paper's weight
-    #             (R scaled by gamma/chi2) and its filter follows the EKF
-    "algorithm": "ekf",
-    # White-acceleration process noise (m/s^2). A person walking or a pushed
-    # trolley changes speed gently; 0.8 keeps straight walks straight while
-    # still following a 90-degree turn without overshooting the corner.
+PARAMS = {
+    # White-acceleration process noise (m/s^2). A trolley changes speed
+    # gently; 0.8 keeps straight runs straight while still following a
+    # 90-degree turn without overshooting the corner.
     "sigma_a": 0.8,
     # LOS range noise of one DW1000 two-way-ranging sample (m).
     "sigma_r": 0.12,
     # Normalised innovation |y|/sqrt(S) where down-weighting starts (Huber).
     "huber_k": 2.5,
-    # Same, for ranges LONGER than predicted. A body or wall in the path only
-    # ever makes UWB read long, so those are more suspicious than short ones;
-    # a smaller value down-weights them earlier. 0 = use huber_k.
-    "huber_k_long": 0.0,
+    # Same, for ranges LONGER than expected. A body or wall in the path only
+    # ever makes a UWB range longer, so a long range is more suspicious than a
+    # short one and is down-weighted earlier.
+    "huber_k_long": 1.0,
     # Normalised innovation beyond which a sample is rejected outright.
     "gate": 6.0,
     # A sample older than the filter state by more than this is dropped.
@@ -76,28 +84,41 @@ DEFAULT_TRACKING = {
     "reinit_ms": 1500,
     # How far outside the room rectangle the estimate may go (m).
     "room_margin": 0.5,
-    # Velocity correlation time (s), Singer / Ornstein-Uhlenbeck model: the
-    # velocity decays as exp(-dt/tau) between samples. For the usual 40 ms
-    # spacing this is a constant-velocity model; across a WiFi stall of a few
-    # seconds it stops the estimate from coasting on a noisy velocity (seen:
-    # 45 cm of drift for a tag lying still). 0 = pure constant velocity.
+    # Velocity correlation time (s), Singer / Ornstein-Uhlenbeck model: across
+    # a WiFi stall of a few seconds it stops the estimate from coasting on a
+    # noisy velocity (seen: 45 cm of drift for a tag lying still).
     "vel_tau_s": 1.0,
-    # 1 = estimate the range offset shared by all anchors online (needs 3+).
-    "estimate_bias": 1.0,
-    # The reported position may be extrapolated along the velocity to "now"
-    # by at most this much (ms). Off by default: in simulation it did not
-    # lower the time-synchronised error but added sideways wobble.
-    "extrapolate_ms": 0,
-    # --- wls_rkf only ---
-    # Process noise of each per-anchor range filter (m/s^2), paper: 0.5.
-    "rkf_sigma_u": 0.5,
-    # NLOS threshold on the squared Mahalanobis distance; chi2(1) at
-    # alpha = 0.001 is 6.2 (paper). A range is NLOS only if it also reads
-    # LONGER than predicted.
-    "nlos_chi2": 6.2,
-}
 
-ALGORITHMS = ("ekf", "wls_rkf", "ekf_nlos")
+    # --- validity -------------------------------------------------------------
+    # The position is valid only while at least min_anchors different anchors
+    # had an accepted range within fresh_ms of the filter time and the
+    # filter's sigma is below valid_sigma (m). Otherwise the last valid
+    # position is held and flagged invalid: one or two anchors cannot fix a
+    # 2-D position (seen on hardware: 2.4 m sigma, a track pushed out of the room).
+    "min_anchors": 3,
+    "fresh_ms": 1500,
+    "valid_sigma": 0.5,
+
+    # --- standing still ---------------------------------------------------------
+    # Zero-velocity mode: once the EKF speed has stayed below 0.2 m/s for
+    # 0.4 s the trolley is taken to stand: its velocity is pinned to 0 and the
+    # process noise made small, so one bad round of ranges can no longer move
+    # the position; it ends as soon as 3 of the last 4 ranges disagree with
+    # the position by more than 1.5 sigma.
+    "zero_velocity": 1.0,
+    # While standing, a range LONGER than expected by more than this (sigma)
+    # is dropped instead of down-weighted, as long as the other anchors can
+    # still fix the position.
+    "still_long": 1.0,
+
+    # --- the path shown -----------------------------------------------------------
+    # 1 = the mean of the last smooth_window positions (one per filter step,
+    # never across a gap longer than window_ms): a smoother line, ~0.35 s
+    # more lag while driving. The only setting (Setup -> Tracker).
+    "smooth": 1.0,
+    "smooth_window": 3,
+    "window_ms": 4000,
+}
 
 # Anchor copies of a link are used only when the tag itself has sent nothing
 # for this long (ms). The tag's WiFi uplink stalls for ~3 s now and then and
@@ -106,24 +127,17 @@ ALGORITHMS = ("ekf", "wls_rkf", "ekf_nlos")
 SOURCE_HOLD_MS = 10000
 # Fresh-sample window used for bootstrapping / re-initialisation (ms).
 FIX_WINDOW_MS = 700
-# wls_rkf: anchors heard within this window take part in the WLS solve; their
-# weight shrinks with the prediction variance of their range filter (ms).
-WLS_FRESH_MS = 3000
+# Samples kept per anchor at least (the bootstrap takes their median).
+BOOT_SAMPLES = 5
 
 
 def tracking_params(scene):
-    """Tracking parameters: defaults overridden by scene["tracking"]."""
-    out = dict(DEFAULT_TRACKING)
+    """The algorithm's values and its one setting, scene["tracking"]["smooth"]."""
+    out = dict(PARAMS)
     raw = (scene or {}).get("tracking") or {}
-    for k in out:
-        if k not in raw:
-            continue
-        if k == "algorithm":
-            if str(raw[k]) in ALGORITHMS:
-                out[k] = str(raw[k])
-            continue
+    if "smooth" in raw:
         try:
-            out[k] = float(raw[k])
+            out["smooth"] = 1.0 if float(raw["smooth"]) >= 0.5 else 0.0
         except (TypeError, ValueError):
             pass
     return out
@@ -132,6 +146,13 @@ def tracking_params(scene):
 # ---------------------------------------------------------------------------
 # geometry helpers
 # ---------------------------------------------------------------------------
+
+def median(vals):
+    v = sorted(vals)
+    n = len(v)
+    m = n // 2
+    return v[m] if n % 2 else 0.5 * (v[m - 1] + v[m])
+
 
 def horizontal_range(range3d, dz):
     """Slant range -> horizontal range (only used for the closed-form guess)."""
@@ -251,6 +272,35 @@ def multilaterate(anchor_fixes, tag_z, room_w, room_h, iters=6):
             "ambiguous": guess.get("ambiguous", False) and len(anchor_fixes) == 2}
 
 
+def multilaterate_with_offset(anchor_fixes, tag_z, room_w, room_h, lo=-0.5, hi=1.5):
+    """Position AND the offset b shared by every range, for a cold start
+    (antenna-delay offset of ~0.75-1 m not known yet). With 4+ anchors there
+    is one equation more than x, y, b. b is found by a 1-D search: for each
+    candidate b the ranges are corrected and the plain fix computed; the b
+    with the smallest residual wins, refined to 1 cm. A search, not a joint
+    Gauss-Newton: that diverged (b = 3 m) in a 2.6 x 1.3 m room with all
+    anchors at one height. Returns the multilaterate() dict plus "b"."""
+    def fix(b):
+        sol = multilaterate([(ax, ay, az, r - b) for ax, ay, az, r in anchor_fixes],
+                            tag_z, room_w, room_h)
+        return (sol["rms"], b, sol) if sol else None
+
+    best = None
+    for k in range(int(round((hi - lo) / 0.05)) + 1):
+        cand = fix(lo + 0.05 * k)
+        if cand and (best is None or cand[0] < best[0]):
+            best = cand
+    if best is None:
+        return None
+    for k in range(-5, 6):
+        cand = fix(best[1] + 0.01 * k)
+        if cand and cand[0] < best[0]:
+            best = cand
+    out = dict(best[2])
+    out["b"] = best[1]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # device clock -> server clock
 # ---------------------------------------------------------------------------
@@ -303,28 +353,55 @@ class ClockSync:
 # ranges than unknowns (px, py), so that common offset is observable and the
 # filter can estimate it online — exactly like the receiver clock bias in GPS.
 # It is only enabled with 3+ anchors; with 2 it would not be observable.
-# Per-anchor differences remain for the static calibration to remove.
+# With a static calibration of every anchor, b and the d_i below are not
+# estimated: the ranges are already corrected by the calibration.
 # ---------------------------------------------------------------------------
 
 N_STATE = 5
 BIAS_SIGMA0 = 0.3          # prior on b (m)
 BIAS_WALK = 0.003          # random walk of b (m / sqrt(s))
-BIAS_LIMIT = (-0.5, 1.0)   # physically plausible range of b (m)
+BIAS_LIMIT = (-0.5, 1.5)   # physically plausible range of b (m)
+# Per-anchor offsets d_i on top of b (without a calibration): each
+# anchor's own antenna-delay difference. Not observable from one spot (4
+# ranges, 7 unknowns) but observable once the trolley moves through the room
+# and sees every anchor from different directions: online self-calibration.
+# A tight prior keeps them near 0 until the data says more.
+ANCHOR_OFF_SIGMA0 = 0.10   # prior on d_i (m): spread between DW1000 modules
+ANCHOR_OFF_WALK = 0.0005   # random walk of d_i (m / sqrt(s))
+ANCHOR_OFF_LIMIT = 0.30    # |d_i| bound (m)
+# Zero-velocity mode: when it starts and ends, and what the filter assumes
+# meanwhile.
+ZUPT_SLOW, ZUPT_AFTER_MS = 0.20, 400     # enter: speed < 0.2 m/s for 0.4 s
+ZUPT_SIGMA_A, ZUPT_SIGMA_V = 0.05, 0.02  # standing: m/s^2 of process noise, m/s on v = 0
+ZUPT_EXIT_NU, ZUPT_EXIT_N = 1.5, 3       # leave: 3 of the last 4 |nu| > 1.5
 
 
 class TagFilter:
     def __init__(self, px, py, t_ms, sigma_a, sigma_pos=0.5, bias=0.0,
-                 estimate_bias=True, vel_tau=0.0):
-        n = N_STATE
-        self.x = [px, py, 0.0, 0.0, bias]
+                 estimate_bias=True, vel_tau=0.0, offsets=None,
+                 zero_velocity=False, still_long=0.0):
+        """offsets: initial per-anchor offsets d_i (one per anchor index) to
+        add to the state; None keeps the state [px, py, vx, vy, b].
+        zero_velocity / still_long: see PARAMS."""
+        self.n_off = len(offsets) if offsets else 0
+        n = N_STATE + self.n_off
+        self.x = [px, py, 0.0, 0.0, bias] + list(offsets or [])
         self.P = [[0.0] * n for _ in range(n)]
         self.P[0][0] = self.P[1][1] = sigma_pos * sigma_pos
         self.P[2][2] = self.P[3][3] = 1.0
         self.P[4][4] = BIAS_SIGMA0 ** 2 if estimate_bias else 0.0
+        for i in range(self.n_off):
+            self.P[N_STATE + i][N_STATE + i] = ANCHOR_OFF_SIGMA0 ** 2
         self.estimate_bias = estimate_bias
         self.t = t_ms
         self.sigma_a = sigma_a
         self.vel_tau = vel_tau
+        self.zero_velocity = zero_velocity
+        self.still_long = still_long
+        self.standing = False         # in the zero-velocity mode
+        self.drop_ok = True           # set by the engine: enough other anchors for still_long
+        self.slow_since = None
+        self.recent = []              # standing: |nu| > ZUPT_EXIT_NU of the last updates
 
     def predict(self, t_ms):
         dt = (t_ms - self.t) / 1000.0
@@ -332,7 +409,7 @@ class TagFilter:
             return
         self.t = t_ms
         dt = min(dt, 2.0)
-        n, x, P = N_STATE, self.x, self.P
+        n, x, P = len(self.x), self.x, self.P
         # velocity decay a and displacement per unit velocity g
         # (Singer model; tau -> infinity gives constant velocity: a=1, g=dt)
         if self.vel_tau > 0:
@@ -357,7 +434,7 @@ class TagFilter:
             FPF[i][1] += g * FP[i][3]
             FPF[i][2] = a * FP[i][2]
             FPF[i][3] = a * FP[i][3]
-        q = self.sigma_a ** 2
+        q = (ZUPT_SIGMA_A if self.standing else self.sigma_a) ** 2
         dt2 = dt * dt
         q11, q13, q33 = q * dt2 * dt2 / 4.0, q * dt2 * dt / 2.0, q * dt2
         FPF[0][0] += q11; FPF[1][1] += q11
@@ -366,6 +443,8 @@ class TagFilter:
         FPF[2][2] += q33; FPF[3][3] += q33
         if self.estimate_bias:
             FPF[4][4] += BIAS_WALK * BIAS_WALK * dt
+        for i in range(N_STATE, n):
+            FPF[i][i] += ANCHOR_OFF_WALK * ANCHOR_OFF_WALK * dt
         self.P = FPF
         # keep sigma interpretable during long outages
         for i, cap in ((0, 25.0), (1, 25.0), (2, 4.0), (3, 4.0)):
@@ -374,29 +453,72 @@ class TagFilter:
                 for j in range(n):
                     self.P[i][j] *= s
                     self.P[j][i] *= s
+        if self.standing:                     # zero-velocity pseudo-measurement
+            self._direct(2, 0.0, ZUPT_SIGMA_V ** 2)
+            self._direct(3, 0.0, ZUPT_SIGMA_V ** 2)
+
+    def _direct(self, j, z, R):
+        """Scalar update of state j measured directly as z (variance R)."""
+        x, P = self.x, self.P
+        n = len(x)
+        S = P[j][j] + R
+        K = [P[i][j] / S for i in range(n)]
+        y = z - x[j]
+        for i in range(n):
+            x[i] += K[i] * y
+        self.P = [[P[i][q] - K[i] * P[j][q] for q in range(n)] for i in range(n)]
+
+    def _standing_mode(self, nu):
+        """Enter / leave the zero-velocity mode after each range."""
+        if not self.zero_velocity:
+            return
+        if self.standing:
+            self.recent = (self.recent + [abs(nu) > ZUPT_EXIT_NU])[-4:]
+            if sum(self.recent) >= ZUPT_EXIT_N:   # the ranges keep moving: it goes
+                self.standing, self.slow_since, self.recent = False, None, []
+                self.P[2][2] += 0.36              # let the velocity grow again
+                self.P[3][3] += 0.36
+                self.P[0][0] += 0.01
+                self.P[1][1] += 0.01
+            return
+        if math.hypot(self.x[2], self.x[3]) < ZUPT_SLOW:
+            if self.slow_since is None:
+                self.slow_since = self.t
+            elif self.t - self.slow_since >= ZUPT_AFTER_MS:
+                self.standing, self.recent = True, []
+        else:
+            self.slow_since = None
 
     def predicted_range(self, ax, ay, dz):
         dx, dy = self.x[0] - ax, self.x[1] - ay
         rho = math.sqrt(dx * dx + dy * dy + dz * dz) or 1e-6
         return rho, (dx / rho, dy / rho)
 
-    def update(self, ax, ay, dz, z, sigma, huber_k, gate, huber_k_long=0.0):
-        """One slant-range update. Returns (accepted, y, nu, S)."""
-        n, P = N_STATE, self.P
+    def update(self, ax, ay, dz, z, sigma, huber_k, gate, k=None, huber_k_long=0.0):
+        """One slant-range update from anchor index k (only used with
+        per-anchor offsets). Returns (accepted, y, nu, S)."""
+        n, P = len(self.x), self.P
         rho, (h0, h1) = self.predicted_range(ax, ay, dz)
         hb = 1.0 if self.estimate_bias else 0.0
-        H = (h0, h1, 0.0, 0.0, hb)
-        y = z - (rho + hb * self.x[4])
-        PHt = [P[i][0] * h0 + P[i][1] * h1 + P[i][4] * hb for i in range(n)]
-        HPHt = h0 * PHt[0] + h1 * PHt[1] + hb * PHt[4]
+        H = [0.0] * n
+        H[0], H[1], H[4] = h0, h1, hb
+        if k is not None and k < self.n_off:
+            H[N_STATE + k] = 1.0
+        nz = [j for j in range(n) if H[j]]
+        y = z - (rho + sum(H[j] * self.x[j] for j in nz if j >= 4))
+        PHt = [sum(P[i][j] * H[j] for j in nz) for i in range(n)]
+        HPHt = sum(H[j] * PHt[j] for j in nz)
         R = sigma * sigma
         S = HPHt + R
         nu = y / math.sqrt(S)
+        self._standing_mode(nu)
         if abs(nu) > gate:
             return False, y, nu, S
-        k = huber_k_long if (nu > 0 and huber_k_long > 0) else huber_k
-        if abs(nu) > k:                       # Huber: inflate R, do not reject
-            R *= abs(nu) / k
+        if self.standing and self.still_long > 0 and nu > self.still_long and self.drop_ok:
+            return False, y, nu, S            # standing: too long = a body in the way
+        kh = huber_k_long if (nu > 0 and huber_k_long > 0) else huber_k
+        if abs(nu) > kh:                      # Huber: inflate R, do not reject
+            R *= abs(nu) / kh
             S = HPHt + R
         K = [PHt[i] / S for i in range(n)]
         for i in range(n):
@@ -408,228 +530,13 @@ class TagFilter:
                    for j in range(n)] for i in range(n)]
         lo, hi = BIAS_LIMIT
         self.x[4] = min(max(self.x[4], lo), hi)
+        for i in range(N_STATE, n):
+            self.x[i] = min(max(self.x[i], -ANCHOR_OFF_LIMIT), ANCHOR_OFF_LIMIT)
         return True, y, nu, S
 
     def sigma(self):
         return math.sqrt(max(self.P[0][0], 0.0) + max(self.P[1][1], 0.0))
 
-
-# ---------------------------------------------------------------------------
-# WLS-RKF  (Fan & Du 2022, "NLOS Error Mitigation Using Weighted Least
-# Squares and Kalman Filter in UWB Positioning", arXiv:2205.05939 —
-# docs/papers/04_Fan_2022_WLS_RKF_NLOS_Kalman.pdf, Algorithm 1)
-#
-#   1. one Kalman filter KF_i per anchor on the range, state [r, r_dot],
-#      constant velocity, process noise on r_dot (paper eq. 3-4)
-#   2. NLOS test (eq. 13-15): gamma = (r - d)^2 / (H P H^T + R) with
-#      d = predicted range; NLOS if gamma > chi2(1, 0.001) = 6.2 AND r > d
-#   3. LOS: update KF_i with r, use the filtered range, weight 1
-#      NLOS: use the predicted range d, weight sqrt(6.2 / gamma)  (eq. 16-17)
-#   4. position = weighted least squares on the ranges (eq. 18)
-#   5. NLOS filters are then updated with the distance from the WLS
-#      position to their anchor (eq. 19), so they follow the LOS solution
-#
-# Adapted to this system (and documented as such in PERBAIKAN_AKURASI.md):
-#   * ranges are 3-D slant ranges: rho_i = sqrt(dx^2 + dy^2 + dz^2)
-#   * the paper's ranges were calibrated; ours carry a common offset (~0.75 m
-#     uncalibrated antenna delay), so the WLS solves [x, y, b] with a
-#     random-walk prior on b (same role as the EKF's b state)
-#   * samples arrive one anchor at a time, not in synchronous epochs: every
-#     sample triggers a solve, and each anchor's range is propagated to the
-#     solve time with its own filter (the per-anchor filters make this easy)
-# ---------------------------------------------------------------------------
-
-class RangeKF:
-    """Kalman filter on one anchor's range, state [r, r_dot]."""
-
-    def __init__(self, r, t_ms, sigma_r):
-        self.r, self.v = r, 0.0
-        self.P = [[sigma_r * sigma_r, 0.0], [0.0, 1.0]]
-        self.t = t_ms
-
-    def predict(self, t_ms, sigma_u):
-        dt = min(max((t_ms - self.t) / 1000.0, 0.0), 2.0)
-        if dt <= 0:
-            return
-        self.t = t_ms
-        self.r += self.v * dt
-        P = self.P
-        # P = A P A^T + Gamma Q Gamma^T, A = [[1, dt], [0, 1]], Gamma = [0, dt]
-        p00 = P[0][0] + 2 * dt * P[0][1] + dt * dt * P[1][1]
-        p01 = P[0][1] + dt * P[1][1]
-        p11 = P[1][1] + (sigma_u * dt) ** 2
-        self.P = [[p00, p01], [p01, p11]]
-
-    def range_at(self, t_ms):
-        """Range propagated to t_ms without touching the state."""
-        dt = min(max((t_ms - self.t) / 1000.0, 0.0), 2.0)
-        return self.r + self.v * dt
-
-    def var_at(self, t_ms, sigma_u):
-        """Variance of range_at(t_ms): grows while the anchor is not heard."""
-        dt = min(max((t_ms - self.t) / 1000.0, 0.0), 2.0)
-        P = self.P
-        return P[0][0] + 2 * dt * P[0][1] + dt * dt * P[1][1] + (sigma_u * dt * dt) ** 2
-
-    def gamma(self, z, R):
-        return (z - self.r) ** 2 / (self.P[0][0] + R)
-
-    def update(self, z, R):
-        P = self.P
-        S = P[0][0] + R
-        k0, k1 = P[0][0] / S, P[1][0] / S
-        y = z - self.r
-        self.r += k0 * y
-        self.v += k1 * y
-        self.P = [[(1 - k0) * P[0][0], (1 - k0) * P[0][1]],
-                  [P[1][0] - k1 * P[0][0], P[1][1] - k1 * P[0][1]]]
-
-
-class WlsRkfFilter:
-    """Position from per-anchor range filters + NLOS-weighted least squares.
-
-    Exposes the same surface the Engine reads from TagFilter (x, t, sigma(),
-    sigma_a, vel_tau) so the output path, room clamp and UI are shared.
-    """
-
-    def __init__(self, px, py, t_ms, bias=0.0, estimate_bias=True):
-        self.x = [px, py, 0.0, 0.0, bias]     # px, py, vx, vy, b
-        self.t = t_ms
-        self.kf = {}                          # anchor -> RangeKF
-        self.sol = {}                         # anchor -> (r_hat, weight, nlos)
-        self.Pb = BIAS_SIGMA0 ** 2 if estimate_bias else 0.0
-        self.estimate_bias = estimate_bias
-        self.Pxy = [[0.25, 0.0], [0.0, 0.25]]
-        self.sigma_a = 0.0                    # unused, kept for configure()
-        self.vel_tau = 0.0
-
-    def sigma(self):
-        return math.sqrt(max(self.Pxy[0][0], 0.0) + max(self.Pxy[1][1], 0.0))
-
-    def step(self, anchor, z, t_ms, anchors, tag_z, p, fresh_ms):
-        """One range sample z (calibrated, still containing the common
-        offset) from `anchor`. Returns (los, innovation, nu, weight)."""
-        R = p["sigma_r"] ** 2
-        kf = self.kf.get(anchor)
-        new = kf is None
-        if new:                                   # first sample seeds the filter
-            kf = self.kf[anchor] = RangeKF(z, t_ms, p["sigma_r"])
-            gamma, y = 0.0, 0.0
-        else:
-            kf.predict(t_ms, p["rkf_sigma_u"])
-            y = z - kf.r
-            gamma = kf.gamma(z, R)
-        chi2 = p["nlos_chi2"]
-        nlos = (not new) and gamma > chi2 and y > 0     # one-sided test (eq. 15)
-        if nlos:
-            w = math.sqrt(chi2 / gamma)                 # eq. 17
-        else:
-            if not new:
-                kf.update(z, R)
-            w = 1.0
-        self.sol[anchor] = (w, nlos)
-
-        # Weighted least squares on every anchor heard in the last few seconds,
-        # each range propagated to now by its own filter. The paper's epochs
-        # are synchronous (all anchors every 50 ms); here an anchor may be
-        # silent for a second or two, so its weight also carries the growing
-        # prediction variance: W = w^2 / (R + var). Using only the anchors of
-        # the last 0.7 s left 2-3 rows and the solution jumped by up to 2 m.
-        rows = []
-        for a, (wa, _nl) in self.sol.items():
-            f = self.kf.get(a)
-            pos = anchors.get(a)
-            if f is None or pos is None or t_ms - f.t > fresh_ms:
-                continue
-            W = wa * wa / (R + f.var_at(t_ms, p["rkf_sigma_u"]))
-            rows.append((pos, f.range_at(t_ms), W))
-        self._solve(rows, t_ms, tag_z, p)
-
-        # NLOS: the filter follows the LOS solution instead of the biased range
-        if nlos:
-            pos = anchors.get(anchor)
-            if pos is not None:
-                rho = math.sqrt((self.x[0] - pos[0]) ** 2 + (self.x[1] - pos[1]) ** 2
-                                + (tag_z - pos[2]) ** 2)
-                kf.update(rho + self.x[4], R)
-        nu = math.copysign(math.sqrt(gamma), y) if gamma > 0 else 0.0
-        return (not nlos), y, nu, w
-
-    def _solve(self, rows, t_ms, tag_z, p):
-        """rows: (anchor_xyz, range, weight W = 1/variance). Solves [x, y]
-        and, with 4+ anchors, the common offset b (else b is held)."""
-        dt = max((t_ms - self.t) / 1000.0, 0.0)
-        # 3 ranges for x, y; a 4th before b is free too: with exactly as many
-        # ranges as unknowns every bit of noise lands in the position
-        if len(rows) < 3:
-            return
-        use_b = self.estimate_bias and len(rows) >= 4
-        if use_b:
-            self.Pb = min(self.Pb + BIAS_WALK * BIAS_WALK * dt, BIAS_SIGMA0 ** 2)
-        x, y, b = self.x[0], self.x[1], self.x[4]
-        b_prior = b
-        n = 3 if use_b else 2
-        cov = None
-        for _ in range(6):
-            A = [[0.0] * n for _ in range(n)]
-            g = [0.0] * n
-            for (ax, ay, az), r, W in rows:
-                dx, dy, dz = x - ax, y - ay, tag_z - az
-                rho = math.sqrt(dx * dx + dy * dy + dz * dz) or 1e-6
-                J = (dx / rho, dy / rho, 1.0)[:n]
-                res = r - (rho + b)
-                for i in range(n):
-                    g[i] += J[i] * W * res
-                    for j in range(n):
-                        A[i][j] += J[i] * W * J[j]
-            if use_b and self.Pb > 0:            # random-walk prior on b
-                A[2][2] += 1.0 / self.Pb
-                g[2] += (b_prior - b) / self.Pb
-            cov = _invert(A)
-            if cov is None:
-                return
-            step = [sum(cov[i][j] * g[j] for j in range(n)) for i in range(n)]
-            x += step[0]
-            y += step[1]
-            if use_b:
-                b += step[2]
-            if abs(step[0]) + abs(step[1]) < 1e-4:
-                break
-        lo, hi = BIAS_LIMIT
-        b = min(max(b, lo), hi)
-        # velocity from the position change, lightly smoothed (output only)
-        if dt > 0:
-            a = min(dt / 0.5, 1.0)
-            self.x[2] += a * ((x - self.x[0]) / dt - self.x[2])
-            self.x[3] += a * ((y - self.x[1]) / dt - self.x[3])
-        self.x[0], self.x[1], self.x[4] = x, y, b
-        self.Pxy = [[cov[0][0], cov[0][1]], [cov[1][0], cov[1][1]]]
-        if use_b:
-            self.Pb = cov[2][2]
-        self.t = max(self.t, t_ms)
-
-
-def _invert(A):
-    """Inverse of a small symmetric matrix (2x2 or 3x3), None if singular."""
-    n = len(A)
-    M = [list(A[i]) + [1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
-    for c in range(n):
-        piv = max(range(c, n), key=lambda r: abs(M[r][c]))
-        if abs(M[piv][c]) < 1e-12:
-            return None
-        M[c], M[piv] = M[piv], M[c]
-        f = M[c][c]
-        M[c] = [v / f for v in M[c]]
-        for r in range(n):
-            if r != c and M[r][c] != 0.0:
-                k = M[r][c]
-                M[r] = [vr - k * vc for vr, vc in zip(M[r], M[c])]
-    return [row[n:] for row in M]
-
-
-# ---------------------------------------------------------------------------
-# per-tag track
-# ---------------------------------------------------------------------------
 
 class TagTrack:
     def __init__(self, tag_id):
@@ -643,10 +550,20 @@ class TagTrack:
         self.reinits = 0
         self.dropped_late = 0
         self.bias = 0.0               # last common-offset estimate, kept across re-inits
+        self.offsets = {}             # anchor -> last per-anchor offset d_i (same)
+        self.bias_known = False       # b solved at a fix or learned by the EKF
         self.implausible = 0          # samples dropped as physically impossible
         self.first_t = None           # first sample seen (bootstrap patience)
         self.warm = 0                 # accepted samples since the last (re)init
-        self.rkf = {}                 # ekf_nlos: anchor -> RangeKF (NLOS test)
+        self.win = {}                 # anchor -> [(t, range)] newest ranges (bootstrap median)
+        self.acc_t = {}               # anchor -> time of its last accepted range
+        self.post = []                # [(filter t, x, y)] last outputs (smoothing)
+        self.still_from = None        # used only by tools/tracker_lab.py (post_filter "still")
+        self.hold = None              # last valid (x, y), reported while invalid
+
+    def reset_output(self):
+        self.post.clear()
+        self.still_from = None
 
 
 class Engine:
@@ -658,7 +575,8 @@ class Engine:
         self.nlos_enabled = True
         self.anchors = {}             # id -> (x, y, z)
         self.cal = {}                 # id -> (bias, scale)
-        self.params = dict(DEFAULT_TRACKING)
+        self.calibrated = False       # every anchor has a static calibration
+        self.params = dict(PARAMS)
         self.tracks = {}              # tag -> TagTrack
         self.clocks = {}              # reporting device -> ClockSync
         self.last_dev_ts = {}         # (reporter, anchor, tag) -> device ts consumed
@@ -668,8 +586,9 @@ class Engine:
 
     # ----- configuration ---------------------------------------------------
     def configure(self, scene, nlos_enabled=True, extra_anchors=None, nlos_mod=None):
-        """(Re)load geometry + calibration + tuning. Tracks are kept unless the
-        caller also calls reset() (it should, when anchors move)."""
+        """(Re)load geometry + calibration + the smoothing setting. Tracks are
+        kept unless the caller also calls reset() (it should, when anchors
+        move or the calibration changes)."""
         self.scene = scene
         self.nlos_enabled = nlos_enabled
         if nlos_mod is not None:
@@ -688,17 +607,43 @@ class Engine:
             except (TypeError, ValueError, AttributeError):
                 continue
         self.cal = cal
-        old_algo = self.params.get("algorithm")
-        self.params = tracking_params(scene)
-        if self.params["algorithm"] != old_algo:
-            # a different algorithm needs a fresh track (other filter type)
+        self.calibrated = bool(anchors) and all(aid in cal for aid in anchors)
+        self.params = self._load_params(scene)
+        index = {aid: i for i, aid in enumerate(sorted(anchors))}
+        n_off = len(index) if self._offset_policy()[1] else 0
+        if index != getattr(self, "anchor_index", None) or n_off != getattr(self, "n_off", 0):
+            # the per-anchor states no longer line up: restart the filters
             for tr in self.tracks.values():
                 tr.f = None
                 tr.first_t = None
+        self.anchor_index, self.n_off = index, n_off
+        zero_velocity, still_long = self._standing_options()
         for tr in self.tracks.values():
+            tr.reset_output()
             if tr.f is not None:
                 tr.f.sigma_a = self.params["sigma_a"]
                 tr.f.vel_tau = self.params["vel_tau_s"]
+                tr.f.zero_velocity = zero_velocity
+                tr.f.still_long = still_long
+                if not zero_velocity:
+                    tr.f.standing = False
+
+    # The four places tools/tracker_lab.py (research variants) differs:
+    def _load_params(self, scene):
+        return tracking_params(scene)
+
+    def _offset_policy(self):
+        """(estimate the shared offset b, estimate each anchor's d_i): only
+        without a calibration, and b only with 3+ anchors (observable)."""
+        learn = not self.calibrated
+        return learn and len(self.anchors) >= 3, learn
+
+    def _standing_options(self):
+        """(zero-velocity mode on, still_long in sigma)."""
+        return self.params["zero_velocity"] >= 0.5, self.params["still_long"]
+
+    def _still(self, tr):
+        return tr.f.standing
 
     def reset(self):
         self.tracks.clear()
@@ -798,11 +743,15 @@ class Engine:
 
     # ----- filter ------------------------------------------------------------
     def _fresh_fixes(self, tr, now):
+        """(ax, ay, az, range) for every anchor heard in the last FIX_WINDOW_MS.
+        The range is the median of that anchor's samples in the window, so a
+        single spike cannot seed a wrong track."""
         out = []
-        for anchor, (t, z, _raw) in tr.latest.items():
+        for anchor, buf in tr.win.items():
             pos = self.anchors.get(anchor)
-            if pos and now - t <= FIX_WINDOW_MS:
-                out.append((pos[0], pos[1], pos[2], z))
+            vals = [z for t, z in buf if now - FIX_WINDOW_MS <= t <= now]
+            if pos and vals:
+                out.append((pos[0], pos[1], pos[2], median(vals)))
         return out
 
     def _bootstrap(self, tr, now, force=False):
@@ -817,9 +766,27 @@ class Engine:
         need = max(need, 2)
         if len(fixes) < need:
             return False
-        # the common offset learned so far still applies to the new fix
+        # the common offset learned so far still applies to the new fix; on a
+        # cold start (offset never learned) it is solved together with x, y
+        est_b = self._offset_policy()[0]
+        cold = est_b and not tr.bias_known
         fixes = [(ax, ay, az, r - tr.bias) for ax, ay, az, r in fixes]
-        sol = multilaterate(fixes, self.tag_z(), room.get("width", 0), room.get("depth", 0))
+        if (cold and len(fixes) < 4 <= len(self.anchors) and not force
+                and now - (tr.first_t or now) <= 5000):
+            return False                     # give 4 anchors 5 s, to learn b
+        w, d = room.get("width", 0), room.get("depth", 0)
+        sol = None
+        if cold and len(fixes) >= 4:
+            sol = multilaterate_with_offset(fixes, self.tag_z(), w, d, *BIAS_LIMIT)
+            m = self.params["room_margin"]
+            inside = sol and (w <= 0 or -m <= sol["x"] <= w + m) and (d <= 0 or -m <= sol["y"] <= d + m)
+            if sol and inside and sol["rms"] <= 0.3:
+                tr.bias = sol["b"]
+                tr.bias_known = True
+            else:
+                sol = None                   # inconsistent: fall back to b as it is
+        if sol is None:
+            sol = multilaterate(fixes, self.tag_z(), w, d)
         if sol is None:
             return False
         # With 3+ anchors an inconsistent set (NLOS) would seed a wrong track;
@@ -827,15 +794,30 @@ class Engine:
         if len(fixes) >= 3 and sol["rms"] > 0.6 and not force:
             return False
         tr.warm = 0
-        est_b = self.params["estimate_bias"] >= 0.5 and len(self.anchors) >= 3
-        if self.params["algorithm"] == "wls_rkf":
-            tr.f = WlsRkfFilter(sol["x"], sol["y"], now, bias=tr.bias, estimate_bias=est_b)
-        else:
-            tr.f = TagFilter(sol["x"], sol["y"], now, self.params["sigma_a"], bias=tr.bias,
-                             estimate_bias=est_b, vel_tau=self.params["vel_tau_s"])
+        tr.reset_output()
+        offsets = None
+        if self.n_off and est_b:
+            offsets = [0.0] * self.n_off
+            for aid, i in self.anchor_index.items():
+                offsets[i] = tr.offsets.get(aid, 0.0)
+        zero_velocity, still_long = self._standing_options()
+        tr.f = TagFilter(sol["x"], sol["y"], now, self.params["sigma_a"], bias=tr.bias,
+                         estimate_bias=est_b, vel_tau=self.params["vel_tau_s"],
+                         offsets=offsets, zero_velocity=zero_velocity, still_long=still_long)
         tr.last_accept = now
         tr.reinits += 1 if force else 0
         return True
+
+    def _range_value(self, tr, anchor, t, z):
+        """Keep the range in this anchor's short window (the bootstrap takes its
+        median) and return the value the EKF uses: the anchor's newest range."""
+        buf = tr.win.setdefault(anchor, [])
+        if buf and t - buf[-1][0] > self.params["window_ms"]:
+            buf.clear()                       # a gap: start again
+        bisect.insort(buf, (t, z))
+        if len(buf) > BOOT_SAMPLES:
+            del buf[:len(buf) - BOOT_SAMPLES]
+        return buf[-1][1]
 
     def _process(self, tr, t, anchor, raw, rx, fp, reporter):
         pos = self.anchors.get(anchor)
@@ -847,12 +829,13 @@ class Engine:
             # tens of metres (seen: 37-189 m in a 2.6 m room)
             tr.implausible += 1
             return
+        zf = self._range_value(tr, anchor, t, z)
         tr.latest[anchor] = (t, z, raw)
         tr.sample_ts.append(t)
         if tr.first_t is None:
             tr.first_t = t
         link = tr.links.setdefault(anchor, {})
-        link.update({"range": raw, "corrected": z, "rx": rx, "fp": fp,
+        link.update({"range": raw, "corrected": z, "filtered": zf, "rx": rx, "fp": fp,
                      "src": reporter, "t": t})
 
         if tr.f is None:
@@ -862,10 +845,6 @@ class Engine:
         p = self.params
         if t < tr.f.t - p["max_late_ms"]:
             tr.dropped_late += 1
-            return
-
-        if isinstance(tr.f, WlsRkfFilter):
-            self._process_wls(tr, t, anchor, z, link)
             return
 
         tr.f.predict(t)
@@ -879,64 +858,33 @@ class Engine:
             sigma = self.nlos_mod.measurement_sigma(blockers, p["sigma_r"])
             bias = self.nlos_mod.nlos_bias(blockers)
 
-        # ekf_nlos: Fan & Du's NLOS identification (eq. 13-15) on this anchor's
-        # own range history; an NLOS range keeps a reduced weight in the EKF
-        # (their eq. 17 weight w = sqrt(chi2/gamma), i.e. R / w^2)
-        nlos = False
-        if p["algorithm"] == "ekf_nlos":
-            R = p["sigma_r"] ** 2
-            kf = tr.rkf.get(anchor)
-            if kf is None:
-                tr.rkf[anchor] = RangeKF(z, t, p["sigma_r"])
-            else:
-                kf.predict(t, p["rkf_sigma_u"])
-                g = kf.gamma(z, R)
-                nlos = g > p["nlos_chi2"] and z > kf.r
-                if nlos:
-                    sigma *= math.sqrt(g / p["nlos_chi2"])
-                else:
-                    kf.update(z, R)
-
-        ok, y, nu, S = tr.f.update(ax, ay, az - tag_z, z - bias, sigma,
-                                   p["huber_k"], p["gate"], p["huber_k_long"])
-        if nlos:
-            # the anchor's range filter follows the EKF instead of the biased
-            # measurement (their eq. 19), so the NLOS episode stays detected
-            rho, _h = tr.f.predicted_range(ax, ay, az - tag_z)
-            tr.rkf[anchor].update(rho + tr.f.x[4], p["sigma_r"] ** 2)
+        # still_long may drop this range only while the other anchors can still
+        # fix the position: with a wrong anchor position (one range always
+        # "too long") it would otherwise starve the validity gate
+        others = sum(1 for a, ta in tr.acc_t.items() if a != anchor and t - ta <= p["fresh_ms"])
+        tr.f.drop_ok = others >= p["min_anchors"]
+        ok, y, nu, S = tr.f.update(ax, ay, az - tag_z, zf - bias, sigma,
+                                   p["huber_k"], p["gate"], self.anchor_index.get(anchor),
+                                   p["huber_k_long"])
         link.update({"residual": y, "nu": nu, "accepted": ok, "sigma": sigma,
-                     "nlos": nlos, "bias": bias, "blocked": bool(blockers),
+                     "bias": bias, "blocked": bool(blockers),
                      "atten": max([ob.get("atten", 1.0) for ob in blockers], default=0.0),
                      "obstacles": [ob.get("id") for ob in blockers]})
         if ok:
             tr.last_accept = t
             tr.accepted_ts.append(t)
+            tr.acc_t[anchor] = t
             tr.bias = tr.f.x[4]
+            tr.bias_known = True
+            if tr.f.n_off:
+                for aid, i in self.anchor_index.items():
+                    tr.offsets[aid] = tr.f.x[N_STATE + i]
             tr.warm += 1
         elif t - (tr.last_accept or t) > p["reinit_ms"]:
             # lost: every sample rejected for a while -> restart from geometry
             self._bootstrap(tr, t, force=True)
             return
 
-        self._clamp_to_room(tr)
-
-    def _process_wls(self, tr, t, anchor, z, link):
-        """WLS-RKF path of _process (algorithm = "wls_rkf")."""
-        los, y, nu, w = tr.f.step(anchor, z, t, self.anchors, self.tag_z(),
-                                  self.params, WLS_FRESH_MS)
-        link.update({"residual": y, "nu": nu, "accepted": los, "nlos": not los,
-                     "weight": w, "sigma": self.params["sigma_r"], "bias": 0.0,
-                     "blocked": False, "atten": 0.0, "obstacles": []})
-        tr.last_accept = t if los else tr.last_accept
-        if los:
-            tr.accepted_ts.append(t)
-        tr.bias = tr.f.x[4]
-        tr.warm += 1
-        if t - (tr.last_accept or t) > self.params["reinit_ms"]:
-            # every anchor judged NLOS for a while: the filters have locked
-            # onto a wrong solution -> restart from geometry
-            self._bootstrap(tr, t, force=True)
-            return
         self._clamp_to_room(tr)
 
     def _clamp_to_room(self, tr):
@@ -953,24 +901,53 @@ class Engine:
         if cy != x[1]:
             x[1], x[3] = cy, 0.0
 
+    def _reported(self, tr, px, py, vx, vy, age):
+        """The position shown: the filter's, or with "smooth" the mean of its
+        last smooth_window outputs. One entry per filter step: estimate()
+        calls without a new sample in between add nothing."""
+        p = self.params
+        t = tr.f.t
+        win = tr.post
+        if not win or t > win[-1][0]:
+            win.append((t, px, py))
+        n = max(int(p["smooth_window"]), 1)
+        while win and (len(win) > n or t - win[0][0] > p["window_ms"]):
+            del win[0]
+        if p["smooth"] < 0.5:
+            return px, py, vx, vy
+        return sum(q[1] for q in win) / len(win), sum(q[2] for q in win) / len(win), vx, vy
+
     # ----- output ------------------------------------------------------------
     def estimate(self, tag, now_ms=None):
-        """Current estimate. With now_ms the position is extrapolated along the
-        velocity to that instant (at most extrapolate_ms), so the displayed
-        point does not trail the tag by the uplink batching delay."""
+        """Current estimate (now_ms: the time it is asked for, for its age).
+
+        "valid" is False when the filter cannot fix a 2-D position (fewer than
+        min_anchors anchors accepted within fresh_ms of the filter time, or
+        sigma above valid_sigma) or when its newest data is older than
+        fresh_ms; x, y are then the last valid position, held."""
         tr = self.tracks.get(tag)
         # a freshly (re)initialised track is not shown until it has absorbed
         # a couple of samples per anchor: the seed alone can be decimetres off
         if tr is None or tr.f is None or tr.warm < 2 * max(len(tr.latest), 2):
             return None
+        p = self.params
         t_ref = tr.f.t if now_ms is None else max(now_ms, tr.f.t)
         tr.sample_ts = [t for t in tr.sample_ts if t_ref - t <= 1000]
         tr.accepted_ts = [t for t in tr.accepted_ts if t_ref - t <= 1000]
-        px, py, vx, vy, bias = tr.f.x
-        ahead = min(t_ref - tr.f.t, self.params["extrapolate_ms"]) / 1000.0
-        px += vx * ahead
-        py += vy * ahead
+        px, py, vx, vy, bias = tr.f.x[:N_STATE]
         sigma = tr.f.sigma()
+        n_fresh = sum(1 for ta in tr.acc_t.values() if tr.f.t - ta <= p["fresh_ms"])
+        need = max(min(int(p["min_anchors"]), len(self.anchors)), 1)
+        fixable = n_fresh >= need and sigma <= p["valid_sigma"]
+        age = t_ref - tr.f.t
+        if fixable:
+            px, py, vx, vy = self._reported(tr, px, py, vx, vy, age)
+            tr.hold = (px, py)
+        else:
+            tr.reset_output()
+            if tr.hold is not None:
+                px, py = tr.hold
+            vx = vy = 0.0
         tag_z = self.tag_z()
         flat = []
         for anchor, (t, z, _raw) in tr.latest.items():
@@ -982,7 +959,15 @@ class Engine:
             "id": tag, "t": tr.f.t,
             "x": px, "y": py, "z": tag_z, "vx": vx, "vy": vy,
             "range_bias": bias,
+            "anchor_offsets": dict(tr.offsets),
+            # an anchor whose own offset exceeds 20 cm: DW1000 modules differ by
+            # a few cm, so the scene position of that anchor is probably wrong
+            "offset_warning": sorted(a for a, v in tr.offsets.items() if abs(v) > 0.20),
             "sigma": sigma, "confidence": 1.0 / (1.0 + sigma),
+            "valid": fixable and age <= p["fresh_ms"],
+            "held": not fixable, "anchors_fresh": n_fresh, "age_ms": age,
+            "still": self._still(tr),         # standing (zero-velocity mode)
+            "calibrated": self.calibrated,    # offsets from the static calibration
             "ambiguous": False,
             "geometry_ok": ok_geo, "geometry_slack": slack,
             "used": len(tr.accepted_ts), "rate_hz": len(tr.sample_ts),

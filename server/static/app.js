@@ -17,6 +17,7 @@ const S = {
   dirty: false,
   trail: {},
   showTrail: true,
+  showRings: true,          // measured range circle per anchor
   autoSpin: false,
 };
 
@@ -28,13 +29,14 @@ const $ = (id) => document.getElementById(id);
    dark blue on a paper-white canvas. */
 const COL_DARK = {
   room: 0x1a1a1f, wall: 0x24242b, grid: 0x2a2a31, anchor: 0x34d399, anchorOff: 0x55555c,
+  anchorWarn: 0xf5a524,
   tag: 0xffb020, los: 0x34d399, nlos: 0xe8243b, obstacle: 0x3a3a44,
   sel: 0xffffff, ghost: 0x8e8e92,   // white reads best on the dark scene
   ruler: 0xffffff, rulerMajor: 0xffffff, rulerText: 0xffffff,
   dimText: 0xa8b8dc, originText: 0xd8e0ff,
   axisX: 0xff6b6b, axisY: 0x6bff9c, axisZ: 0x6bb5ff,
   labelOutline: 0x0a0a0c,
-  labelOn: 0xcffbe6, labelOff: 0xc3c9d6, labelTag: 0xffe6a8,
+  labelOn: 0xcffbe6, labelOff: 0xc3c9d6, labelTag: 0xffe6a8, labelText: 0xf2f0ec,
   plateBg: 0x111114, plateLine: 0x3a3a44,
   gridMajor: 0x2e2e38, wallGlass: 0x3a3a46,
   anchorBody: 0x1c3b30, anchorBodyOff: 0x24242b, tagBody: 0x4a3208,
@@ -43,6 +45,7 @@ const COL_DARK = {
 };
 const COL_LIGHT = {
   room: 0xdedbd5, wall: 0xd6d3cc, grid: 0xd2cfc8, anchor: 0x2f9e77, anchorOff: 0xc4c1ba,
+  anchorWarn: 0xc77d0a,
   tag: 0xc2761a, los: 0x2f9e77, nlos: 0xd12a3d, obstacle: 0xd2cfc8,
   sel: 0xe01f34, ghost: 0x5c5c66,
   // Darker than the paper background: the old pale blues were unreadable here.
@@ -52,7 +55,7 @@ const COL_LIGHT = {
   labelOutline: 0xeceae6,
   // On paper, a pale green label over a pale wall disappeared; these are dark
   // enough to hold against #eceae6 while still reading as "online".
-  labelOn: 0x0a5c3f, labelOff: 0x4a4a55, labelTag: 0x7a4a00,
+  labelOn: 0x0a5c3f, labelOff: 0x4a4a55, labelTag: 0x7a4a00, labelText: 0x17171b,
   plateBg: 0xf6f5f2, plateLine: 0xc9c6c0,
   gridMajor: 0xc4c0b8, wallGlass: 0xd9d4cb,
   anchorBody: 0xdad7d0, anchorBodyOff: 0xd4d1ca, tagBody: 0xf0d9a8,
@@ -192,23 +195,34 @@ function bindContextLoss() {
 // become unreadable at exactly the zoom where the whole room matters. Rescale
 // every frame so a label keeps a constant size on screen, and hide it when the
 // node is too small to matter.
-const LABEL_PX = 30;          // on-screen height of a label at reference size
+const LABEL_PX = 30;          // on-screen height of a one-line label at reference size
 const LABEL_REF = 0.20;       // `size` of the anchor label = the reference
 function updateLabelScale() {
   const h = renderer.domElement.clientHeight || 1;
+  // labels farther than this are hidden; grows with the room so a big room
+  // seen as a whole still shows every anchor's label
+  const room = S.scene?.room || {};
+  const farLabels = Math.max(26, 3.5 * Math.hypot(room.width || 0, room.depth || 0));
   for (const g of [anchorGroup, tagGroup, roomGroup]) {
     if (!g) continue;
     for (const node of g.children) {
       for (const c of node.children) {
         if (!c.isSprite || !c.userData.labelSize) continue;
         const dist = camera.position.distanceTo(c.getWorldPosition(_labelTmp));
-        // World units covered by one screen pixel at this depth.
-        const worldPerPx = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * dist / h;
+        // World units covered by one screen pixel at this depth. Perspective
+        // size depends on the depth ALONG the view direction, not on the
+        // straight-line distance: with the distance, a label near the edge
+        // of the screen was drawn larger and grew / shrank as the camera turned.
+        const depth = Math.max(-_labelTmp.applyMatrix4(camera.matrixWorldInverse).z, 0.05);
+        const worldPerPx = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * depth / h;
         // `size` scales the label, so ruler numbers stay smaller than anchors.
         const weight = (c.userData.labelSize || LABEL_REF) / LABEL_REF;
-        const target = LABEL_PX * weight * worldPerPx;
+        // LABEL_PX is the height of ONE text line; a two-line plate is drawn
+        // twice as tall instead of squeezing its letters to half size (which
+        // made a label jump in size when its line count changed).
+        const target = LABEL_PX * weight * worldPerPx * ((c.userData.hPx || 1) / (c.userData.unitPx || c.userData.hPx || 1));
         c.scale.set(target * (c.userData.aspect || 1), target, 1);
-        c.visible = dist < 26;                        // drop the far ones
+        c.visible = dist < farLabels;                 // drop the far ones
       }
     }
   }
@@ -224,7 +238,6 @@ function animate() {
   else applyAutoSpin();
   controls.update();
   applyZoom();
-  animatePulses();
   animateSelRig();
   updateFog();
   updateLabelScale();
@@ -430,13 +443,12 @@ function buildRoom() {
   floor.userData.pick = 'floor';
   roomGroup.add(floor);
 
-  // 1 m grid, aligned with the world origin (0,0) so it doubles as a ruler
-  // Grid colours come from the palette; the fixed blues did not follow the
-  // theme and read as a stray element on the paper background.
-  const grid = new THREE.GridHelper(Math.max(W, D) * 1.4, Math.round(Math.max(W, D) * 1.4),
-                                    COL.gridMajor, COL.grid);
-  grid.position.set(W / 2, 0.005, D / 2);
-  roomGroup.add(grid);
+  // Floor grid covering exactly the room: a line on every whole metre from the
+  // 0,0 corner (fainter ones every half metre), so a point's x, y can be read
+  // off the floor. (The old GridHelper was 1.4x the room, centred on it, and
+  // its cells were W*1.4/round(W*1.4) wide: 1.02 m in a 9.5 m room, with no
+  // line on any whole metre.)
+  roomGroup.add(floorGrid(W, D));
 
   // ---- coordinate system: X axis (red), Y axis (green), origin marker ----
   const axes = new THREE.Group();
@@ -500,12 +512,95 @@ function buildRoom() {
   mk(0.06, H, D, W, H / 2, D / 2);          // x = W
 
   // dimension labels (the rulers already carry per-metre numbers)
-  // Outside the footprint, clear of the rulers' own numbers.
-  label(`width ${W.toFixed(2)} m`, new THREE.Vector3(W / 2, 0.12, -1.05), COL.rulerText, 0.145, true);
-  label(`depth ${D.toFixed(2)} m`, new THREE.Vector3(-1.05, 0.12, D / 2), COL.rulerText, 0.145, true);
+  // Outside the footprint, clear of the rulers' own numbers. These were
+  // created but never added to the scene before, so they never showed.
+  roomGroup.add(label(`width X ${W.toFixed(2)} m · grid 1 m`,
+                      new THREE.Vector3(W / 2, 0.12, -1.05), COL.rulerText, 0.145, true));
+  roomGroup.add(label(`depth Y ${D.toFixed(2)} m`,
+                      new THREE.Vector3(-1.05, 0.12, D / 2), COL.rulerText, 0.145, true));
+  roomGroup.add(label(`height ${H.toFixed(2)} m`,
+                      new THREE.Vector3(W + 0.25, H, -0.25), COL.rulerText, 0.13, true));
 
   controls.target.set(W / 2, 0.8, D / 2);
   updateHud();
+}
+
+// Grid lines on the floor, inside the room only: every 0.5 m, whole metres
+// stronger. Counted in integer steps so the lines land exactly on the metre.
+function floorGrid(W, D) {
+  const major = [], minor = [];
+  const y = 0.004;
+  const push = (arr, a, b) => arr.push(a[0], y, a[1], b[0], y, b[1]);
+  for (let i = 0; i <= Math.floor(W * 2 + 1e-6); i++) {
+    const x = i / 2;
+    push(i % 2 ? minor : major, [x, 0], [x, D]);
+  }
+  for (let i = 0; i <= Math.floor(D * 2 + 1e-6); i++) {
+    const z = i / 2;
+    push(i % 2 ? minor : major, [0, z], [W, z]);
+  }
+  push(major, [W, 0], [W, D]);          // the far walls, also when not on a 0.5 m step
+  push(major, [0, D], [W, D]);
+  const g = new THREE.Group();
+  for (const [pts, col, op] of [[major, COL.ruler, 0.28], [minor, COL.ruler, 0.10]]) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    const lines = new THREE.LineSegments(geo, new THREE.LineBasicMaterial(
+      { color: col, transparent: true, opacity: op, depthWrite: false }));
+    lines.userData.pick = 'floor';
+    g.add(lines);
+  }
+  return g;
+}
+
+// A circle in the floor plane at height h, as a 1-pixel line (stays visible
+// at any size: a margin of error of 2 cm or a range circle of 10 m).
+function circleLine(cx, cz, h, r, color, opacity, dashed = false) {
+  const pts = [];
+  const n = 128;
+  for (let i = 0; i <= n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    pts.push(new THREE.Vector3(cx + r * Math.cos(a), h, cz + r * Math.sin(a)));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = dashed
+    ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 0.10, gapSize: 0.08 })
+    : new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+  const line = new THREE.Line(geo, mat);
+  if (dashed) line.computeLineDistances();
+  return line;
+}
+
+// Labels are painted on canvases with "JetBrains Mono". A label painted
+// before the web font finished loading used a fallback font (wider, larger),
+// and kept it until its text changed — then it was repainted in the real font
+// and visibly shrank or grew. LABEL_EPOCH changes once the font is ready, so
+// every label is repainted (and re-measured) with it.
+let LABEL_EPOCH = 0;
+const LABEL_FONT_CHECK = 'bold 40px "JetBrains Mono"';
+const LABEL_WAIT = new Set();      // labels painted with a fallback font
+let ROOM_WAIT = false;             // floor numbers painted with a fallback font
+const labelFontReady = () => !document.fonts || document.fonts.check(LABEL_FONT_CHECK);
+
+function repaintWaitingLabels() {
+  if (!labelFontReady()) return;
+  if (!LABEL_WAIT.size && !ROOM_WAIT) return;
+  LABEL_EPOCH++;
+  const list = [...LABEL_WAIT];
+  LABEL_WAIT.clear();
+  for (const spr of list) spr.userData.setText(spr.userData.text);
+  if (ROOM_WAIT && roomGroup) { ROOM_WAIT = false; buildRoom(); }
+}
+if (document.fonts) {
+  document.fonts.addEventListener('loadingdone', repaintWaitingLabels);
+  document.fonts.load(LABEL_FONT_CHECK).then(repaintWaitingLabels).catch(() => {});
+}
+
+// Blend two 0xRRGGBB colours: t = 0 gives a, 1 gives b.
+function mixHex(a, b, t) {
+  const ch = (v, sh) => (v >> sh) & 255;
+  const m = (sh) => Math.round(ch(a, sh) * (1 - t) + ch(b, sh) * t) << sh;
+  return m(16) | m(8) | m(0);
 }
 
 function label(text, pos, color = 0xffffff, size = 0.16, plate = false) {
@@ -514,24 +609,42 @@ function label(text, pos, color = 0xffffff, size = 0.16, plate = false) {
     transparent: true, depthTest: false }));
   spr.position.copy(pos);
   spr.userData.labelSize = size;
+  spr.userData.unitPx = plate ? 62 : 48;   // canvas height of a one-line label
   spr.userData.labelColor = color;
   spr.userData.pick = 'label';
   // Reuse the same canvas + texture when the text changes (the anchor labels
   // update every poll, so allocating a texture each time leaked GPU memory).
-  spr.userData.setText = (t, col) => {
+  // tint: plate colour (e.g. an anchor's condition); null = the neutral plate
+  spr.userData.setText = (t, col, tint) => {
     if (col !== undefined) spr.userData.labelColor = col;
-    if (spr.userData.text === t && spr.userData.col === spr.userData.labelColor) return;
+    if (tint !== undefined) spr.userData.tint = tint;
+    if (spr.userData.text === t && spr.userData.col === spr.userData.labelColor
+        && spr.userData.tintDrawn === spr.userData.tint && spr.userData.epoch === LABEL_EPOCH) return;
+    if (spr.userData.epoch !== LABEL_EPOCH) {
+      spr.userData.minW = 0;                 // sizes measured with another font
+      spr.userData.minH = 0;
+      spr.userData.epoch = LABEL_EPOCH;
+    }
     spr.userData.text = t;
     spr.userData.col = spr.userData.labelColor;
+    spr.userData.tintDrawn = spr.userData.tint;
 
     const g = canvas.getContext('2d');
     const font = 'bold 40px "JetBrains Mono", ui-monospace, monospace';
     g.font = font;
     const lines = String(t).split('\n');
     const pad = plate ? 20 : 12;
-    const w = Math.ceil(Math.max(...lines.map((l) => g.measureText(l).width))) + pad * 2;
+    // A plate never shrinks: it keeps the widest / tallest size it has had,
+    // so a value that changes length every poll does not make it jump.
+    let w = Math.ceil(Math.max(...lines.map((l) => g.measureText(l).width))) + pad * 2;
     const lh = 48;
-    const h = lh * lines.length + (plate ? 14 : 0);
+    let h = lh * lines.length + (plate ? 14 : 0);
+    if (plate) {
+      w = Math.max(w, spr.userData.minW || 0);
+      h = Math.max(h, spr.userData.minH || 0);
+      spr.userData.minW = w;
+      spr.userData.minH = h;
+    }
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
     g.clearRect(0, 0, w, h);
@@ -541,15 +654,21 @@ function label(text, pos, color = 0xffffff, size = 0.16, plate = false) {
     // and an outlined hairline was still hard to read at sprite scale. A solid
     // chip is also what the rest of this interface uses for a label.
     if (plate) {
-      const bg = `#${(COL.plateBg ?? 0x111114).toString(16).padStart(6, '0')}`;
-      const br = `#${(COL.plateLine ?? 0x2a2a30).toString(16).padStart(6, '0')}`;
+      const tint = spr.userData.tint;
+      const base = COL.plateBg ?? 0x111114;
+      // a tinted plate: 32 % of the condition colour over the plate colour,
+      // dark enough (dark theme) / light enough (light theme) for the text
+      const bgHex = (tint === undefined || tint === null) ? base : mixHex(base, tint, 0.32);
+      const brHex = (tint === undefined || tint === null) ? (COL.plateLine ?? 0x2a2a30) : tint;
+      const bg = `#${bgHex.toString(16).padStart(6, '0')}`;
+      const br = `#${brHex.toString(16).padStart(6, '0')}`;
       g.fillStyle = bg;
       g.fillRect(0, 0, w, h);
       g.strokeStyle = br;
       g.lineWidth = 3;
       g.strokeRect(1.5, 1.5, w - 3, h - 3);
       g.fillStyle = br;
-      g.fillRect(0, 0, 5, h);                 // accent edge, like the panel rows
+      g.fillRect(0, 0, tint === undefined || tint === null ? 5 : 9, h);   // accent edge
       g.fillStyle = bg;
     }
     // Outline in the background colour first: the labels sit over a grid, a
@@ -571,8 +690,10 @@ function label(text, pos, color = 0xffffff, size = 0.16, plate = false) {
     } else {
       spr.material.map.needsUpdate = true;
     }
+    if (!labelFontReady()) LABEL_WAIT.add(spr);           // repaint when the font is in
     const s = spr.userData.labelSize;
     spr.userData.aspect = (w / 64 * s) / (h / 64 * s);   // w/h, for uniform rescale
+    spr.userData.hPx = h;                                // line count, for the scale
     spr.scale.set(w / 64 * s, h / 64 * s, 1);
   };
   spr.userData.setText(text);
@@ -709,6 +830,7 @@ function animateSelRig() {
    the scene: it lies in the XZ plane, keeps a fixed world size, and therefore
    reads as part of the floor rather than as an overlay. */
 function floorLabel(text, pos, color, size = 0.17, rotY = 0) {
+  if (!labelFontReady()) ROOM_WAIT = true;   // rebuilt by repaintWaitingLabels()
   const canvas = document.createElement('canvas');
   const g = canvas.getContext('2d');
   const font = 'bold 40px "JetBrains Mono", ui-monospace, monospace';
@@ -759,7 +881,9 @@ function makeRuler(from, to, outward, rotY = 0) {
   const tickMat = new THREE.LineBasicMaterial({ color: COL.ruler, transparent: true, opacity: 0.75 });
   const majorMat = new THREE.LineBasicMaterial({ color: COL.rulerMajor });
 
-  const ticks = Math.round(len * 2);                      // every 0.5 m
+  // every 0.5 m, never past the end of the edge (round() drew a 10 m tick
+  // on a 9.8 m wall)
+  const ticks = Math.floor(len * 2 + 1e-6);
   for (let i = 0; i <= ticks; i++) {
     const t = i / 2;                                      // metres
     const p = from.clone().addScaledVector(dir, t);
@@ -775,6 +899,15 @@ function makeRuler(from, to, outward, rotY = 0) {
       lp.y = 0.012;                      // just above the floor, no z-fighting
       g.add(floorLabel(`${t} m`, lp, COL.rulerText, 0.19, rotY));
     }
+  }
+  if (len - ticks / 2 > 0.01) {
+    // the exact length at the end of an edge that is not a multiple of 0.5 m
+    const p = to.clone();
+    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+      [p.clone().addScaledVector(side, 0.02), p.clone().addScaledVector(side, 0.22)]), majorMat));
+    const lp = p.clone().addScaledVector(side, 0.55);
+    lp.y = 0.012;
+    g.add(floorLabel(`${len.toFixed(2)} m`, lp, COL.rulerText, 0.17, rotY));
   }
   return g;
 }
@@ -809,21 +942,17 @@ function buildAnchors() {
     post.userData.pick = 'anchor';
     post.userData.id = a.id;
     g.add(post);
+    g.userData.mat = bodyMat;           // recoloured by anchorStatus() every poll
 
-    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.06, 0.34), bodyMat);
+    // The post runs from the floor to the anchor's real height; the plate is
+    // a marker (about the size of the anchor box), not a measured shape.
+    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.04, 0.16), bodyMat);
     plate.position.y = 0;                    // at the anchor's own height
     plate.rotation.y = Math.PI / 4;
     plate.castShadow = true;
     plate.userData.pick = 'anchor';
     plate.userData.id = a.id;
     g.add(plate);
-
-    // A short fin on top so the plate reads as a direction, not a floating tile.
-    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.22, 0.05), bodyMat);
-    fin.position.y = 0.14;
-    fin.userData.pick = 'anchor';
-    fin.userData.id = a.id;
-    g.add(fin);
 
     g.add(anchorLabel(a, live));
     anchorObjs[a.id] = g;
@@ -832,12 +961,59 @@ function buildAnchors() {
   updateSelRig();          // the groups were rebuilt; re-attach the marker
 }
 
+// Condition of one anchor, from its own WiFi reports and from the tag's
+// measurements to it. level: ok (green) | warn (amber) | bad (red) | off (grey)
+const ANCHOR_MEM = {};   // anchor id -> smoothed residual + warning states
+function anchorStatus(a) {
+  const live = S.state.anchors?.find((x) => x.id === a.id);
+  const wifi = !!(live && live.online);
+  const t = (S.state.tags || []).find((x) => x.online) || null;
+  const info = t && t.links ? t.links[a.id] : null;
+  const age = info && typeof info.t === 'number' && t.last_seen ? (t.last_seen - info.t) / 1000 : null;
+  const fresh = age !== null && age <= 3;
+  const off = t && t.anchor_offsets ? t.anchor_offsets[a.id] : undefined;
+  const st = { live, wifi, t, info, age, fresh, off, level: 'ok', notes: [] };
+  const worse = (lvl) => { if (lvl === 'bad' || st.level === 'ok') st.level = lvl; };
+  if (!fresh) {
+    st.level = wifi ? 'warn' : 'off';
+    st.notes.push(wifi ? (t ? 'no range to the tag' : 'online, no tag yet') : 'offline');
+    return st;
+  }
+  // One residual is noisy and sat around the 30 cm line, so the label flipped
+  // every poll. Smooth it per anchor (new samples only) and use separate on /
+  // off thresholds.
+  const m = ANCHOR_MEM[a.id] || (ANCHOR_MEM[a.id] = { res: 0, lastT: null, resWarn: false, offWarn: false });
+  if (typeof info.residual === 'number' && info.t !== m.lastT) {
+    m.res = m.lastT === null ? info.residual : 0.7 * m.res + 0.3 * info.residual;
+    m.lastT = info.t;
+  }
+  m.resWarn = Math.abs(m.res) > (m.resWarn ? 0.20 : 0.30);
+  m.offWarn = off !== undefined && Math.abs(off) > (m.offWarn ? 0.15 : 0.20);
+  st.notes.push(`${info.range.toFixed(2)} m`);
+  if (info.blocked) { worse('bad'); st.notes.push('NLOS (obstacle)'); }
+  if (info.accepted === false) { worse('bad'); st.notes.push('range rejected'); }
+  else if (m.resWarn) {
+    worse('warn');
+    st.notes.push(`residual ${m.res > 0 ? '+' : ''}${(m.res * 100).toFixed(0)} cm`);
+  }
+  if (m.offWarn) {
+    worse('warn');
+    st.notes.push(`check position (d ${off > 0 ? '+' : ''}${(off * 100).toFixed(0)} cm)`);
+  }
+  if (!wifi) { worse('warn'); st.notes.push('WiFi off, radio OK'); }
+  if (st.level === 'ok') st.notes.push(info.blocked ? '' : 'LOS, OK');
+  return st;
+}
+const STATUS_COL = { ok: () => COL.anchor, warn: () => COL.anchorWarn, bad: () => COL.nlos,
+                     off: () => COL.anchorOff };
+
 // Anchor label: name on the first line, live values underneath
 // (position always, plus the current range/RSSI when the device reports them).
 function anchorLabel(a, live) {
-  const online = live ? live.online : false;
-  const spr = label(anchorLabelText(a, live), new THREE.Vector3(0, 0.55, 0),
-                    online ? COL.labelOn : COL.labelOff, 0.20, true);
+  const st = anchorStatus(a);
+  const spr = label(anchorLabelText(a, live), new THREE.Vector3(0, 0.45, 0),
+                    COL.labelText, 0.12, true);
+  spr.userData.setText(anchorLabelText(a, live), COL.labelText, STATUS_COL[st.level]());
   spr.userData.anchorId = a.id;
   return spr;
 }
@@ -847,40 +1023,50 @@ function anchorLabel(a, live) {
 // Previously the sprite was created with the short name only and the live text
 // arrived 500 ms later on the next poll, so the label visibly shrank ("kempes")
 // for a moment every time an object was selected.
-function anchorLabelText(a, live) {
-  const online = live ? live.online : false;
-  let rng = null;
-  for (const t of S.state.tags || []) {
-    const l = (t.links || {})[a.id];
-    if (l && t.ranges && t.ranges[a.id] !== undefined) { rng = t.ranges[a.id]; break; }
-  }
-  const lines = [`${a.label || a.id}  (${a.x.toFixed(2)}, ${a.y.toFixed(2)})`];
-  if (!online) lines.push('offline');
-  else if (rng !== null) lines.push(`${rng.toFixed(2)} m`);
-  else lines.push('online');
-  return lines.join('\n');
+function anchorLabelText(a, _live) {
+  const st = anchorStatus(a);
+  return `${a.label || a.id}  (${a.x.toFixed(2)}, ${a.y.toFixed(2)}, z ${a.z.toFixed(2)})\n`
+       + st.notes.filter(Boolean).join(' · ');
 }
 
-// Live text for every anchor label, refreshed from /api/v1/state.
+// Live text and condition colour of every anchor, refreshed from
+// /api/v1/state on each poll.
 function updateAnchorLabels() {
   for (const a of S.scene.anchors) {
     const g = anchorObjs[a.id];
     if (!g) continue;
+    const st = anchorStatus(a);
+    if (g.userData.mat) g.userData.mat.color.setHex(STATUS_COL[st.level]());
     const spr = g.children.find((c) => c.userData && c.userData.setText && c.userData.anchorId);
-    if (!spr) continue;
-
-    const live = S.state.anchors.find((x) => x.id === a.id);
-    const online = live ? live.online : false;
-
-    // live range to the tag, if any link exists
-    let rng = null;
-    for (const t of S.state.tags || []) {
-      const l = (t.links || {})[a.id];
-      if (l && t.ranges && t.ranges[a.id] !== undefined) { rng = t.ranges[a.id]; break; }
+    if (spr) {
+      spr.userData.setText(anchorLabelText(a), COL.labelText, STATUS_COL[st.level]());
     }
-
-    spr.userData.setText(anchorLabelText(a, live), online ? COL.labelOn : COL.labelOff);
   }
+  if (S.selected?.type === 'anchor') renderAnchorStatus(S.selected.id);
+}
+
+// The condition table in the inspector for a selected anchor.
+function renderAnchorStatus(id) {
+  const host = $('i-status');
+  const a = S.scene.anchors.find((x) => x.id === id);
+  if (!host || !a) return;
+  const st = anchorStatus(a);
+  const lv = { ok: 'OK', warn: 'Check', bad: 'Problem', off: 'Offline' }[st.level];
+  const col = '#' + STATUS_COL[st.level]().toString(16).padStart(6, '0');
+  const l = st.live || {};
+  const i = st.info || {};
+  const row = (k, v, tip = '') => `<tr><td${tip ? ` class="tip" title="${esc(tip)}"` : ''}>${k}</td><td>${v}</td></tr>`;
+  host.innerHTML = `<table class="kv">
+    ${row('Condition', `<span class="lamp" style="background:${col}"></span>${lv} — ${esc(st.notes.filter(Boolean).join(' · '))}`,
+          'Green: measuring the tag and agreeing with the other anchors. Amber: no range, a large residual, WiFi off, or an offset above 20 cm. Red: blocked by an obstacle or range rejected. Grey: offline.')}
+    ${row('WiFi', st.wifi ? `online${l.rssi !== undefined ? ` · ${l.rssi} dBm` : ''}${l.ip ? ` · ${esc(l.ip)}` : ''}`
+                             : 'no report for 5 s', 'Status reports the anchor sends over WiFi (independent of the UWB radio).')}
+    ${row('Firmware', esc(l.fw || '—'))}
+    ${row('Range to tag', st.fresh ? `${(i.range ?? 0).toFixed(2)} m (${st.age.toFixed(1)} s ago)` : (st.age !== null ? `none for ${st.age.toFixed(0)} s` : 'none'), TIP.range)}
+    ${row('Path', st.fresh ? (i.blocked ? 'NLOS (obstacle)' : 'LOS') : '—', TIP.path)}
+    ${row('Residual', st.fresh && typeof i.residual === 'number' ? `${i.residual > 0 ? '+' : ''}${(i.residual * 100).toFixed(0)} cm${i.accepted === false ? ' (rejected)' : ''}` : '—', TIP.residual)}
+    ${row('Anchor offset d', st.off !== undefined ? `${st.off > 0 ? '+' : ''}${(st.off * 100).toFixed(1)} cm` : '—', TIP.d)}
+  </table>`;
 }
 
 /* ------------------------------------------------------------- obstacles */
@@ -991,59 +1177,8 @@ function buildObstacles() {
   }
   updateSelRig();          // groups rebuilt
 }
-/* ==========================================================================
-   Pulse rings: one thin ring per node that expands and fades, like a sonar
-   ping. Cheap by design — a handful of meshes share two geometries, nothing is
-   allocated per frame, and the whole effect is skipped when rendering is
-   paused.
-   ========================================================================== */
-const PULSE_MAX = 2.6;          // metres: how far the ring travels
-const PULSE_PERIOD = 2.4;       // seconds per ping
-const PULSE_THICK = 0.012;      // ring thickness in metres (thin!)
-
-const pulseGeo = new THREE.RingGeometry(1.0, 1.0 + PULSE_THICK, 72);
-const pulses = [];              // { mesh, group, phase }
-
-function makePulse(color) {
-  const mat = new THREE.MeshBasicMaterial({
-    color, transparent: true, opacity: 0.5,
-    side: THREE.DoubleSide, depthWrite: false });
-  const m = new THREE.Mesh(pulseGeo, mat);
-  m.rotation.x = -Math.PI / 2;   // lie flat on the floor
-  m.renderOrder = 5;
-  return m;
-}
-
-// Ensure each anchor and tag has a small pool of pulse rings.
-function ensurePulses() {
-  const want = [];
-  for (const a of S.scene.anchors) want.push(['anchor', a.id, a.x, a.y, a.z, 0x6ee7b7]);
-  for (const t of S.state.tags || []) want.push(['tag', t.id, t.x, t.y, tagZ(t), 0xffd166]);
-
-  // drop pulses for things that vanished
-  const keys = new Set(want.map((w) => w[0] + ':' + w[1]));
-  for (let i = pulses.length - 1; i >= 0; i--) {
-    if (!keys.has(pulses[i].key)) {
-      pulses[i].group.remove(pulses[i].mesh);
-      pulses[i].mesh.material.dispose();
-      pulses.splice(i, 1);
-    }
-  }
-  // add missing ones
-  for (const [kind, id, x, y, z, color] of want) {
-    const key = kind + ':' + id;
-    if (pulses.some((p) => p.key === key)) continue;
-    const group = kind === 'anchor' ? anchorGroup : tagGroup;
-    const mesh = makePulse(color);
-    mesh.position.set(x, 0.03, y);
-    group.add(mesh);
-    pulses.push({ key, mesh, group, phase: Math.random() * PULSE_PERIOD });
-  }
-}
-
-// Animate: expand + fade, looping. Runs every frame but touches only a few
-// floats per ring.
-let pulseT = 0;
+// (The decorative "sonar" pulse rings were removed: they did not show any
+//  measured value. The measured range circles in buildLinks() replaced them.)
 const tagFlashers = {};   // tag id -> value flasher for the coordinate readout
 
 // Height of the tag above the floor, as set in Setup. The server reports the
@@ -1052,31 +1187,6 @@ function tagZ(t) {
   return (t && typeof t.z === 'number') ? t.z
        : (S.scene && typeof S.scene.tag_z === 'number') ? S.scene.tag_z : 1.3;
 }
-function animatePulses() {
-  if (!pulses.length) return;
-  pulseT += frameDt;
-  for (const p of pulses) {
-    const t = ((pulseT + p.phase) % PULSE_PERIOD) / PULSE_PERIOD;   // 0..1
-    const r = 0.12 + t * PULSE_MAX;
-    p.mesh.scale.set(r, r, r);
-    p.mesh.material.opacity = 0.45 * (1 - t) * (1 - t);
-  }
-  // keep them under the node even while it moves
-  for (const p of pulses) {
-    if (p.key.startsWith('tag:')) {
-      const id = p.key.slice(4);
-      const t = (S.state.tags || []).find((x) => x.id === id);
-      if (t) p.mesh.position.set(t.x, 0.03, t.y);
-    } else {
-      const id = p.key.slice(7);
-      const a = S.scene.anchors.find((x) => x.id === id);
-      if (a) p.mesh.position.set(a.x, 0.03, a.y);
-    }
-  }
-}
-
-/* ------------------------------------------------------------ tags/links */
-
 /* ------------------------------------------------------------ tags/links */
 function buildTags() {
   const seen = new Set();
@@ -1087,8 +1197,10 @@ function buildTags() {
       mesh = new THREE.Group();
       // An octagonal puck rather than a sphere: same flat language as the
       // anchor plate, and it still reads as a distinct shape from the anchors.
+      // The puck is a marker (12 cm, about the tag box), centred on the
+      // estimated position. The circle around it is to scale: see below.
       const body = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.135, 0.135, 0.07, 8),
+        new THREE.CylinderGeometry(0.06, 0.06, 0.04, 16),
         new THREE.MeshStandardMaterial({ color: COL.tag, emissive: COL.tagBody,
                                          emissiveIntensity: 0.9, roughness: 0.35 }));
       body.castShadow = true;
@@ -1099,22 +1211,28 @@ function buildTags() {
       // crosshair bars on top, so the tag is identifiable from above
       const barMat = new THREE.MeshBasicMaterial({ color: COL.tag });
       for (const rot of [0, Math.PI / 2]) {
-        const bar = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.012, 0.022), barMat);
-        bar.position.y = 0.035;
+        const bar = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.01, 0.014), barMat);
+        bar.position.y = 0.022;
         bar.rotation.y = rot;
         bar.userData.pick = 'tag';
         bar.userData.id = t.id;
         mesh.add(bar);
       }
-      // uncertainty ring, scaled from the EKF sigma
-      const ring = new THREE.Mesh(
-        new THREE.RingGeometry(0.9, 0.93, 64),
-        new THREE.MeshBasicMaterial({ color: COL.tag, transparent: true, opacity: 0.35,
-                                      side: THREE.DoubleSide }));
-      ring.rotation.x = -Math.PI / 2;
+      // Margin of error, to scale: a unit circle scaled to the EKF sigma, so
+      // its radius in metres IS the margin of error (about 2 in 3 positions
+      // fall inside it). Drawn as a 1-pixel line plus a faint disc.
+      const ring = new THREE.Group();
+      ring.add(circleLine(0, 0, 0, 1, COL.tag, 0.9));
+      const disc = new THREE.Mesh(new THREE.CircleGeometry(1, 64),
+        new THREE.MeshBasicMaterial({ color: COL.tag, transparent: true, opacity: 0.10,
+                                      side: THREE.DoubleSide, depthWrite: false }));
+      disc.rotation.x = -Math.PI / 2;
+      ring.add(disc);
       ring.name = 'sigma';
       mesh.add(ring);
-      mesh.add(label(t.id, new THREE.Vector3(0, 0.46, 0), COL.labelTag, 0.19, true));
+      const tl = label(t.id, new THREE.Vector3(0, 0.40, 0), COL.labelTag, 0.12, true);
+      tl.name = 'tlabel';
+      mesh.add(tl);
       tagGroup.add(mesh);
       tagMeshes[t.id] = mesh;
     }
@@ -1122,14 +1240,22 @@ function buildTags() {
 
     const ring = mesh.getObjectByName('sigma');
     if (ring) {
-      const r = Math.max(0.25, Math.min(t.sigma || 0.3, 3) * 1.6);
-      ring.scale.set(r, r, r);
-      ring.material.opacity = t.online ? 0.30 : 0.12;
+      const r = Math.min(Math.max(t.sigma || 0, 0.005), 5);   // metres, to scale
+      ring.scale.set(r, 1, r);
+      const live = t.online && t.valid !== false;
+      ring.children[0].material.opacity = live ? 0.9 : 0.35;
+      ring.children[1].material.opacity = live ? 0.10 : 0.04;
+    }
+    const tl = mesh.getObjectByName('tlabel');
+    if (tl) {
+      tl.userData.setText(`${t.id}\n${t.held ? 'HOLD (not valid)'
+        : '±' + ((t.sigma || 0) * 100).toFixed(0) + ' cm'}`, undefined,
+        t.held ? COL.anchorWarn : null);
     }
     mesh.visible = true;
 
-    // trail
-    if (S.showTrail) {
+    // trail (a held position is not a new point)
+    if (S.showTrail && !t.held) {
       const tr = S.trail[t.id] || (S.trail[t.id] = []);
       const last = tr[tr.length - 1];
       if (!last || Math.hypot(last[0] - t.x, last[1] - t.y) > 0.04) {
@@ -1147,6 +1273,7 @@ function buildTags() {
 // The trail is updated IN PLACE: rebuilding the Line objects every poll
 // (500 ms) allocated two geometries per second per tag for no reason.
 const trailLines = {};
+const TRAIL_SMOOTH = 3;          // points on each side in the drawn trail
 
 function buildTrail() {
   if (!S.showTrail) {
@@ -1173,11 +1300,19 @@ function buildTrail() {
       trailGroup.add(line);
     }
 
-    const pos = new Float32Array(pts.length * 3);
-    for (let i = 0; i < pts.length; i++) {
-      pos[i * 3] = pts[i][0];
+    // The drawn trail is history, so it can use the points before AND after
+    // each point: a centred moving average (half-width TRAIL_SMOOTH, shrinking
+    // to 0 at both ends so the line still ends at the live position). It
+    // straightens the drawn line without delaying the position itself.
+    const n = pts.length;
+    const pos = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const k = Math.min(TRAIL_SMOOTH, i, n - 1 - i);
+      let sx = 0, sy = 0;
+      for (let j = i - k; j <= i + k; j++) { sx += pts[j][0]; sy += pts[j][1]; }
+      pos[i * 3] = sx / (2 * k + 1);
       pos[i * 3 + 1] = tagZ(null);
-      pos[i * 3 + 2] = pts[i][1];
+      pos[i * 3 + 2] = sy / (2 * k + 1);
     }
     line.geometry.dispose();
     const g = new THREE.BufferGeometry();
@@ -1192,7 +1327,24 @@ function buildLinks() {
     for (const [aid, info] of Object.entries(t.links || {})) {
       const a = S.scene.anchors.find((x) => x.id === aid);
       if (!a) continue;
+      // a link not measured for 3 s is history, not a current measurement
+      if (typeof info.t === 'number' && t.last_seen && t.last_seen - info.t > 3000) continue;
       const blocked = !!info.blocked;
+      if (S.showRings) {
+        // Measured range circle, to scale: the slant range minus the offsets
+        // the tracker estimated (common b + this anchor's d), projected onto
+        // the tag's height. All circles meet at the tag when the ranges agree.
+        const r = typeof info.corrected === 'number' ? info.corrected : info.range;
+        if (typeof r === 'number') {
+          const rs = r - (t.range_bias || 0) - ((t.anchor_offsets || {})[aid] || 0);
+          const dz = a.z - tagZ(t);
+          const rh = Math.sqrt(Math.max(rs * rs - dz * dz, 0));
+          if (rh > 0.02) {
+            linkGroup.add(circleLine(a.x, a.y, tagZ(t), rh,
+                                     blocked ? COL.nlos : COL.los, 0.45, true));
+          }
+        }
+      }
       const pts = [new THREE.Vector3(a.x, a.z, a.y),
                    new THREE.Vector3(t.x, tagZ(t), t.y)];
       const line = new THREE.Line(
@@ -1291,12 +1443,12 @@ function clearGroup(g) {
 }
 
 function rebuildAll() {
+  buildLegend();
   buildRoom();
   buildAnchors();
   buildObstacles();
   buildTags();
   buildLinks();
-  ensurePulses();
   buildPalette();
 }
 
@@ -1603,6 +1755,7 @@ function showSelection() {
     if (!a) { host.innerHTML = ''; return; }
     host.innerHTML = `
       <h3>Anchor <span class="pill">${a.id}</span></h3>
+      <div id="i-status"></div>
       <label>Label<input id="i-label" value="${esc(a.label || a.id)}"></label>
       <div class="row">
         <label>X (m)<input id="i-x" type="number" step="0.05" value="${a.x.toFixed(2)}"></label>
@@ -1615,6 +1768,7 @@ function showSelection() {
     $('i-y').oninput = (e) => { a.y = +e.target.value; S.dirty = true; rebuildAll(); };
     $('i-z').oninput = (e) => { a.z = +e.target.value; S.dirty = true; rebuildAll(); };
     $('i-del').onclick = removeSelected;
+    renderAnchorStatus(a.id);
   } else if (type === 'obstacle') {
     const o = S.scene.obstacles.find((x) => x.id === id);
     if (!o) { host.innerHTML = ''; return; }
@@ -1659,31 +1813,64 @@ function showSelection() {
     host.innerHTML = `
       <h3>Tag <span class="pill">${t.id}</span></h3>
       <table class="kv">
-        <tr><td>Position</td><td>${fmt(t.x)}, ${fmt(t.y)} m</td></tr>
-        <tr><td>Height</td><td>${fmt(tagZ(t))} m</td></tr>
-        <tr><td>Speed</td><td>${Math.hypot(t.vx || 0, t.vy || 0).toFixed(2)} m/s</td></tr>
-        <tr><td>1σ</td><td>${fmt(t.sigma)} m</td></tr>
-        <tr><td>Confidence</td><td>${((t.confidence ?? 0) * 100).toFixed(0)}%</td></tr>
-        <tr><td>Range offset</td><td>${t.range_bias === undefined ? '—' : (t.range_bias * 100).toFixed(1) + ' cm'}</td></tr>
-        <tr><td>Samples</td><td>${t.rate_hz ?? '—'}/s (${t.used ?? '—'} used)</td></tr>
-        <tr><td>Status</td><td>${t.online ? 'live' : 'offline'}</td></tr>
+        <tr><td class="tip" title="${esc(TIP.pos)}">Position (x, y)</td><td>${fmt(t.x)}, ${fmt(t.y)} m</td></tr>
+        <tr><td class="tip" title="${esc(TIP.height)}">Height</td><td>${fmt(tagZ(t))} m</td></tr>
+        <tr><td class="tip" title="${esc(TIP.speed)}">Speed</td><td>${Math.hypot(t.vx || 0, t.vy || 0).toFixed(2)} m/s</td></tr>
+        <tr><td class="tip" title="${esc(TIP.sigma)}">Margin of error</td><td>±${((t.sigma || 0) * 100).toFixed(1)} cm</td></tr>
+        <tr><td class="tip" title="${esc(TIP.conf)}">Confidence</td><td>${((t.confidence ?? 0) * 100).toFixed(0)}%</td></tr>
+        <tr><td class="tip" title="${esc(TIP.b)}">Range offset (b)</td><td>${t.range_bias === undefined ? '—' : (t.range_bias * 100).toFixed(1) + ' cm'}</td></tr>
+        <tr><td class="tip" title="${esc(TIP.samples)}">Samples</td><td>${t.rate_hz ?? '—'}/s (${t.used ?? '—'} used)</td></tr>
+        <tr><td class="tip" title="${esc(TIP.status)}">Status</td><td>${tagStatus(t)}</td></tr>
       </table>
       <h4>Links</h4>${linksTable(t)}
+      ${(t.offset_warning || []).length ? `<p class="bad" style="font-size:12px">⚠ ${esc(t.offset_warning.join(', '))}: offset above 20 cm. DW1000 modules differ by a few cm, so check that anchor's X / Y / Z in the scene (and the tag height).</p>` : ''}
       ${t.geometry_ok === false ? `<p class="bad" style="font-size:12px">⚠ Range measurements are geometrically inconsistent by ${(t.geometry_slack || 0).toFixed(2)} m — one or more anchors are likely measuring a reflection (NLOS), not the direct path.</p>` : ''}`;
   }
+}
+
+function tagStatus(t) {
+  if (!t.online) return 'offline';
+  if (t.held) return `HOLD — not valid (${t.anchors_fresh ?? 0} anchors)`;
+  return t.still ? 'live · standing' : 'live · moving';
 }
 
 function linksTable(t) {
   // Residual = measured minus predicted range at the last update; a link that
   // is consistently far off (or rejected) points at NLOS or a wrong anchor
   // position in the scene.
+  const off = t.anchor_offsets || {};
   const rows = Object.entries(t.links || {}).map(([aid, i]) => `
     <tr><td>${aid}</td><td>${fmt(i.range ?? t.ranges?.[aid])} m</td>
+        <td>${off[aid] === undefined ? '—' : (off[aid] >= 0 ? '+' : '') + (off[aid] * 100).toFixed(1) + ' cm'}</td>
         <td>${i.blocked ? '<span class="bad">NLOS</span>' : '<span class="good">LOS</span>'}</td>
         <td>${i.residual === undefined ? '—' : (i.residual * 100).toFixed(0) + ' cm'}${i.accepted === false ? ' <span class="bad">✕</span>' : ''}</td></tr>`).join('');
-  return rows ? `<table class="kv"><tr><th>Anchor</th><th>Range</th><th>Path</th><th>Residual</th></tr>${rows}</table>`
+  return rows ? `<table class="kv"><tr><th>Anchor</th><th class="tip" title="${esc(TIP.range)}">Range</th>`
+              + `<th class="tip" title="${esc(TIP.d)}">Offset d</th><th class="tip" title="${esc(TIP.path)}">Path</th>`
+              + `<th class="tip" title="${esc(TIP.residual)}">Residual</th></tr>${rows}</table>`
               : '<p class="muted">No links yet.</p>';
 }
+
+// Plain-language explanation of every number the interface shows. Used as
+// hover text (title) and in the glossary on the Live tab.
+const TIP = {
+  pos: 'Metres from the 0,0 corner (anchor A2): X along the width, Y along the depth — the same as the floor grid and rulers.',
+  height: 'Tag height above the floor, as entered in Setup → Room. A wrong height shifts every position.',
+  speed: 'Speed estimated by the tracker from the last few seconds.',
+  sigma: 'Margin of error: the tracker\'s own uncertainty. About 2 out of 3 positions fall within this radius. It is the circle drawn around the tag, to scale. It cannot include a wrongly entered anchor position.',
+  conf: '1 / (1 + margin of error in metres). 100 % = no uncertainty. Navigation receives this as "quality".',
+  b: 'Range offset (b): extra distance every range carries because of the DW1000 antenna delay (about 75–100 cm here). Estimated automatically and subtracted. A sudden change usually means an anchor position or the tag height was entered wrong.',
+  d: 'Anchor offset (d): how much this anchor reads more (+) or less (−) than the others, on top of b. Learned while the trolley moves. More than 20 cm means this anchor\'s position in the scene is probably wrong.',
+  samples: 'Ranges received per second, and how many of them the tracker accepted in the last second.',
+  status: 'moving / still (below 0.15 m/s: the shown position is the average since the trolley stopped, up to 20 outputs) / HOLD (fewer than 3 anchors heard in 1.5 s: the last good position is kept and marked not valid).',
+  range: 'Distance measured by UWB between the tag and this anchor: a straight line in 3D, including the height difference and the offsets.',
+  path: 'LOS = clear line of sight. NLOS = the line crosses an obstacle drawn in the scene (only drawn obstacles are known).',
+  residual: 'Measured range minus the range expected from the current position and offsets. Near 0 = this anchor agrees with the others. Large, or ✕ (rejected) = blocked or reflected signal, or a wrong anchor position.',
+  calOffset: 'Calibration offset of this anchor: measured range − true range, fitted over the stored points. Subtracted from every range of this anchor.',
+  calScale: 'Calibration scale: measured = scale × true + offset. 1.0000 = no scale error.',
+  meanErr: 'Accuracy: average distance between the shown positions and the X/Y you entered.',
+  spread: 'Precision: how tightly the positions cluster (1σ), regardless of the true point.',
+  rmse: 'RMSE: like the mean error, but large errors count more. CEP50 / CEP95: radius around the true point that holds 50 % / 95 % of the positions.',
+};
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = (v) => (v === undefined || v === null) ? '—' : Number(v).toFixed(2);
@@ -1708,6 +1895,27 @@ function buildPalette() {
   });
 }
 
+/* ----------------------------------------------------------------- legend
+   What every element in the 3D view stands for, and which ones are to scale. */
+function buildLegend() {
+  const hex = (c) => '#' + c.toString(16).padStart(6, '0');
+  let open = false;                       // collapsed by default; remembered
+  try { open = localStorage.getItem('uwb-legend-open') === '1'; } catch (e) { /* no storage */ }
+  $('legend').innerHTML = `<details ${open ? 'open' : ''}>
+    <summary>Legend — what the 3D view shows</summary>
+    <div><span class="lg-line" style="border-color:${hex(COL.ruler)}"></span>grid: 1 m (thin: 0.5 m)</div>
+    <div><span class="lg-ring" style="border-color:${hex(COL.tag)}"></span>around the tag: margin of error ±1σ <b>to scale</b></div>
+    <div><span class="lg-dash" style="border-color:${hex(COL.los)}"></span>dashed circle: range measured by one anchor <b>to scale</b></div>
+    <div><span class="lg-line" style="border-color:${hex(COL.los)}"></span><span class="lg-line" style="border-color:${hex(COL.nlos)}"></span>tag–anchor line: clear (LOS) / blocked (NLOS)</div>
+    <div><span class="lg-box" style="background:${hex(COL.anchor)}"></span>anchor post: floor to its real height; colour = condition</div>
+    <div class="lg-cond"><span style="background:${hex(COL.anchor)}"></span>OK <span style="background:${hex(COL.anchorWarn)}"></span>check <span style="background:${hex(COL.nlos)}"></span>problem <span style="background:${hex(COL.anchorOff)}"></span>offline</div>
+    <div class="muted">tag and anchor heads are markers, not their real size</div>
+  </details>`;
+  $('legend').querySelector('details').addEventListener('toggle', (e) => {
+    try { localStorage.setItem('uwb-legend-open', e.target.open ? '1' : '0'); } catch (err) { /* no storage */ }
+  });
+}
+
 /* -------------------------------------------------------------------- io */
 async function loadScene() {
   try {
@@ -1715,7 +1923,6 @@ async function loadScene() {
   const d = await r.json();
   S.scene = d.scene;
   S.nlos = d.nlos_enabled !== false;
-  $('nlos').checked = S.nlos;
   syncRoomInputs();
   rebuildAll();
   Audio2.success();
@@ -1737,7 +1944,7 @@ async function poll() {
   try {
     const r = await fetch('/api/v1/state');
     S.state = await r.json();
-    if (!S.drag) { buildTags(); buildLinks(); updateAnchorLabels(); ensurePulses(); }
+    if (!S.drag) { buildTags(); buildLinks(); updateAnchorLabels(); }
     updateHud();
     // Rebuilding the list on every poll (5 Hz) would restart its entry
     // animation constantly and thrash the DOM. Only the numbers are refreshed;
@@ -1764,10 +1971,15 @@ function updateHud() {
   const geoWarn = (tag && tag.online && tag.geometry_ok === false)
     ? `<span class="sep"></span><span class="warn" title="Range measurements are geometrically inconsistent — likely NLOS reflections. Slack: ${(tag.geometry_slack || 0).toFixed(2)} m">⚠ NLOS ${(tag.geometry_slack || 0).toFixed(2)} m</span>`
     : '';
+  const offWarn = (tag && tag.online && (tag.offset_warning || []).length)
+    ? `<span class="sep"></span><span class="warn" title="${esc(TIP.d)}">⚠ check ${esc(tag.offset_warning.join(', '))}</span>`
+    : '';
+  const holdTxt = (tag && tag.online && tag.held)
+    ? `<span class="sep"></span><span class="warn" title="${esc(TIP.status)}">HOLD</span>` : '';
   $('hud').innerHTML =
     `<span class="dot ${anc ? 'on' : 'off'}"></span>${anc} anchor${anc === 1 ? '' : 's'} online` +
     `<span class="sep"></span><span class="dot ${live ? 'on' : 'off'}"></span>` +
-    `${live} tag${live === 1 ? '' : 's'} live` + coord + geoWarn +
+    `${live} tag${live === 1 ? '' : 's'} live` + coord + holdTxt + offWarn + geoWarn +
     (S.state.nlos_enabled === false ? '<span class="sep"></span><span class="warn">NLOS off</span>' : '');
 
   // Mark the coordinate when it changes: the HUD is rebuilt every poll, so a
@@ -1803,11 +2015,22 @@ function stagger(host, sel = ':scope > *') {
 }
 
 // Refresh just the coordinate readouts of the existing rows.
+function tagShortStatus(t) {
+  return t.held ? `HOLD (${t.anchors_fresh ?? 0} anchors)` : t.still ? 'still' : 'moving';
+}
+
 function updateTagValues() {
-  for (const t of S.state.tags || []) {
+  const rows = $('taglist').querySelectorAll('.dev');
+  (S.state.tags || []).forEach((t, i) => {
     const f = tagFlashers[t.id];
     if (f) f(t);
-  }
+    const row = rows[i];
+    if (!row) return;
+    const sg = row.querySelector('[data-sigma]');
+    if (sg) sg.textContent = `±${((t.sigma || 0) * 100).toFixed(0)} cm`;
+    const stt = row.querySelector('[data-status]');
+    if (stt) stt.textContent = tagShortStatus(t);
+  });
 }
 
 // Flash a value that just changed. Returns a function to feed the next value.
@@ -1997,7 +2220,7 @@ function setTab(name) {
   });
   if (name === 'devices') renderDevices();
   if (name === 'api') renderApi();
-  if (name === 'setup') { loadOta(); loadCal(); loadRec(); loadTracking(); }
+  if (name === 'setup') { loadOta(); loadCal(); loadRec(); loadTracking(); loadScreenPolicy(); }
 }
 
 /* ==========================================================================
@@ -2053,46 +2276,36 @@ async function renderDevices() {
 }
 
 /* ==========================================================================
-   Tracker algorithm + tuning (GET/PUT /api/v1/tracking)
+   Tracker (GET/PUT /api/v1/tracking): one fixed algorithm; the only switch is
+   the smoothed path. The status says where the range offsets come from.
    ========================================================================== */
-const TRK_FIELDS = { 'trk-sa': 'sigma_a', 'trk-sr': 'sigma_r', 'trk-tau': 'vel_tau_s', 'trk-chi': 'nlos_chi2' };
-let trkDefaults = {};
-
 function showTracking(d) {
-  trkDefaults = d.defaults || trkDefaults;
-  $('trk-algo').value = d.params.algorithm;
-  for (const [id, key] of Object.entries(TRK_FIELDS)) $(id).value = d.params[key];
-  $('trk-chi').disabled = d.params.algorithm === 'ekf';
+  $('trk-smooth').checked = !!d.smooth;
+  $('trk-status').textContent = 'EKF + zero-velocity mode + long-range rejection (fixed). Range offsets: '
+    + (d.calibrated ? 'from the static calibration.'
+                    : 'learned while the trolley moves (no calibration applied yet).');
 }
 
 async function loadTracking() {
   try { showTracking(await (await fetch('/api/v1/tracking')).json()); } catch (e) { /* offline */ }
 }
 
-async function putTracking(body) {
-  const r = await fetch('/api/v1/tracking', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  });
-  const d = await r.json();
-  if (!d.ok) { $('trk-result').textContent = d.error || 'failed'; Audio2.error(); return; }
-  showTracking(d);
-  $('trk-result').textContent = `Active: ${d.params.algorithm} — the track restarts with the new setting.`;
-  Audio2.success();
-}
-
-function applyTracking() {
-  const body = { algorithm: $('trk-algo').value };
-  for (const [id, key] of Object.entries(TRK_FIELDS)) {
-    const v = parseFloat($(id).value);
-    if (Number.isFinite(v)) body[key] = v;
+async function setSmooth() {
+  try {
+    const r = await fetch('/api/v1/tracking', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ smooth: $('trk-smooth').checked }),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'failed');
+    showTracking(d);
+    toast(d.smooth ? 'Path smoothing on.' : 'Path smoothing off.');
+    Audio2.success();
+  } catch (e) {
+    toast(`Could not change the smoothing: ${e.message}`);
+    Audio2.error();
+    loadTracking();
   }
-  putTracking(body);
-}
-
-function resetTracking() {
-  const body = { algorithm: trkDefaults.algorithm || 'ekf' };
-  for (const key of Object.values(TRK_FIELDS)) if (key in trkDefaults) body[key] = trkDefaults[key];
-  putTracking(body);
 }
 
 /* ==========================================================================
@@ -2105,7 +2318,8 @@ function calTable(cal) {
   const rows = Object.entries(a).map(([id, c]) =>
     `<tr><td>${esc(id)}</td><td>${cm(c.bias)}</td><td>${(c.scale ?? 1).toFixed(4)}</td><td>${c.points ?? '—'}</td></tr>`).join('');
   const pts = (cal?.points || []).length;
-  return (rows ? `<table class="kv"><tr><th>Anchor</th><th>Bias</th><th>Scale</th><th>Pts</th></tr>${rows}</table>`
+  return (rows ? `<table class="kv"><tr><th>Anchor</th><th class="tip" title="${esc(TIP.calOffset)}">Offset</th>`
+                + `<th class="tip" title="${esc(TIP.calScale)}">Scale</th><th>Pts</th></tr>${rows}</table>`
                : '<p class="muted">No calibration applied.</p>') +
          `<p class="muted">${pts} stored point(s).</p>`;
 }
@@ -2135,13 +2349,17 @@ async function calMeasure() {
       `<tr><td>${esc(id)}</td><td>${a.n}</td><td>${a.true.toFixed(3)}</td><td>${a.median.toFixed(3)}</td><td>${cm(a.error)}</td><td>${cm(a.std)}</td></tr>`).join('');
     const p = d.position;
     $('cal-result').innerHTML =
-      `<table class="kv"><tr><th>Anchor</th><th>n</th><th>True</th><th>Measured</th><th>Error</th><th>σ</th></tr>${rows}</table>` +
+      `<table class="kv"><tr><th>Anchor</th><th>n</th><th title="Distance from the X/Y you entered to the anchor (3D)">True</th>`
+      + `<th title="Median measured range">Measured</th><th title="Measured − true">Error</th>`
+      + `<th title="Spread of the measured ranges (1σ)">Spread</th></tr>${rows}</table>` +
       (p ? `<table class="kv" style="margin-top:6px">
         <tr><td>Mean position</td><td>${p.mean_x.toFixed(3)}, ${p.mean_y.toFixed(3)} m</td></tr>
-        <tr><td>Accuracy (mean error)</td><td>${cm(p.mean_error)}</td></tr>
-        <tr><td>Precision (σ)</td><td>${cm(p.std)}</td></tr>
-        <tr><td>RMSE / CEP50 / CEP95</td><td>${cm(p.rmse)} / ${cm(p.cep50)} / ${cm(p.cep95)}</td></tr>
+        <tr><td class="tip" title="${esc(TIP.meanErr)}">Accuracy (mean error)</td><td>${cm(p.mean_error)}</td></tr>
+        <tr><td class="tip" title="${esc(TIP.spread)}">Precision (spread, 1σ)</td><td>${cm(p.std)}</td></tr>
+        <tr><td class="tip" title="${esc(TIP.rmse)}">RMSE / CEP50 / CEP95</td><td>${cm(p.rmse)} / ${cm(p.cep50)} / ${cm(p.cep95)}</td></tr>
       </table>` : '<p class="muted">No position estimates during the window.</p>') +
+      (p && p.mean_error > 1.0 ? `<p class="bad" style="font-size:12px">⚠ Error above 1 m. Check that X / Y is where the TAG
+        stands, measured from anchor A2 at (0, 0) — not an anchor's own position.</p>` : '') +
       `<p class="muted">${d.stored ? 'Stored as a calibration point — press Apply when done.' : 'Accuracy test only (not stored).'}</p>`;
     Audio2.success();
   } catch (e) {
@@ -2155,6 +2373,7 @@ async function calApply() {
   const d = await (await fetch('/api/v1/calibration/apply', { method: 'POST' })).json();
   toast(d.ok ? `Calibration applied to ${Object.keys(d.anchors).length} anchor(s).` : 'Apply failed.');
   loadCal();
+  loadTracking();
 }
 
 async function calClear() {
@@ -2162,6 +2381,7 @@ async function calClear() {
   await fetch('/api/v1/calibration/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   toast('Calibration cleared.');
   loadCal();
+  loadTracking();
 }
 
 /* ==========================================================================
@@ -2304,9 +2524,12 @@ async function cancelOta(deviceId) {
    Device screen (OLED) power policy — pushed to every device as a normal
    config update, so the node dims/blanks its panel while staying online.
    ========================================================================== */
+// One checkbox: screens always on (default) or off after 60 s idle.
+const SCREEN_IDLE_S = 60;
+
 async function applyScreenPolicy() {
-  const mode = $('scr-mode').value;
-  const timeout_s = Math.max(0, parseInt($('scr-timeout').value || '0', 10));
+  const mode = $('scr-on').checked ? 'always' : 'off';
+  const timeout_s = mode === 'always' ? 0 : SCREEN_IDLE_S;
   const ids = (S.state.devices || []).map((d) => d.id);
   if (!ids.length) { toast('No device known yet.'); return; }
 
@@ -2323,10 +2546,21 @@ async function applyScreenPolicy() {
       if (r.ok) ok++;
     } catch (e) { /* keep going */ }
   }
-  $('scr-result').textContent =
-    `Applied to ${ok}/${ids.length} device(s): screen ${mode}, timeout ${timeout_s}s.`;
-  toast(`Screen policy sent (${mode}, ${timeout_s}s)`);
+  const what = mode === 'always' ? 'screens always on' : `screens off after ${SCREEN_IDLE_S} s idle`;
+  $('scr-result').textContent = `Applied to ${ok}/${ids.length} device(s): ${what}.`;
+  toast(`Screen setting sent: ${what}`);
   Audio2.update();
+}
+
+// Show the setting the devices actually have (taken from the first one).
+async function loadScreenPolicy() {
+  const d = (S.state.devices || [])[0];
+  if (!d) return;
+  try {
+    const [role, num] = d.id.split('-');
+    const cfg = await (await fetch(`/api/v1/config/device?role=${role}&id=${parseInt(num, 10)}`)).json();
+    $('scr-on').checked = (cfg.display?.mode || 'always') === 'always';
+  } catch (e) { /* offline */ }
 }
 
 /* ==========================================================================
@@ -2399,8 +2633,8 @@ function applyTheme(theme) {
     if (tagGroup) buildTags();
     if (linkGroup) buildLinks();
     updateAnchorLabels();
-    ensurePulses();
     buildPalette();          // legend swatches follow the 3D palette
+    buildLegend();
   }
 }
 
@@ -2430,8 +2664,9 @@ function renderTagList() {
       <span class="dot ${t.online ? 'on' : 'off'}"></span>
       <div>
         <div class="name">${esc(t.id)}</div>
-        <div class="meta mono"><span data-coord>(${t.x.toFixed(2)}, ${t.y.toFixed(2)}) m</span> · σ ${(t.sigma || 0).toFixed(2)}</div>
-        <div class="meta">${esc(t.ip || 'no ip yet')} · conf ${((t.confidence || 0) * 100).toFixed(0)}%</div>
+        <div class="meta mono"><span data-coord>(${t.x.toFixed(2)}, ${t.y.toFixed(2)}) m</span> · <span class="tip" data-sigma title="${esc(TIP.sigma)}">±${((t.sigma || 0) * 100).toFixed(0)} cm</span></div>
+        <div class="meta">${esc(t.ip || 'no ip yet')} · conf ${((t.confidence || 0) * 100).toFixed(0)}%
+          · <span class="tip" data-status title="${esc(TIP.status)}">${tagShortStatus(t)}</span></div>
       </div>
     </div>`).join('');
   // Coordinates are the value that actually moves; flash them on change.
@@ -2530,8 +2765,8 @@ function initUi() {
   });
   $('save').onclick = async () => { busy($('save'), true); try { await saveScene(); } finally { busy($('save'), false); } };
   $('reload').onclick = async () => { busy($('reload'), true); try { await loadScene(); } finally { busy($('reload'), false); } };
-  $('nlos').onchange = (e) => { S.nlos = e.target.checked; setDirty(); };
   $('trail').onchange = (e) => { S.showTrail = e.target.checked; buildTrail(); };
+  $('rings').onchange = (e) => { S.showRings = e.target.checked; buildLinks(); };
   $('spin').onchange = (e) => { S.autoSpin = e.target.checked; };
   $('view-top').onclick = () => setView('top');
   $('view-iso').onclick = () => setView('iso');
@@ -2551,9 +2786,8 @@ function initUi() {
     applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
   };
   $('ota-push-all').onclick = () => pushOta('all');
-  $('scr-apply').onclick = applyScreenPolicy;
-  $('trk-apply').onclick = applyTracking;
-  $('trk-reset').onclick = resetTracking;
+  $('scr-on').onchange = applyScreenPolicy;
+  $('trk-smooth').onchange = setSmooth;
   $('cal-measure').onclick = calMeasure;
   $('cal-apply').onclick = calApply;
   $('cal-clear').onclick = calClear;
@@ -2647,6 +2881,7 @@ function zoomBy(notches) {
 initThree();
 initUi();
 loadScene().then(() => { setView('iso'); playIntro(); });
+repaintWaitingLabels();          // in case the font was already there
 applyTheme(localStorage.getItem('uwb-theme') || 'dark');
 setPalette(document.documentElement.dataset.theme);   // 3D colours before the first build
 poll();
@@ -2708,15 +2943,6 @@ window.__uwbLabels = () => {
   return out;
 };
 
-// Pulse ring state (test/debug helper).
-window.__uwbPulse = () => pulses.map((p) => ({
-  key: p.key,
-  scale: +p.mesh.scale.x.toFixed(3),
-  opacity: +p.mesh.material.opacity.toFixed(3),
-  pos: [+p.mesh.position.x.toFixed(2), +p.mesh.position.z.toFixed(2)],
-  visible: p.mesh.visible,
-}));
-
 window.__uwbProbe = () => ({
   dist: camera.position.distanceTo(controls.target),
   zoomAccum,
@@ -2731,5 +2957,16 @@ window.__uwbProbe = () => ({
   handles: Object.keys(obstacleObjs).map((id) => {
     const g = obstacleObjs[id];
     return [id, g.children.map((c) => c.userData.pick || 'mesh')];
+  }),
+  // anchor labels: on-screen glyph height should be the same for all
+  labels: Object.entries(anchorObjs).map(([id, g]) => {
+    const spr = g.children.find((c) => c.isSprite);
+    if (!spr) return [id, null];
+    const p = spr.getWorldPosition(new THREE.Vector3()).applyMatrix4(camera.matrixWorldInverse);
+    const pxPerWorld = renderer.domElement.clientHeight
+      / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * -p.z);
+    return [id, { scaleY: +spr.scale.y.toFixed(4), hPx: spr.userData.hPx, unit: spr.userData.unitPx,
+                  size: spr.userData.labelSize, screenH: +(spr.scale.y * pxPerWorld).toFixed(1),
+                  worldScale: spr.getWorldScale(new THREE.Vector3()).toArray().map((v) => +v.toFixed(4)) }];
   }),
 });

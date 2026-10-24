@@ -35,6 +35,7 @@
       <button id="trail-clear" title="Clear the movement trail">⟲</button>
     </div>
     <div id="palette"></div>
+    <div id="legend"></div>
     <div id="toast"></div>
   </div>
 
@@ -59,83 +60,51 @@
       </div>
       <h3 style="margin-top:16px">Tags</h3>
       <div id="taglist"><p class="muted">No tag reporting yet.</p></div>
+      <details class="glossary" style="margin-top:16px">
+        <summary>What do these numbers mean?</summary>
+        <dl>
+          <dt>Position (x, y)</dt><dd>Metres from the 0,0 corner (anchor A2): X along the width, Y along the depth, the same as the floor grid.</dd>
+          <dt>Margin of error (±)</dt><dd>The tracker's own uncertainty, 1σ. About 2 out of 3 positions fall inside this radius. Drawn around the tag to scale.</dd>
+          <dt>Range</dt><dd>Distance measured by UWB between the tag and one anchor, in 3D.</dd>
+          <dt>Range offset (b)</dt><dd>Extra distance every range carries because of the DW1000 antenna delay (about 75–100 cm). Removed by the static calibration, or estimated automatically while there is none.</dd>
+          <dt>Anchor offset (d)</dt><dd>How much one anchor reads more or less than the others. Taken from the static calibration (Setup) once it is applied; until then learned while the trolley moves. Above 20 cm = that anchor's position in the scene is probably wrong.</dd>
+          <dt>Residual</dt><dd>Measured range minus the range expected from the position and offsets. Large or ✕ = blocked / reflected signal or wrong anchor position.</dd>
+          <dt>LOS / NLOS</dt><dd>Clear line of sight / blocked by an obstacle drawn in the scene.</dd>
+          <dt>Confidence</dt><dd>1 / (1 + margin of error in m). Navigation receives it as "quality".</dd>
+          <dt>standing / moving</dt><dd>Standing: the tracker's zero-velocity mode is on (the speed stayed below 0.2 m/s for 0.4 s). The trolley's velocity is held at 0 and a range that comes in too long (a person in the way) is ignored, so the position stays put. It ends as soon as the ranges show movement.</dd>
+          <dt>HOLD</dt><dd>Fewer than 3 anchors heard in 1.5 s: the last good position is kept and marked not valid, so navigation does not steer on a guess.</dd>
+          <dt>Accuracy / precision</dt><dd>Accuracy: how close to the true position. Precision: how tightly positions cluster when still.</dd>
+          <dt>Mean error, RMSE, CEP50 / CEP95</dt><dd>Mean error: average distance to the true point. RMSE: large errors count more. CEP: radius holding 50 % / 95 % of the positions.</dd>
+        </dl>
+      </details>
     </section>
 
     <!-- --------------------------------------------------------- SETUP -->
     <section data-panel="setup" hidden>
-      <h3>Room <span class="pill">metres</span></h3>
+      <p class="muted">Only what has to be measured in your room is set here:
+         the room, the anchor positions (click an anchor in the 3D view, or
+         drag it) and the tag height, then the calibration below. The tracking
+         algorithm itself is fixed.</p>
+      <h3>1 · Room <span class="pill">metres</span></h3>
       <div class="row">
         <label>Width (X)<input id="r-w" type="number" step="0.1" min="0.5"></label>
         <label>Depth (Y)<input id="r-d" type="number" step="0.1" min="0.5"></label>
       </div>
       <label>Height (Z)<input id="r-h" type="number" step="0.1" min="0.5"></label>
-      <label>Tag height above floor (m)
+      <label title="Measure from the floor to the tag's antenna. Ranges are 3D, so a wrong height shifts every position.">Tag height above floor (m)
         <input id="r-tz" type="number" step="0.05" min="0.05" max="3">
       </label>
       <p class="muted" style="margin:-4px 0 10px">Ranges are measured in 3D and
          projected onto the floor, so a wrong tag height shifts every position.</p>
-      <label><input id="nlos" type="checkbox"> Obstacle-aware NLOS correction</label>
-      <label><input id="trail" type="checkbox" checked> Show movement trail</label>
-      <label><input id="spin" type="checkbox"> Slow auto-orbit when idle</label>
 
-      <h3 style="margin-top:16px">Device screen (OLED)</h3>
-      <p class="muted">Saves power on the node. It keeps ranging, serving this
-         page and sending telemetry while the screen is dimmed or off.</p>
-      <label>Mode
-        <select id="scr-mode">
-          <option value="always">Always on</option>
-          <option value="dim">Dim when idle</option>
-          <option value="off">Off when idle</option>
-        </select>
-      </label>
-      <label>Idle timeout (seconds, 0 = never)
-        <input id="scr-timeout" type="number" min="0" step="5" value="60">
-      </label>
-      <div class="row btns">
-        <button id="scr-apply" class="primary">Apply to all devices</button>
-      </div>
-      <div id="scr-result" class="muted" style="margin-top:8px"></div>
-
-      <h3 style="margin-top:16px">OTA firmware</h3>
-      <p class="muted" id="ota-hint">Loading…</p>
-      <label>Firmware image
-        <select id="ota-file"></select>
-      </label>
-      <div class="row btns">
-        <button id="ota-push-all" class="primary">⬆ Push to all online</button>
-      </div>
-      <div id="ota-result" class="muted" style="margin-top:8px"></div>
-
-      <h3 style="margin-top:16px">Tracker</h3>
-      <p class="muted">Positioning algorithm and its main tuning. Applied at
-         once (the track restarts), no server restart needed.</p>
-      <label>Algorithm
-        <select id="trk-algo">
-          <option value="ekf">EKF (default)</option>
-          <option value="ekf_nlos">EKF + NLOS test (Fan &amp; Du 2022)</option>
-          <option value="wls_rkf">WLS-RKF (Fan &amp; Du 2022)</option>
-        </select>
-      </label>
-      <div class="row">
-        <label>Accel noise (m/s²)<input id="trk-sa" type="number" step="0.1" min="0.05"></label>
-        <label>Range noise (m)<input id="trk-sr" type="number" step="0.01" min="0.01"></label>
-      </div>
-      <div class="row">
-        <label>Velocity τ (s)<input id="trk-tau" type="number" step="0.1" min="0"></label>
-        <label>NLOS χ²<input id="trk-chi" type="number" step="0.1" min="1"></label>
-      </div>
-      <div class="row btns">
-        <button id="trk-apply" class="primary">Apply</button>
-        <button id="trk-reset">Defaults</button>
-      </div>
-      <div id="trk-result" class="muted" style="margin-top:8px"></div>
-
-      <h3 style="margin-top:16px">Calibration &amp; static test</h3>
-      <p class="muted">Put the tag still on a spot you measured with the laser
-         meter (same origin as the anchors), enter its X/Y and press Measure.
-         The server compares every raw range with the true distance to each
-         anchor and reports the position error there. Measure 2–4 spots, then
-         Apply to correct each anchor's range bias.</p>
+      <h3 style="margin-top:16px">2 · Calibration &amp; static test</h3>
+      <p class="muted">Every DW1000 adds its own few centimetres to each range.
+         Put the tag still on a spot you measured with the laser meter (same
+         origin as the anchors, not on an anchor), enter its X/Y and press
+         Measure. Do this at 2–4 spots, then press Apply: the tracker then
+         takes each anchor's offset from the calibration instead of learning
+         it. To test the accuracy afterwards, untick "keep" and measure at
+         another spot.</p>
       <div class="row">
         <label>X (m)<input id="cal-x" type="number" step="0.01"></label>
         <label>Y (m)<input id="cal-y" type="number" step="0.01"></label>
@@ -150,6 +119,15 @@
       </div>
       <div id="cal-result" class="muted" style="margin-top:8px"></div>
 
+      <h3 style="margin-top:16px">3 · Tracker</h3>
+      <p class="muted" id="trk-status">Loading…</p>
+      <label title="Ticked: the position shown is the mean of the last 3 positions, so the path is smoother (about 3 times less stipple) but trails the trolley a little more while it drives (simulation: about 13 cm). Unticked: the tracker's own position, slightly more accurate while driving."><input id="trk-smooth" type="checkbox" checked> Smooth the path (mean of the last 3 positions)</label>
+
+      <h3 style="margin-top:16px">View</h3>
+      <label title="The drawn trail uses the points before and after each point (±3), so the line is straighter than the live dot; the live position itself is not delayed."><input id="trail" type="checkbox" checked> Show movement trail</label>
+      <label title="One dashed circle per anchor: where the tag can be according to that anchor's measured range, to scale. Where the circles meet is the position."><input id="rings" type="checkbox" checked> Show measured range circles</label>
+      <label><input id="spin" type="checkbox"> Slow auto-orbit when idle</label>
+
       <h3 style="margin-top:16px">Record session</h3>
       <p class="muted">Records every raw packet and estimate to
          <code>server/logs/</code>. Analyse with
@@ -160,6 +138,20 @@
         <button id="rec-mark">Mark</button>
       </div>
       <div id="rec-status" class="muted" style="margin-top:8px"></div>
+
+      <h3 style="margin-top:16px">Device screen (OLED)</h3>
+      <label title="Ticked (default): the OLED of every node stays on. Unticked: each screen turns off after 60 s without a button press, to save power. The node keeps ranging, serving its page and sending telemetry either way. Applied to all devices at once."><input id="scr-on" type="checkbox" checked> Keep device screens on</label>
+      <div id="scr-result" class="muted"></div>
+
+      <h3 style="margin-top:16px">OTA firmware</h3>
+      <p class="muted" id="ota-hint">Loading…</p>
+      <label>Firmware image
+        <select id="ota-file"></select>
+      </label>
+      <div class="row btns">
+        <button id="ota-push-all" class="primary">⬆ Push to all online</button>
+      </div>
+      <div id="ota-result" class="muted" style="margin-top:8px"></div>
     </section>
 
     <!-- ------------------------------------------------------- DEVICES -->

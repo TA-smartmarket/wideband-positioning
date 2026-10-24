@@ -95,7 +95,13 @@ Closed-form geometry gives the first fix:
   centre returned. No intersection → midpoint, low confidence.
 - **3+ anchors** → linearised least squares + 2 Gauss-Newton iterations.
 
-### 5.3 Tracking — Extended Kalman Filter, `src/ekf.h` / `server/app.py::TagEKF`
+### 5.3 Tracking — Extended Kalman Filter, `src/ekf.h` / `server/tracker.py`
+
+> The server's tracker has since grown into the final algorithm (EKF +
+> static calibration + zero-velocity mode + long-range rejection + validity
+> gate, fixed values, one "smooth the path" switch). It is described in
+> [`ALGORITHMS.md`](ALGORITHMS.md); this section keeps the basic EKF, which the
+> device-side `src/ekf.h` still uses.
 
 Once a first fix exists, the **EKF** takes over (this is the estimator the
 supervisor asked for — the measurement model is non-linear, hence *Extended*).

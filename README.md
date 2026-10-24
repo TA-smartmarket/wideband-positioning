@@ -77,14 +77,20 @@ wideband-positioning/
 ├── docs/
 │   ├── API.md            # kontrak API/MQTT + model payload
 │   ├── ARCHITECTURE.md   # cara kerja sistem + trade-off desain
-│   ├── ALGORITHMS.md     # penjelasan matematis tiap algoritma
+│   ├── ALGORITHMS.md     # algoritma inti (EKF + kalibrasi + mode diam + tolak jarak kepanjangan)
+│   ├── algorithm-deep-understanding.md  # detail, studi windowing, catatan bimbingan, rujukan
+│   ├── hasil-simulasi/   # gambar + Excel perbandingan algoritma (tools/sim_report.py)
 │   ├── Jurnal_UWB_Indoor_Positioning.docx   # tabel review 10 jurnal
 │   └── papers/           # PDF 10 paper rujukan + README berisi link
 ├── tools/                # build_firmware.py (build + staging OTA), ota_debug.py,
-│                         # simulate.py (sebelum/sesudah), evaluate.py (analisis rekaman)
+│                         # simulate.py (sebelum/sesudah), smoothing_study.py (studi algoritma),
+│                         # sim_report.py (gambar + Excel hasil simulasi),
+│                         # evaluate.py (analisis rekaman), report_excel.py (laporan Excel),
+│                         # tracker_lab.py (varian algoritma riset, tidak dipakai server),
+│                         # window_study.py + window_report.py (studi semua kombinasi)
 └── server/
     ├── app.py            # Flask: REST + MQTT ingest + web UI + kalibrasi + rekam
-    ├── tracker.py        # engine tracking: dedup sampel, clock sync, EKF 5-state
+    ├── tracker.py        # engine tracking: dedup sampel, clock sync, algoritma final (EKF)
     ├── recorder.py       # perekam sesi (server/logs/*.jsonl)
     ├── scene.py          # geometri ruangan, penghalang, klasifikasi LOS/NLOS
     ├── static/           # web UI 3D (Three.js di-vendor di static/vendor/)
@@ -431,7 +437,7 @@ Buka `http://<server>:8080`. Ada **4 tab**:
 | Tab | Isi |
 |---|---|
 | **Live** | inspector objek + daftar tag (posisi, σ, IP, confidence) |
-| **Setup** | ukuran ruangan, NLOS, trail, auto-orbit, **OTA firmware** |
+| **Setup** | ukuran ruangan + tinggi tag, kalibrasi, centang *Smooth the path*, tampilan, rekam, **OTA firmware** |
 | **Devices** | tiap node: IP, RSSI, firmware, tombol **OTA** + **🔑 key** |
 | **API** | daftar endpoint REST (dibaca live dari `/api/v1/meta`) + topik MQTT |
 
@@ -562,6 +568,10 @@ Update    : y = z − h(x) ; S = H P Hᵀ + σr² ; K = P Hᵀ/S   (σr = 0,12 m
 - **Kalibrasi per anchor** (`bias`, `scale`) dari titik statis yang diukur
   dengan meteran laser — lihat bagian 🎯 di bawah.
 - **Confidence** = `1/(1+σ)` dengan `σ = √(P₀₀+P₁₁)`.
+- **Mode diam + tolak jarak kepanjangan**: saat troli berhenti kecepatan
+  dikunci 0 dan jarak yang > 1σ terlalu panjang (badan pembeli) dibuang.
+  Satu-satunya pilihan pengguna: *Smooth the path* (rata-rata 3 posisi).
+  Detail dan hasil: [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md).
 
 Hasil simulasi (30 run, error radio sama untuk semua pipeline,
 `python tools/simulate.py`):
@@ -632,7 +642,8 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
    python tools/evaluate.py server/logs/<file>.jsonl --path 0.8,1.0 3.6,4.4 --min-speed 0.1
    ```
 
-   `--replay --set sigma_a=1.2` memutar ulang paket mentah dengan parameter
+   `--replay` memutar ulang paket mentah lewat algoritma server; `--replay --set
+   sigma_a=1.2` memakai varian riset (`tools/tracker_lab.py`) dengan parameter
    lain pada data yang sama.
 
 | Method | Path | Fungsi |
@@ -640,7 +651,7 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
 | `POST` | `/api/v1/calibration/point` | `{"x","y","seconds","store"}` — kumpulkan di titik terukur |
 | `POST` | `/api/v1/calibration/apply` | hitung bias/scale per anchor |
 | `POST` | `/api/v1/calibration/clear` | hapus kalibrasi |
-| `GET`/`PUT` | `/api/v1/tracking` | parameter tracker (`sigma_a`, `sigma_r`, …) |
+| `GET`/`PUT` | `/api/v1/tracking` | `GET`: status (`smooth`, `calibrated`) + nilai tetap; `PUT {"smooth": true\|false}`: satu-satunya pilihan |
 | `POST` | `/api/v1/record/start` · `stop` · `mark` | rekam sesi ke `server/logs/` |
 
 ---
@@ -669,9 +680,15 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
 - [`docs/API.md`](docs/API.md) — kontrak API/MQTT lengkap + model payload.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — cara kerja sistem, skema
   alamat UWB, matematika solver, trade-off.
-- [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md) — penjelasan matematis tiap
-  algoritma (TWR, pre-filter, solver, EKF, NLOS, geometry check) + tabel
-  parameter yang bisa disetel.
+- [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md) — algoritma inti yang berjalan di
+  server (EKF + kalibrasi + mode diam + tolak jarak kepanjangan + gerbang validitas),
+  diagram alur, hasil, parameter, dan arti setiap istilah.
+- [`docs/hasil-simulasi/`](docs/hasil-simulasi/) — gambar dan
+  `Hasil_Simulasi.xlsx`: tujuh algoritma pada data simulasi yang sama.
+- [`docs/algorithm-deep-understanding.md`](docs/algorithm-deep-understanding.md)
+  — penurunan rumus, studi semua kombinasi windowing, pembahasan catatan
+  bimbingan (moving average, Nyquist–Shannon, compressed sensing), audit
+  perubahan 22-10, dan rujukan per bagian.
 - [`docs/Jurnal_UWB_Indoor_Positioning.docx`](docs/Jurnal_UWB_Indoor_Positioning.docx)
   — tabel review 10 jurnal (AUTHOR | JUDUL | TAHUN | METODE | ALGORITMA | ALAT |
   KEKURANGAN | KELEBIHAN) + daftar pustaka APA.
