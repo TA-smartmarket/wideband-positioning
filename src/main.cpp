@@ -139,6 +139,7 @@ uint8_t pos_count = 0;
 
 uint32_t last_telem_ms = 0;
 uint8_t  anchors_seen = 0, tags_seen = 0;
+uint32_t anchors_dropped = 0;        // anchors removed as inactive since boot
 unsigned long boot_ms = 0;
 
 // ---------------------------------------------------------------------------
@@ -331,6 +332,7 @@ String buildTelemetry(uint8_t n)
 
     JsonObject st = doc["status"].to<JsonObject>();
     jsonPutFloat(st, "tag_z", cfg.tag_z);       // height the device solved with
+    st["robust"] = cfg.role == ROLE_TAG && cfg.robust_round;   // ranging round mode, for the recordings
     if (net.wifi_up) st["ip"] = WiFi.localIP().toString();
     st["rssi"] = net.wifi_up ? WiFi.RSSI() : 0;
     st["uptime_s"] = (millis() - boot_ms) / 1000;
@@ -340,6 +342,22 @@ String buildTelemetry(uint8_t n)
     st["reset"] = resetReasonName();
     st["heap_min"] = ESP.getMinFreeHeap();
     st["fw"] = FW_VERSION;
+    if (cfg.role == ROLE_TAG) {
+        // ranging-round diagnostics (tools/ranging_rate.py): the slowest
+        // POLL_ACK per anchor since the last packet, ms after the POLL; POLL_ACKs
+        // after the robust deadline; anchors dropped as inactive since boot
+        JsonObject ack = st["ack_ms"].to<JsonObject>();
+        for (uint8_t i = 0; i < DW1000Ranging.getNetworkDevicesNumber(); i++) {
+            DW1000Device *d = DW1000Ranging.getNetworkDevice(i);
+            const uint8_t ms = DW1000Ranging.takeAckMs(i);
+            if (!d || !ms) continue;
+            char id[16];
+            shortToDeviceId(d->getShortAddress(), id, sizeof(id));
+            ack[id] = ms;
+        }
+        st["ack_late"] = DW1000Ranging.takeAckLate();
+        st["anchors_dropped"] = anchors_dropped;
+    }
 
     String out;
     serializeJson(doc, out);
@@ -479,6 +497,7 @@ void otaRestoreRadio()
         DW1000Ranging.startAsTag(eui_buf, uwbModeBytes(cfg.uwb_mode), false);
     else
         DW1000Ranging.startAsAnchor(eui_buf, uwbModeBytes(cfg.uwb_mode), false);
+    DW1000Ranging.useRobustRound(cfg.role == ROLE_TAG && cfg.robust_round);
     Serial.println(F("[ota] radio restarted"));
 }
 
@@ -681,6 +700,7 @@ void inactiveDevice(DW1000Device *d)
 {
     char id[16]; shortToDeviceId(d->getShortAddress(), id, sizeof(id));
     if (!strncmp(id, "anchor", 6) && anchors_seen) anchors_seen--;
+    if (!strncmp(id, "anchor", 6)) anchors_dropped++;
     if (!strncmp(id, "tag", 3) && tags_seen) tags_seen--;
 
     filterForget(id);   // drop the pre-filter state for this link
@@ -878,6 +898,7 @@ void printHelp()
         "  screen on|dim|off    OLED power saving (device stays online)\n"
         "  screen auto <sec>    idle seconds before dim/off (0 = never)\n"
         "  rate <ms>            telemetry interval\n"
+        "  robust on|off        tag: robust ranging round (experimental, default off)\n"
         "  save                 persist to NVS\n"
         "  portal [off]         open/close the setup portal (or hold BOOT 3 s)\n"
         "  reboot               restart\n"
@@ -911,6 +932,7 @@ void printConfig()
                   (cfg.screen_mode == 1 ? "dim" : "off"),
                   (unsigned)cfg.screen_timeout_s);
     Serial.printf("rate       : %u ms\n", (unsigned)cfg.update_ms);
+    Serial.printf("robust     : %s\n", cfg.robust_round ? "on" : "off");
     Serial.printf("wifi state : %s\n", net.wifi_up ? WiFi.localIP().toString().c_str() : "down");
 }
 
@@ -996,6 +1018,11 @@ void handleSerial()
         }
         else if (!strcmp(cmd, "filter") && a1) cfg.range_filter = !strcmp(a1, "on");
         else if (!strcmp(cmd, "rate") && a1) cfg.update_ms = (uint16_t)atoi(a1);
+        else if (!strcmp(cmd, "robust") && a1) {
+            cfg.robust_round = !strcmp(a1, "on");
+            DW1000Ranging.useRobustRound(cfg.role == ROLE_TAG && cfg.robust_round);
+            Serial.printf("robust round %s (save to keep it)\n", cfg.robust_round ? "on" : "off");
+        }
         else if (!strcmp(cmd, "save")) { configSave(cfg); Serial.println("saved"); }
         else if (!strcmp(cmd, "portal")) {
             if (a1 && !strcmp(a1, "off")) portalStop();
@@ -1230,6 +1257,8 @@ void onServerConfig(JsonObjectConst doc)
         if (u["mode"].is<const char *>()) cfg.uwb_mode = uwbModeFromName(u["mode"].as<const char *>());
         if (u["range_filter"].is<bool>()) cfg.range_filter = u["range_filter"].as<bool>();
         if (u["update_ms"].is<int>()) cfg.update_ms = (uint16_t)u["update_ms"].as<int>();
+        // only sent when the server is started with --robust-round
+        if (u["robust_round"].is<bool>()) cfg.robust_round = u["robust_round"].as<bool>();
     }
 
     // Same values as already stored (the JSON can still differ, e.g. a server
@@ -1324,6 +1353,7 @@ void setup()
         DW1000Ranging.startAsTag(eui, uwbModeBytes(cfg.uwb_mode), false);
     else
         DW1000Ranging.startAsAnchor(eui, uwbModeBytes(cfg.uwb_mode), false);
+    DW1000Ranging.useRobustRound(cfg.role == ROLE_TAG && cfg.robust_round);
     radio_started = true;
 
     wifiBegin();

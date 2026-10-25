@@ -77,20 +77,18 @@ wideband-positioning/
 ├── docs/
 │   ├── API.md            # kontrak API/MQTT + model payload
 │   ├── ARCHITECTURE.md   # cara kerja sistem + trade-off desain
-│   ├── ALGORITHMS.md     # algoritma inti (EKF + kalibrasi + mode diam + tolak jarak kepanjangan)
-│   ├── algorithm-deep-understanding.md  # detail, studi windowing, catatan bimbingan, rujukan
-│   ├── hasil-simulasi/   # gambar + Excel perbandingan algoritma (tools/sim_report.py)
+│   ├── ALGORITHMS.md     # algoritma inti CALF-UWB (EKF + kalibrasi + mode diam + tolak jarak kepanjangan)
+│   ├── riset/            # RISET: varian pembanding, sejarah, ide yang tidak dipakai server
+│   ├── algorithm-deep-understanding.md  # riset: detail, studi windowing, catatan bimbingan
+│   ├── hasil-simulasi/   # riset: gambar + Excel studi simulasi
 │   ├── Jurnal_UWB_Indoor_Positioning.docx   # tabel review 10 jurnal
 │   └── papers/           # PDF 10 paper rujukan + README berisi link
 ├── tools/                # build_firmware.py (build + staging OTA), ota_debug.py,
-│                         # simulate.py (sebelum/sesudah), smoothing_study.py (studi algoritma),
-│                         # sim_report.py (gambar + Excel hasil simulasi),
-│                         # evaluate.py (analisis rekaman), report_excel.py (laporan Excel),
-│                         # tracker_lab.py (varian algoritma riset, tidak dipakai server),
-│                         # window_study.py + window_report.py (studi semua kombinasi)
+│                         # evaluate.py (analisis rekaman), report_excel.py (laporan Excel);
+│                         # skrip riset lainnya: lihat docs/riset/README.md
 └── server/
     ├── app.py            # Flask: REST + MQTT ingest + web UI + kalibrasi + rekam
-    ├── tracker.py        # engine tracking: dedup sampel, clock sync, algoritma final (EKF)
+    ├── tracker.py        # engine tracking: dedup sampel, clock sync, algoritma CALF-UWB (EKF)
     ├── recorder.py       # perekam sesi (server/logs/*.jsonl)
     ├── scene.py          # geometri ruangan, penghalang, klasifikasi LOS/NLOS
     ├── static/           # web UI 3D (Three.js di-vendor di static/vendor/)
@@ -523,9 +521,9 @@ curl -X PUT localhost:8080/api/v1/scene -H 'Content-Type: application/json' -d '
 
 ## ⚙️ Cara Kerja & Logika Penting
 
-> Pipeline server ditulis ulang pada Oktober 2026 karena lintasan zig-zag.
-> Akar masalah, bukti simulasi sebelum/sesudah, dan protokol uji ada di
-> [`docs/PERBAIKAN_AKURASI.md`](docs/PERBAIKAN_AKURASI.md).
+> Algoritma lengkapnya, **CALF-UWB**, dijelaskan di
+> [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md). Sejarah perbaikannya ada di
+> [`docs/riset/`](docs/riset/README.md).
 
 ### 1. Pengukuran (firmware ≥ 1.0.32)
 Setiap hasil two-way ranging masuk antrean dan dikirim **sekali** ke server,
@@ -546,24 +544,24 @@ solver lokal; server memakai nilai mentah.
 - Tag dan anchor sama-sama melaporkan hasil TWR yang sama; salinan tag yang
   dipakai.
 
-### 3. Tracking — **Extended Kalman Filter** dengan bias jarak
+### 3. Tracking — CALF-UWB (Extended Kalman Filter dengan koreksi offset)
 
 ```
-State     : x = [ px, py, vx, vy, b ]ᵀ     posisi, kecepatan, offset jarak bersama
-Gerak     : constant velocity (σa = 0,8 m/s²); b random walk lambat
-Pengukuran: h(x) = √((px-ax)² + (py-ay)² + dz²) + b     dz = z_anchor − z_tag
-Jacobian  : H = [ (px-ax)/ρ , (py-ay)/ρ , 0 , 0 , 1 ]
+State     : x = [ px, py, vx, vy, b, d₁…d₄ ]ᵀ   posisi, kecepatan, offset jarak
+Gerak     : model Singer (σa = 0,8 m/s², τ = 1 s); saat diam σa = 0,05 dan v = 0
+Pengukuran: h(x) = √((px-ax)² + (py-ay)² + dz²) + b + dᵢ   dz = z_anchor − z_tag
 Update    : y = z − h(x) ; S = H P Hᵀ + σr² ; K = P Hᵀ/S   (σr = 0,12 m)
             x ← x + K y ; P ← (I−KH) P (I−KH)ᵀ + K σr² Kᵀ   (Joseph)
 ```
 
 - **Jarak miring langsung** dipakai sebagai pengukuran (tanpa proyeksi
   `√(r² − dz²)` yang memperbesar noise dekat anchor).
-- **`b`** = offset yang sama di semua jarak (delay antena DW1000 yang belum
-  dikalibrasi). Dengan ≥ 3 anchor ia teramati dan diestimasi online, seperti
-  *clock bias* pada GPS.
-- **Robust (Huber)**: inovasi ternormalisasi > 2,5 → noise dibesarkan;
-  > 6 → ditolak. Tidak ada sampel diterima 1,5 s → inisialisasi ulang.
+- **`b`, `dᵢ`** = offset yang sama di semua jarak (delay antena DW1000) dan
+  selisih tiap anchor. Diambil dari kalibrasi bila semua anchor sudah
+  dikalibrasi; bila belum, diestimasi online seperti *clock bias* pada GPS.
+- **Robust (Huber asimetris)**: inovasi ternormalisasi > 1 (jarak kepanjangan)
+  atau < −2,5 → noise dibesarkan; |e| > 6 → ditolak. Tidak ada sampel diterima
+  1,5 s → inisialisasi ulang.
 - **Bootstrap**: multilaterasi Gauss-Newton dari semua anchor.
 - **Kalibrasi per anchor** (`bias`, `scale`) dari titik statis yang diukur
   dengan meteran laser — lihat bagian 🎯 di bawah.
@@ -572,15 +570,6 @@ Update    : y = z − h(x) ; S = H P Hᵀ + σr² ; K = P Hᵀ/S   (σr = 0,12 m
   dikunci 0 dan jarak yang > 1σ terlalu panjang (badan pembeli) dibuang.
   Satu-satunya pilihan pengguna: *Smooth the path* (rata-rata 3 posisi).
   Detail dan hasil: [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md).
-
-Hasil simulasi (30 run, error radio sama untuk semua pipeline,
-`python tools/simulate.py`):
-
-| Pipeline | RMSE | Galat lintasan (XT-RMSE) |
-|---|---|---|
-| Lama (server `1aff68c` + FW 1.0.31) | 144 cm | 53 cm |
-| Baru + FW ≥ 1.0.32 | 23 cm | 13 cm |
-| Baru + FW ≥ 1.0.32 + kalibrasi | 21 cm | 11 cm |
 
 | Tahap | Device (tag) | Server |
 |---|---|---|
@@ -633,7 +622,16 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
 [`docs/PERBAIKAN_AKURASI.md`](docs/PERBAIKAN_AKURASI.md) §4.
 
 1. **Kalibrasi** — Setup → *Calibration & static test*: tag diam di titik yang
-   diukur, isi X/Y → **Measure here** (2–4 titik) → **Apply calibration**.
+   diukur, isi X/Y → **Measure here** (2–4 titik, ±0,5 m dari anchor; jangan
+   berdiri di antara tag dan anchor selama 15 detik) → **Apply calibration**.
+   Sebelum Apply, cek apakah titik-titiknya saling cocok:
+
+   ```bash
+   python tools/calibration_check.py
+   ```
+
+   Titik yang ditandai (`noisy`, `offset`, `position`) diukur ulang. Kalau
+   ruangan atau anchor berubah, tekan **Clear** dulu.
 2. **Uji statis** — sama, tapi *Keep as calibration point* tidak dicentang;
    hasilnya mean error, σ, RMSE, CEP50/95.
 3. **Uji lintasan** — Setup → *Record session* → jalan di garis lakban → Stop →
@@ -642,9 +640,8 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
    python tools/evaluate.py server/logs/<file>.jsonl --path 0.8,1.0 3.6,4.4 --min-speed 0.1
    ```
 
-   `--replay` memutar ulang paket mentah lewat algoritma server; `--replay --set
-   sigma_a=1.2` memakai varian riset (`tools/tracker_lab.py`) dengan parameter
-   lain pada data yang sama.
+   `--replay` memutar ulang paket mentah lewat algoritma server pada data yang
+   sama.
 
 | Method | Path | Fungsi |
 |---|---|---|
@@ -681,14 +678,9 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — cara kerja sistem, skema
   alamat UWB, matematika solver, trade-off.
 - [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md) — algoritma inti yang berjalan di
-  server (EKF + kalibrasi + mode diam + tolak jarak kepanjangan + gerbang validitas),
+  server, **CALF-UWB** (*Correction-Aware Layered Filter for UWB Indoor
+  Positioning*: EKF + kalibrasi + mode diam + tolak jarak kepanjangan + gerbang validitas),
   diagram alur, hasil, parameter, dan arti setiap istilah.
-- [`docs/hasil-simulasi/`](docs/hasil-simulasi/) — gambar dan
-  `Hasil_Simulasi.xlsx`: tujuh algoritma pada data simulasi yang sama.
-- [`docs/algorithm-deep-understanding.md`](docs/algorithm-deep-understanding.md)
-  — penurunan rumus, studi semua kombinasi windowing, pembahasan catatan
-  bimbingan (moving average, Nyquist–Shannon, compressed sensing), audit
-  perubahan 22-10, dan rujukan per bagian.
 - [`docs/Jurnal_UWB_Indoor_Positioning.docx`](docs/Jurnal_UWB_Indoor_Positioning.docx)
   — tabel review 10 jurnal (AUTHOR | JUDUL | TAHUN | METODE | ALGORITMA | ALAT |
   KEKURANGAN | KELEBIHAN) + daftar pustaka APA.
@@ -696,11 +688,21 @@ diukur tegak lurus terhadap garis). Protokol lengkap:
   memuat tautan unduh tiap paper dan ringkasan relevansinya ke proyek.
 - [`server/README.md`](server/README.md) — panduan server saja.
 
+### Riset (tidak dipakai server)
+
+- [`docs/riset/README.md`](docs/riset/README.md) — daftar semua riset: varian
+  pembanding, sejarah dari pipeline lama sampai CALF-UWB, riset lanjutan
+  (improved TWR dan AoA), kode riset, dan istilah riset.
+- [`docs/algorithm-deep-understanding.md`](docs/algorithm-deep-understanding.md)
+  — penurunan rumus, studi windowing, pembahasan catatan bimbingan.
+
 ## ⚠️ Catatan & Keterbatasan
 
 - **Bukan WiFi CSI / radar**: radio board ini DW1000 (UWB), bukan WiFi — tidak
   bisa deteksi manusia tanpa tag (fitur CSI ada di board ESP32-S3 + WiFi).
-- Akurasi ±10–30 cm indoor; noise karena pantulan radio.
+- Akurasi saat troli berhenti ±3–5 cm di simulasi (CALF-UWB dengan kalibrasi),
+  ±23 cm saat bergerak. Akurasi nyata diukur dengan titik terukur
+  (Setup → *Calibration & static test*).
 - State server **in-memory**: config device hilang saat server restart
   (device akan ambil ulang config dalam 15 detik setelah online kembali).
 - Server dev Flask cocok untuk LAN; untuk produksi pakai gunicorn

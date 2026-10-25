@@ -148,7 +148,7 @@ B dan R diuji bersama Z, L, dan **semua jendela**, termasuk rata 3 yang dipakai 
 | K+R+Z (bayangan badan arah acak) | 3,1 | 4,3 | 6,2 | 4,5 | 25,8 |
 | K+R+Z+L | 3,1 | 3,8 | **5,2** | 4,0 | 25,3 |
 | K+R+Z+L + rata 3 | 3,2 | 3,9 | 5,3 | 4,1 | 36,6 |
-| **K+G+Z+L (rekomendasi)** | **3,0** | **3,4** | 5,4 | **3,9** | **23,2** |
+| **K+G+Z+L (rekomendasi, CALF-UWB)** | **3,0** | **3,4** | 5,4 | **3,9** | **23,2** |
 | K+G+Z+L + rata 3 (web + kalibrasi) | 3,1 | 3,5 | 5,5 | 4,0 | 34,5 |
 
 - **B selalu memperburuk**, dengan atau tanpa L dan dengan jendela apa pun.
@@ -206,7 +206,8 @@ B dan R diuji bersama Z, L, dan **semua jendela**, termasuk rata 3 yang dipakai 
 
 ## Algoritma di server
 
-Server sekarang **hanya** menjalankan algoritma rekomendasi **K + G + Z + L**
+Server sekarang **hanya** menjalankan algoritma rekomendasi **K + G + Z + L**, yang
+dinamai **CALF-UWB** (*Correction-Aware Layered Filter for UWB Indoor Positioning*)
 (`server/tracker.py`). Varian lain di studi ini (C, B, R, jendela pada jarak, dan seterusnya)
 dipindah ke `tools/tracker_lab.py`, yang hanya dipakai skrip di `tools/`.
 

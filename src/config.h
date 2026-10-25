@@ -22,7 +22,7 @@
 
 #include "DW1000Ranging.h"
 
-#define FW_VERSION      "1.0.35"
+#define FW_VERSION      "1.0.37"
 #define MAX_ANCHORS     10
 #define MAX_TAGS        10
 // Prefix for the setup access point. The advertised name is this plus a
@@ -77,6 +77,9 @@ struct Config {
     UwbMode  uwb_mode = MODE_RANGE_LOWPOWER;
     bool     range_filter = true;
     uint16_t update_ms = 200;
+    // Tag: robust ranging round (DW1000Ranging::useRobustRound). Experimental,
+    // off by default; docs/riset/RISET_LANJUTAN.md has the test.
+    bool     robust_round = false;
 
     // Positions of every anchor, pushed by the server so a tag can solve its
     // own position without asking the server. Encoded "id:x,y;id:x,y".
@@ -250,6 +253,7 @@ inline void configLoad(Config &c)
     c.uwb_mode = (UwbMode)p.getUChar("uwbm", MODE_RANGE_LOWPOWER);
     c.range_filter = p.getBool("rfilt", true);
     c.update_ms = p.getUShort("upd", 200);
+    c.robust_round = p.getBool("rround", false);
     p.getString("amap", c.anchor_map, sizeof(c.anchor_map));
     c.tag_z = p.getFloat("tagz", 1.3f);
     c.screen_mode = p.getUChar("scr_mode", 1);
@@ -285,6 +289,7 @@ inline void configSave(const Config &c)
     p.putUChar("uwbm", (uint8_t)c.uwb_mode);
     p.putBool("rfilt", c.range_filter);
     p.putUShort("upd", c.update_ms);
+    p.putBool("rround", c.robust_round);
     p.putString("amap", c.anchor_map);
     p.putFloat("tagz", c.tag_z);
     p.putUChar("scr_mode", c.screen_mode);
@@ -316,6 +321,7 @@ inline uint32_t configDigest(const Config &c)
     mix(&c.room_w, sizeof(c.room_w)); mix(&c.room_h, sizeof(c.room_h));
     mix(&c.uwb_mode, sizeof(c.uwb_mode)); mix(&c.range_filter, sizeof(c.range_filter));
     mix(&c.update_ms, sizeof(c.update_ms)); str(c.anchor_map);
+    mix(&c.robust_round, sizeof(c.robust_round));
     mix(&c.tag_z, sizeof(c.tag_z));
     mix(&c.screen_mode, sizeof(c.screen_mode));
     mix(&c.screen_timeout_s, sizeof(c.screen_timeout_s));

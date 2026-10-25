@@ -35,6 +35,7 @@ import time
 
 from flask import Flask, jsonify, request, send_from_directory
 
+import calibration as calib
 import recorder
 import scene as scene_mod
 import tracker
@@ -62,6 +63,10 @@ DEVICES = {}          # device_id -> config dict (merged)
 LOCK = threading.RLock()
 STALE_MS = 5000       # device offline threshold
 NAV_STALE_MS = 1500   # a navigation position older than this is not valid
+# Experimental (docs/riset/RISET_LANJUTAN.md): --robust-round 0/1 pushes the
+# tag's robust ranging round as uwb.robust_round. None = not pushed at all, so
+# every node keeps its own setting (default off).
+ROBUST_ROUND = None
 
 RANGES = {}           # (anchor_id, tag_id) -> {"range","rx","fp","q","ts"}
 TAG_POS = {}          # tag_id -> {"x","y","conf","amb","ts","src"}
@@ -96,6 +101,32 @@ OTA_TOKENS = {}       # device_id -> token (persisted, see ota_tokens_path)
 # for no reason.
 OTA_PENDING = {}      # device_id -> {"firmware": name, "requested": ts}
 OTA_TOKENS_PATH = os.path.join(os.path.dirname(__file__), "ota_tokens.json")
+# What happened to each requested update, for the progress shown in the UI:
+# waiting (the node checks once a minute) -> downloading (it was told to) ->
+# restarting (it went quiet or reported success) -> done (it reports the new
+# version) | failed (it reported an error) | no-response (OTA_TIMEOUT_MS).
+OTA_PROGRESS = {}     # device_id -> {"firmware", "version", "stage", "since", "requested", "error"}
+OTA_TIMEOUT_MS = 4 * 60 * 1000
+
+
+def ota_stage(dev, stage, **extra):
+    p = OTA_PROGRESS.get(dev)
+    if p is not None and p["stage"] != stage:
+        p.update(stage=stage, since=now_ms(), **extra)
+
+
+def ota_progress(dev):
+    """The progress of dev's update, with the time-out applied (None: none)."""
+    p = OTA_PROGRESS.get(dev)
+    if not p:
+        return None
+    p = dict(p)
+    if p["stage"] == "downloading" and now_ms() - (DEVICES.get(dev) or {}).get("last_seen", 0) > STALE_MS:
+        p["stage"] = "restarting"            # quiet: writing the image / rebooting
+    if p["stage"] in ("waiting", "downloading", "restarting") and now_ms() - p["requested"] > OTA_TIMEOUT_MS:
+        p["error"] = f"no answer while {p['stage']}"
+        p["stage"] = "no-response"
+    return p
 
 
 def _load_ota_tokens():
@@ -295,9 +326,14 @@ def merged_config(role, did):
             # so it must be sent even here. Without it a device seen only
             # through telemetry kept its NVS default and solved with the wrong
             # height.
-            return {"device_id": key, "role": role, "id": did, "anchors": anchors,
-                    "tag_z": float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z)),
-                    "ota": {"enabled": True, "port": OTA_PORT, "token": ota_token(key)}}
+            out = {"device_id": key, "role": role, "id": did, "anchors": anchors,
+                   "tag_z": float(SCENE.get("tag_z", scene_mod.DEFAULT_TAG_Z)),
+                   "ota": {"enabled": True, "port": OTA_PORT, "token": ota_token(key)}}
+            if ROBUST_ROUND is not None:
+                out["uwb"] = {"robust_round": ROBUST_ROUND}
+            return out
+        if ROBUST_ROUND is not None:
+            cfg.setdefault("uwb", {})["robust_round"] = ROBUST_ROUND
         # never push empty credentials back — that would wipe the device
         if not cfg["wifi"]["ssid"]:
             cfg.pop("wifi", None)
@@ -418,6 +454,9 @@ def recompute_positions():
 def handle_status(device_id, st):
     with LOCK:
         STATUS[device_id] = dict(st, ts=now_ms())
+        p = OTA_PROGRESS.get(device_id)
+        if p and p["stage"] not in ("done", "failed") and st.get("fw") == p["version"]:
+            ota_stage(device_id, "done")
 
 
 def ingest_telemetry(payload, source):
@@ -964,6 +1003,8 @@ def api_ota_check():
                         "current": cur})
 
     base = request.host_url.rstrip("/")
+    with LOCK:
+        ota_stage(dev, "downloading")
     return jsonify({"ok": True, "update": True, "version": ver,
                     "size": os.path.getsize(path),
                     "url": f"{base}/api/v1/ota/firmware/{name}",
@@ -992,6 +1033,7 @@ def api_ota_request():
         if cancel:
             for dk in targets:
                 OTA_PENDING.pop(dk, None)
+                OTA_PROGRESS.pop(dk, None)
             return jsonify({"ok": True, "cancelled": targets})
 
         name = body.get("firmware")
@@ -1013,6 +1055,8 @@ def api_ota_request():
                 already.append(dk)
                 continue
             OTA_PENDING[dk] = {"firmware": name, "requested": now_ms()}
+            OTA_PROGRESS[dk] = {"firmware": name, "version": ver, "stage": "waiting",
+                                "since": now_ms(), "requested": now_ms(), "error": None}
             queued.append(dk)
 
         if skipped and not queued and not already:
@@ -1048,6 +1092,10 @@ def api_ota_ack():
     ok = bool(body.get("ok"))
     with LOCK:
         OTA_PENDING.pop(dev, None)     # one shot: never serve it twice
+        if ok:
+            ota_stage(dev, "restarting")
+        else:
+            ota_stage(dev, "failed", error=str(body.get("error") or "the device reported a failure"))
     print(f"[ota] {dev} reported {'success' if ok else 'failure'} "
           f"{body.get('version','')} {body.get('error','')}")
     return jsonify({"ok": True})
@@ -1078,7 +1126,8 @@ def api_ota_list():
                          "online": now_ms() - dc.get("last_seen", 0) < 5000,
                          "ip": st.get("ip"), "fw": st.get("fw"),
                          "key": ota_token(dk), "port": OTA_PORT,
-                         "pending": (OTA_PENDING.get(dk) or {}).get("firmware")})
+                         "pending": (OTA_PENDING.get(dk) or {}).get("firmware"),
+                         "progress": ota_progress(dk)})
     return jsonify({"ok": True, "devices": devs, "firmware": firmwares,
                     "port": OTA_PORT})
 
@@ -1273,11 +1322,20 @@ def _default_tag():
         return (live or list(ENGINE.tracks) or ["tag-1"])[0]
 
 
+def _scene_anchors():
+    """{anchor id: (x, y, z)} from the floor plan."""
+    return {a["id"]: (a["x"], a["y"], a.get("z", 2.2)) for a in SCENE.get("anchors", [])}
+
+
 @APP.route("/api/v1/calibration", methods=["GET"])
 def api_calibration_get():
-    """Stored calibration points and the per-anchor correction in use."""
+    """Stored calibration points, the per-anchor correction in use, and
+    "review": what Apply would do now (server/calibration.py fit, dry run)."""
     with LOCK:
-        return jsonify({"ok": True, "calibration": SCENE.get("calibration", {}),
+        cal = SCENE.get("calibration", {})
+        pts = cal.get("points") or []
+        review = calib.fit(pts, _scene_anchors()) if pts else None
+        return jsonify({"ok": True, "calibration": cal, "review": review,
                         "jobs": [{"tag": j["tag"], "until": j["until"]} for j in CAL_JOBS]})
 
 
@@ -1331,50 +1389,51 @@ def api_calibration_point():
 
     point = {"label": label, "x": x, "y": y, "tag": tag, "tag_z": tag_z,
              "t": now_ms(), "seconds": seconds, "anchors": per_anchor}
+    check = None
     if store:
         with LOCK:
-            SCENE.setdefault("calibration", {}).setdefault("points", []).append(point)
+            pts = SCENE.setdefault("calibration", {}).setdefault("points", [])
+            pts.append(point)
             save_scene()
-    return jsonify({"ok": True, "stored": store, "point": point,
+            # how it agrees with the points before it: shown at once in Setup
+            check = calib.check_point(pts, len(pts) - 1, _scene_anchors())
+    return jsonify({"ok": True, "stored": store, "point": point, "check": check,
                     "position": position_stats(job["est"], x, y)})
 
 
 @APP.route("/api/v1/calibration/apply", methods=["POST"])
 def api_calibration_apply():
-    """Fit the per-anchor range correction from the stored points.
-
-    measured = scale * true + bias. With points spread over >= 1 m of distance
-    both are fitted (least squares); otherwise bias only (scale = 1).
-    """
+    """Fit the per-anchor range correction from the stored points, safely
+    (server/calibration.py): noisy and inconsistent ranges are left out, a
+    scale only with 3+ consistent points, and the result is refused (409,
+    nothing changes) when it would not locate the points themselves well."""
     with LOCK:
         cal = SCENE.setdefault("calibration", {})
-        pts = cal.get("points") or []
-        by_anchor = {}
-        for p in pts:
-            for aid, a in (p.get("anchors") or {}).items():
-                by_anchor.setdefault(aid, []).append((a["true"], a["median"]))
-        fitted = {}
-        for aid, obs in by_anchor.items():
-            trues = [t for t, _ in obs]
-            if len(obs) >= 2 and max(trues) - min(trues) >= 1.0:
-                n = len(obs)
-                mt = sum(trues) / n
-                mm = sum(m for _, m in obs) / n
-                sxx = sum((t - mt) ** 2 for t in trues)
-                sxy = sum((t - mt) * (m - mm) for t, m in obs)
-                scale = min(max(sxy / sxx, 0.9), 1.1)
-                bias = mm - scale * mt
-            else:
-                scale = 1.0
-                bias = sum(m - t for t, m in obs) / len(obs)
-            resid = [m - (scale * t + bias) for t, m in obs]
-            fitted[aid] = {"bias": round(bias, 4), "scale": round(scale, 5),
-                           "points": len(obs),
-                           "residual_rms": round(math.sqrt(sum(r * r for r in resid) / len(resid)), 4)}
-        cal["anchors"] = fitted
+        res = calib.fit(cal.get("points") or [], _scene_anchors())
+        if res["refused"]:
+            return jsonify({"ok": False, **res}), 409
+        cal["anchors"] = res["anchors"]
         save_scene()
     configure_engine(reset=True)
-    return jsonify({"ok": True, "anchors": fitted})
+    return jsonify({"ok": True, **res})
+
+
+@APP.route("/api/v1/calibration/remove", methods=["POST"])
+def api_calibration_remove():
+    """Remove one stored point: {"point": n} (1 = the first one measured).
+    The correction in use does not change until Apply."""
+    body = request.get_json(silent=True) or {}
+    with LOCK:
+        pts = SCENE.setdefault("calibration", {}).setdefault("points", [])
+        try:
+            n = int(body["point"])
+        except (KeyError, TypeError, ValueError):
+            n = 0
+        if not 1 <= n <= len(pts):
+            return jsonify({"ok": False, "error": f"point must be 1..{len(pts)}"}), 400
+        pts.pop(n - 1)
+        save_scene()
+        return jsonify({"ok": True, "points": len(pts)})
 
 
 @APP.route("/api/v1/calibration/clear", methods=["POST"])
@@ -1663,8 +1722,13 @@ def main():
     ap.add_argument("--mqtt-port", type=int, default=1883)
     ap.add_argument("--mqtt-base", default="uwb/home")
     ap.add_argument("--mqtt", type=int, default=1, help="0 = disable mqtt")
+    ap.add_argument("--robust-round", type=int, choices=(0, 1), default=None,
+                    help="experimental: push the tag's robust ranging round (1 on, 0 off); "
+                         "not given = not pushed, nodes keep their own setting")
     args = ap.parse_args()
 
+    global ROBUST_ROUND
+    ROBUST_ROUND = None if args.robust_round is None else bool(args.robust_round)
     cfg["port"] = args.port
     cfg["token"] = args.token
     cfg["mqtt"]["host"] = args.mqtt_host

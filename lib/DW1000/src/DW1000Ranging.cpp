@@ -52,6 +52,14 @@ volatile byte    DW1000RangingClass::_expectedMsgId;
 volatile boolean DW1000RangingClass::_useRangeFilter = false;
 uint16_t DW1000RangingClass::_rangeFilterValue = 15;
 
+// robust round (tag), off by default
+boolean  DW1000RangingClass::_robustRound = false;
+boolean  DW1000RangingClass::_roundOpen   = false;
+uint32_t DW1000RangingClass::_pollSentMs  = 0;
+boolean  DW1000RangingClass::_ackedThisRound[MAX_DEVICES];
+uint8_t  DW1000RangingClass::_ackMs[MAX_DEVICES];
+uint16_t DW1000RangingClass::_ackLate = 0;
+
 // message sent/received state
 volatile boolean DW1000RangingClass::_sentAck     = false;
 volatile boolean DW1000RangingClass::_receivedAck = false;
@@ -383,7 +391,29 @@ void DW1000RangingClass::loop() {
 		timer = time;
 		timerTick();
 	}
-	
+
+	// robust round: every POLL_ACK slot has passed and the last anchor did not
+	// answer -> RANGE to the anchors that did, instead of losing the round.
+	// Slot i answers (2i+1) reply delays after the anchor's loop handled the
+	// POLL, the last one after 2N-1. An anchor busy in its loop (OLED, WiFi)
+	// answers later, so wait until 2N+1 plus 15 ms: with 4 anchors 78 ms,
+	// which still leaves the reports time before the next POLL (164 ms).
+	// A received frame not handled yet goes first.
+	if(_robustRound && _type == TAG && _roundOpen && _expectedMsgId == POLL_ACK && !_receivedAck) {
+		uint32_t deadline = (uint32_t)(2 * _networkDevicesNumber + 1) * DEFAULT_REPLY_DELAY_TIME / 1000 + 15;
+		if(millis() - _pollSentMs > deadline) {
+			_roundOpen = false;
+			boolean any = false;
+			for(uint8_t i = 0; i < _networkDevicesNumber; i++) {
+				any |= _ackedThisRound[i];
+			}
+			if(any) {
+				_expectedMsgId = RANGE_REPORT;
+				transmitRange(nullptr);
+			}
+		}
+	}
+
 	if(_sentAck) {
 		_sentAck = false;
 		
@@ -631,6 +661,14 @@ void DW1000RangingClass::loop() {
 			else if(_type == TAG) {
 				// get message and parse
 				if(messageType != _expectedMsgId) {
+					// robust round: a POLL_ACK after the deadline is too late
+					// for this round, but the anchor is alive. Without this it
+					// was dropped after 1 s and needed a new BLINK to come back.
+					if(_robustRound && messageType == POLL_ACK) {
+						myDistantDevice->noteActivity();
+						noteAckTime(myDistantDevice);
+						_ackLate++;
+					}
 					// unexpected message, start over again
 					//not needed ?
 					return;
@@ -641,9 +679,14 @@ void DW1000RangingClass::loop() {
 					DW1000.getReceiveTimestamp(myDistantDevice->timePollAckReceived);
 					//we note activity for our device:
 					myDistantDevice->noteActivity();
-					
+					if(myDistantDevice->getIndex() < MAX_DEVICES) {
+						_ackedThisRound[myDistantDevice->getIndex()] = true;
+					}
+					noteAckTime(myDistantDevice);
+
 					//in the case the message come from our last device:
 					if(myDistantDevice->getIndex() == _networkDevicesNumber-1) {
+						_roundOpen = false;
 						_expectedMsgId = RANGE_REPORT;
 						//and transmit the next message (range) of the ranging protocole (in broadcast)
 						transmitRange(nullptr);
@@ -688,6 +731,35 @@ void DW1000RangingClass::loop() {
 
 void DW1000RangingClass::useRangeFilter(boolean enabled) {
 	_useRangeFilter = enabled;
+}
+
+void DW1000RangingClass::useRobustRound(boolean enabled) {
+	_robustRound = enabled;
+	_roundOpen   = false;
+}
+
+void DW1000RangingClass::noteAckTime(DW1000Device* device) {
+	uint32_t ms = millis() - _pollSentMs;
+	uint8_t i = device->getIndex();
+	uint8_t v = ms > 255 ? 255 : (ms < 1 ? 1 : (uint8_t)ms);
+	if(i < MAX_DEVICES && v > _ackMs[i]) {
+		_ackMs[i] = v;                       // the latest since the last read, at most
+	}
+}
+
+uint8_t DW1000RangingClass::takeAckMs(uint8_t i) {
+	if(i >= MAX_DEVICES) {
+		return 0;
+	}
+	uint8_t v = _ackMs[i];
+	_ackMs[i] = 0;
+	return v;
+}
+
+uint16_t DW1000RangingClass::takeAckLate() {
+	uint16_t v = _ackLate;
+	_ackLate = 0;
+	return v;
 }
 
 void DW1000RangingClass::setRangeFilterValue(uint16_t newValue) {
@@ -809,7 +881,14 @@ void DW1000RangingClass::transmitPoll(DW1000Device* myDistantDevice) {
 		data[SHORT_MAC_LEN]   = POLL;
 		//we enter the number of devices
 		data[SHORT_MAC_LEN+1] = _networkDevicesNumber;
-		
+
+		// a new round: nobody has answered yet
+		for(uint8_t i = 0; i < MAX_DEVICES; i++) {
+			_ackedThisRound[i] = false;
+		}
+		_pollSentMs = millis();
+		_roundOpen  = true;
+
 		for(uint8_t i = 0; i < _networkDevicesNumber; i++) {
 			//each devices have a different reply delay time.
 			_networkDevices[i].setReplyTime((2*i+1)*DEFAULT_REPLY_DELAY_TIME);
@@ -865,26 +944,32 @@ void DW1000RangingClass::transmitRange(DW1000Device* myDistantDevice) {
 		byte shortBroadcast[2] = {0xFF, 0xFF};
 		_globalMac.generateShortMACFrame(data, _currentShortAddress, shortBroadcast);
 		data[SHORT_MAC_LEN]   = RANGE;
-		//we enter the number of devices
-		data[SHORT_MAC_LEN+1] = _networkDevicesNumber;
-		
+
 		// delay sending the message and remember expected future sent timestamp
 		DW1000Time deltaTime     = DW1000Time(DEFAULT_REPLY_DELAY_TIME, DW1000Time::MICROSECONDS);
 		DW1000Time timeRangeSent = DW1000.setDelay(deltaTime);
-		
+
+		// robust round: only the anchors that answered THIS round's POLL; the
+		// others would get last round's POLL_ACK timestamp (a garbage range)
+		uint8_t n = 0;
 		for(uint8_t i = 0; i < _networkDevicesNumber; i++) {
+			if(_robustRound && !_ackedThisRound[i]) {
+				continue;
+			}
 			//we write the short address of our device:
-			memcpy(data+SHORT_MAC_LEN+2+17*i, _networkDevices[i].getByteShortAddress(), 2);
-			
-			
+			memcpy(data+SHORT_MAC_LEN+2+17*n, _networkDevices[i].getByteShortAddress(), 2);
+
+
 			//we get the device which correspond to the message which was sent (need to be filtered by MAC address)
 			_networkDevices[i].timeRangeSent = timeRangeSent;
-			_networkDevices[i].timePollSent.getTimestamp(data+SHORT_MAC_LEN+4+17*i);
-			_networkDevices[i].timePollAckReceived.getTimestamp(data+SHORT_MAC_LEN+9+17*i);
-			_networkDevices[i].timeRangeSent.getTimestamp(data+SHORT_MAC_LEN+14+17*i);
-			
+			_networkDevices[i].timePollSent.getTimestamp(data+SHORT_MAC_LEN+4+17*n);
+			_networkDevices[i].timePollAckReceived.getTimestamp(data+SHORT_MAC_LEN+9+17*n);
+			_networkDevices[i].timeRangeSent.getTimestamp(data+SHORT_MAC_LEN+14+17*n);
+			n++;
 		}
-		
+		//we enter the number of devices
+		data[SHORT_MAC_LEN+1] = n;
+
 		copyShortAddress(_lastSentToShortAddress, shortBroadcast);
 		
 	}

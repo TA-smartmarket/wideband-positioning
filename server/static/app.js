@@ -18,7 +18,7 @@ const S = {
   trail: {},
   showTrail: true,
   showRings: true,          // measured range circle per anchor
-  showCoords: false,        // drop line + floor cross + X / Y under each tag
+  showCoords: true,         // drop line + floor cross + X / Y under each tag
   autoSpin: false,
 };
 
@@ -362,7 +362,7 @@ function isTyping() {
 function bindKeyboard() {
   addEventListener('keydown', (e) => {
     lastInteraction = performance.now();
-    if (isTyping()) return;
+    if (isTyping() || e.ctrlKey || e.metaKey) return;   // Ctrl+S saves, not "move back"
     const k = e.key.toLowerCase();
     if (['w', 'a', 's', 'd', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft',
          'arrowright', 'pageup', 'pagedown', 'shift'].includes(k)) {
@@ -2019,6 +2019,8 @@ async function poll() {
     cueTransitions();
     if (S.selected?.type === 'tag') showSelection();
     updateFog();
+    showDirty();
+    renderAnchorTable();
   } catch (e) { /* server restarting */ }
 }
 
@@ -2065,6 +2067,41 @@ function syncRoomInputs() {
   $('r-d').value = S.scene.room.depth.toFixed(2);
   $('r-h').value = S.scene.room.height.toFixed(2);
   $('r-tz').value = (S.scene.tag_z ?? 1.3).toFixed(2);
+  renderAnchorTable();
+}
+
+// Setup -> Room & anchors: every anchor's X / Y / Z, edited in place. The
+// rows are rebuilt only when anchors are added or removed; otherwise the
+// values are refreshed (a field being typed in is left alone), so dragging an
+// anchor in the 3D view shows up here too.
+function renderAnchorTable() {
+  const host = $('anc-table');
+  if (!host) return;
+  const ids = S.scene.anchors.map((a) => a.id).join(',');
+  if (host.dataset.ids !== ids) {
+    host.dataset.ids = ids;
+    $('anc-summary').textContent = `Anchor positions (${S.scene.anchors.length})`;
+    host.innerHTML = S.scene.anchors.length
+      ? '<tr><th>Anchor</th><th>X</th><th>Y</th><th>Z</th></tr>' + S.scene.anchors.map((a) =>
+        `<tr><td>${esc(a.label || a.id)}</td>` + ['x', 'y', 'z'].map((k) =>
+          `<td><input type="number" step="0.01" data-aid="${esc(a.id)}" data-k="${k}"></td>`).join('') + '</tr>').join('')
+      : '<tr><td class="muted">No anchors yet: add them in the 3D view (Anchor button).</td></tr>';
+    host.querySelectorAll('input').forEach((inp) => {
+      inp.onchange = () => {
+        const a = S.scene.anchors.find((x) => x.id === inp.dataset.aid);
+        const v = parseFloat(inp.value);
+        if (!a || !Number.isFinite(v)) return;
+        a[inp.dataset.k] = v;
+        setDirty();
+        rebuildAll();
+      };
+    });
+  }
+  host.querySelectorAll('input').forEach((inp) => {
+    if (document.activeElement === inp) return;
+    const a = S.scene.anchors.find((x) => x.id === inp.dataset.aid);
+    if (a) inp.value = (+a[inp.dataset.k] || 0).toFixed(2);
+  });
 }
 
 /* ------------------------------------------------------------------ motion
@@ -2121,8 +2158,15 @@ function busy(btn, on) {
   btn.setAttribute('aria-busy', on ? 'true' : 'false');
 }
 
-function setDirty() { S.dirty = true; $('save').classList.add('dirty'); }
-function setSaved() { $('save').classList.remove('dirty'); }
+function setDirty() { S.dirty = true; showDirty(); }
+function setSaved() { S.dirty = false; showDirty(); }
+// The Save button sits under the room & anchor fields; the bar at the bottom
+// of the panel appears on every tab while something is unsaved (an anchor
+// dragged in the 3D view, too).
+function showDirty() {
+  $('save').classList.toggle('dirty', !!S.dirty);
+  $('unsaved').hidden = !S.dirty;
+}
 
 let toastTimer = null;
 function toast(msg) {
@@ -2282,9 +2326,9 @@ function setTab(name) {
       stagger(s);
     }
   });
-  if (name === 'devices') renderDevices();
+  if (name === 'devices') { renderDevices(); otaWatch(); }
   if (name === 'api') renderApi();
-  if (name === 'setup') { loadOta(); loadCal(); loadRec(); loadTracking(); loadScreenPolicy(); }
+  if (name === 'setup') { loadOta(); loadCal(); loadRec(); loadTracking(); loadScreenPolicy(); otaWatch(); }
 }
 
 /* ==========================================================================
@@ -2308,9 +2352,11 @@ async function renderDevices() {
         <div class="name">${esc(d.id)} <span class="pill">${esc(d.role || '')}</span></div>
         <div class="ip">${esc(d.ip || 'no ip yet')}</div>
         <div class="meta">${rssi} · fw ${esc(d.fw || '?')}</div>
+        ${o.progress ? (() => { const t = otaStageText(o.progress);
+          return `<div class="meta ${o.progress.stage === 'done' ? 'good' : (t.active ? 'warn' : 'bad')}">${t.icon} ${esc(t.text)} · ${t.secs} s</div>`; })() : ''}
       </div>
       <div class="spacer"></div>
-      <button data-ota="${esc(d.id)}" ${o.pending ? 'disabled' : ''} title="${o.pending ? 'Already waiting for ' + esc(o.pending) : 'Queue a firmware update for this device'}">${o.pending ? '⏳ Queued' : '⬆ Update'}</button>
+      <button data-ota="${esc(d.id)}" ${o.pending ? 'disabled' : ''} title="${o.pending ? 'Already waiting for ' + esc(o.pending) : 'Update the firmware of this device'}">${o.pending ? '⏳ Updating' : '⬆ Update'}</button>
       ${o.pending ? `<button data-cancel="${esc(d.id)}" title="Cancel the queued update">✕</button>` : ''}
       <button data-key="${esc(d.id)}" title="Show / rotate the OTA key">🔑</button>
     </div>`;
@@ -2345,7 +2391,7 @@ async function renderDevices() {
    ========================================================================== */
 function showTracking(d) {
   $('trk-smooth').checked = !!d.smooth;
-  $('trk-status').textContent = 'EKF + zero-velocity mode + long-range rejection (fixed). Range offsets: '
+  $('trk-status').textContent = 'CALF-UWB: EKF + zero-velocity mode + long-range rejection (fixed). Range offsets: '
     + (d.calibrated ? 'from the static calibration.'
                     : 'learned while the trolley moves (no calibration applied yet).');
 }
@@ -2381,69 +2427,133 @@ function calTable(cal) {
   const a = cal?.anchors || {};
   const rows = Object.entries(a).map(([id, c]) =>
     `<tr><td>${esc(id)}</td><td>${cm(c.bias)}</td><td>${(c.scale ?? 1).toFixed(4)}</td><td>${c.points ?? '—'}</td></tr>`).join('');
-  const pts = (cal?.points || []).length;
-  return (rows ? `<table class="kv"><tr><th>Anchor</th><th class="tip" title="${esc(TIP.calOffset)}">Offset</th>`
+  return rows ? `<table class="kv"><tr><th>Anchor</th><th class="tip" title="${esc(TIP.calOffset)}">Offset</th>`
                 + `<th class="tip" title="${esc(TIP.calScale)}">Scale</th><th>Pts</th></tr>${rows}</table>`
-               : '<p class="muted">No calibration applied.</p>') +
-         `<p class="muted">${pts} stored point(s).</p>`;
+              : '';
+}
+
+// The stored points, each with what Apply would do with it (the server's dry
+// run, server/calibration.py), then whether Apply would be accepted.
+function calPoints(cal, review) {
+  const pts = cal?.points || [];
+  if (!pts.length) return '<p class="muted">No calibration points yet.</p>';
+  const drops = {}, errs = {};
+  for (const d of review?.dropped || []) (drops[d.point] = drops[d.point] || []).push(`${d.anchor}: ${d.reason}`);
+  for (const c of review?.check || []) errs[c.point] = c;
+  const list = pts.map((p, i) => {
+    const n = i + 1, c = errs[n], dr = drops[n] || [];
+    const err = c && c.error !== null && c.error !== undefined
+      ? ` · <span class="${c.error > 0.10 ? 'warn' : 'good'}">${(c.error * 100).toFixed(1)} cm</span>` : '';
+    return `<div class="calpt"><span class="n">${n}</span><div class="what">` +
+      `<span class="xy">(${p.x.toFixed(2)}, ${p.y.toFixed(2)})</span>${err}` +
+      (dr.length ? `<ul>${dr.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : '') +
+      `</div><button data-rm="${n}" title="Remove this point">✕</button></div>`;
+  }).join('');
+  const ok = review && !(review.refused || []).length;
+  const warn = (review?.warnings || []).map((w) => `<li>${esc(w)}</li>`).join('');
+  const verdict = ok
+    ? `<div class="verdict good">✓ Ready to apply (${pts.length} point${pts.length === 1 ? '' : 's'}).` +
+      (warn ? `<ul>${warn}</ul>` : '') + '</div>'
+    : `<div class="verdict bad">✗ Apply would be refused:<ul>` +
+      (review?.refused || []).map((r) => `<li>${esc(r)}</li>`).join('') + '</ul></div>';
+  return `<p class="muted" style="margin:0 0 2px">Stored points · cm = how far the position there would be with the other points' correction</p>` +
+    list + verdict;
 }
 
 async function loadCal() {
   try {
     const d = await (await fetch('/api/v1/calibration')).json();
-    $('cal-result').innerHTML = calTable(d.calibration);
+    const applied = calTable(d.calibration);
+    $('cal-points').innerHTML = calPoints(d.calibration, d.review) +
+      (applied ? `<p class="muted" style="margin:10px 0 2px">Correction in use</p>${applied}`
+               : '<p class="muted" style="margin-top:8px">No correction in use: offsets are learned.</p>');
+    $('cal-points').querySelectorAll('[data-rm]').forEach((b) => {
+      b.onclick = async () => {
+        await fetch('/api/v1/calibration/remove', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ point: +b.dataset.rm }) });
+        $('cal-result').textContent = '';
+        loadCal();
+      };
+    });
   } catch (e) { /* offline */ }
 }
 
-async function calMeasure() {
-  const x = parseFloat($('cal-x').value), y = parseFloat($('cal-y').value);
+// Collect at a measured spot. store=true: a calibration point; false: an
+// accuracy test only.
+async function collectAt(x, y, store, btn, out) {
   const seconds = parseFloat($('cal-sec').value) || 15;
-  if (!Number.isFinite(x) || !Number.isFinite(y)) { toast('Enter the measured X and Y first.'); return; }
-  const btn = $('cal-measure');
+  if (!Number.isFinite(x) || !Number.isFinite(y)) { toast('Enter the measured X and Y first.'); return null; }
   btn.disabled = true;
-  $('cal-result').innerHTML = `<p>Collecting for ${seconds} s — keep the tag still…</p>`;
+  out.innerHTML = `<p>Measuring for ${seconds} s — keep the tag still and step away…</p>`;
   try {
     const r = await fetch('/api/v1/calibration/point', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ x, y, seconds, store: $('cal-store').checked }),
+      body: JSON.stringify({ x, y, seconds, store }),
     });
     const d = await r.json();
-    if (!d.ok) { $('cal-result').textContent = d.error || 'failed'; Audio2.error(); return; }
-    const rows = Object.entries(d.point.anchors).map(([id, a]) =>
-      `<tr><td>${esc(id)}</td><td>${a.n}</td><td>${a.true.toFixed(3)}</td><td>${a.median.toFixed(3)}</td><td>${cm(a.error)}</td><td>${cm(a.std)}</td></tr>`).join('');
-    const p = d.position;
-    $('cal-result').innerHTML =
-      `<table class="kv"><tr><th>Anchor</th><th>n</th><th title="Distance from the X/Y you entered to the anchor (3D)">True</th>`
-      + `<th title="Median measured range">Measured</th><th title="Measured − true">Error</th>`
-      + `<th title="Spread of the measured ranges (1σ)">Spread</th></tr>${rows}</table>` +
-      (p ? `<table class="kv" style="margin-top:6px">
-        <tr><td>Mean position</td><td>${p.mean_x.toFixed(3)}, ${p.mean_y.toFixed(3)} m</td></tr>
-        <tr><td class="tip" title="${esc(TIP.meanErr)}">Accuracy (mean error)</td><td>${cm(p.mean_error)}</td></tr>
-        <tr><td class="tip" title="${esc(TIP.spread)}">Precision (spread, 1σ)</td><td>${cm(p.std)}</td></tr>
-        <tr><td class="tip" title="${esc(TIP.rmse)}">RMSE / CEP50 / CEP95</td><td>${cm(p.rmse)} / ${cm(p.cep50)} / ${cm(p.cep95)}</td></tr>
-      </table>` : '<p class="muted">No position estimates during the window.</p>') +
-      (p && p.mean_error > 1.0 ? `<p class="bad" style="font-size:12px">⚠ Error above 1 m. Check that X / Y is where the TAG
-        stands, measured from anchor A2 at (0, 0) — not an anchor's own position.</p>` : '') +
-      `<p class="muted">${d.stored ? 'Stored as a calibration point — press Apply when done.' : 'Accuracy test only (not stored).'}</p>`;
-    Audio2.success();
+    if (!d.ok) { out.textContent = d.error || 'failed'; Audio2.error(); return null; }
+    return d;
   } catch (e) {
-    $('cal-result').textContent = 'Server unreachable.';
+    out.textContent = 'Server unreachable.';
+    return null;
   } finally {
     btn.disabled = false;
   }
 }
 
+async function calMeasure() {
+  const out = $('cal-result');
+  const d = await collectAt(parseFloat($('cal-x').value), parseFloat($('cal-y').value), true, $('cal-measure'), out);
+  if (!d) return;
+  const w = d.check?.warnings || [];
+  out.innerHTML = w.length
+    ? `<div class="verdict bad">⚠ Point added, but:<ul>${w.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` +
+      'Measure it again (✕ removes it), or add another point to tell which one is wrong.</div>'
+    : `<div class="verdict good">✓ Point added${d.check?.first ? ' (the first one: the next points are checked against it)' : ': consistent with the earlier points'}.</div>`;
+  if (w.length) Audio2.error(); else Audio2.success();
+  loadCal();
+}
+
+async function accTest() {
+  const out = $('acc-result');
+  const d = await collectAt(parseFloat($('acc-x').value), parseFloat($('acc-y').value), false, $('acc-test'), out);
+  if (!d) return;
+  const p = d.position;
+  out.innerHTML = p ? `<table class="kv">
+      <tr><td>Mean position</td><td>${p.mean_x.toFixed(3)}, ${p.mean_y.toFixed(3)} m</td></tr>
+      <tr><td class="tip" title="${esc(TIP.meanErr)}">Accuracy (mean error)</td><td>${cm(p.mean_error)}</td></tr>
+      <tr><td class="tip" title="${esc(TIP.spread)}">Precision (spread, 1σ)</td><td>${cm(p.std)}</td></tr>
+      <tr><td class="tip" title="${esc(TIP.rmse)}">RMSE / CEP50 / CEP95</td><td>${cm(p.rmse)} / ${cm(p.cep50)} / ${cm(p.cep95)}</td></tr>
+    </table>` + (p.mean_error > 1.0 ? '<p class="bad">⚠ More than 1 m off: is X / Y measured from the (0, 0) corner of the floor plan?</p>' : '')
+    : '<p class="muted">No position estimates during the window.</p>';
+  Audio2.success();
+}
+
 async function calApply() {
-  const d = await (await fetch('/api/v1/calibration/apply', { method: 'POST' })).json();
-  toast(d.ok ? `Calibration applied to ${Object.keys(d.anchors).length} anchor(s).` : 'Apply failed.');
+  const r = await fetch('/api/v1/calibration/apply', { method: 'POST' });
+  const d = await r.json();
+  if (d.ok) {
+    const dropped = (d.dropped || []).length;
+    $('cal-result').innerHTML = `<div class="verdict good">✓ Calibration applied to ${Object.keys(d.anchors).length} anchors` +
+      (dropped ? `, ${dropped} range(s) left out` : '') + '.</div>';
+    toast('Calibration applied.');
+    Audio2.success();
+  } else {
+    $('cal-result').innerHTML = '<div class="verdict bad">✗ Not applied — nothing changed:<ul>' +
+      (d.refused || [d.error || 'failed']).map((t) => `<li>${esc(t)}</li>`).join('') + '</ul></div>';
+    toast('Calibration refused.');
+    Audio2.error();
+  }
   loadCal();
   loadTracking();
 }
 
 async function calClear() {
-  if (!confirm('Forget every calibration point and correction?')) return;
+  if (!confirm('Remove every calibration point and the correction in use?')) return;
   await fetch('/api/v1/calibration/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   toast('Calibration cleared.');
+  $('cal-result').textContent = '';
   loadCal();
   loadTracking();
 }
@@ -2522,7 +2632,7 @@ async function pushOta(deviceId) {
   otaRequestInFlight = true;
 
   const who = deviceId === 'all' ? 'all devices' : deviceId;
-  if (!confirm(`Queue ${name} for ${who}?\n\nThe device installs it on its next check (within ~1 min) and reboots.\nNothing is downloaded until you confirm.`)) {
+  if (!confirm(`Update ${who} to ${name}?\n\nEach node picks it up on its next check (within about a minute), installs it and restarts.\nProgress is shown under the button.`)) {
     otaRequestInFlight = false;
     return;
   }
@@ -2544,8 +2654,7 @@ async function pushOta(deviceId) {
       if (sk.length) parts.push(`<span class="warn">not newer: ${sk.join(', ')}</span>`);
       $('ota-result').innerHTML = parts.join('<br>') ||
         'Nothing to do — the device already runs this image.';
-      toast(q.length ? `Queued on ${q.length} device(s) — installs within a minute.`
-                     : 'Already queued / nothing to do.');
+      toast(q.length ? `Update started on ${q.length} device(s).` : 'Already queued / nothing to do.');
       Audio2.update();
     }
   } catch (e) {
@@ -2556,6 +2665,7 @@ async function pushOta(deviceId) {
     setOtaBusy(false);
     renderDevices();          // reflect the new pending state right away
     loadOta();
+    otaWatch();               // live progress until every node is done
   }
 }
 
@@ -2565,13 +2675,57 @@ function setOtaBusy(busy, label) {
     const b = $(id);
     if (!b) continue;
     b.disabled = busy;
-    b.textContent = busy ? '⏳ Working…' : '⬆ Queue update for all';
+    b.textContent = busy ? '⏳ Working…' : '⬆ Update all online';
   }
   document.querySelectorAll('[data-ota]').forEach((b) => { b.disabled = busy; });
   if (busy && label) $('ota-result').textContent = label;
 }
 
 let otaRequestInFlight = false;
+
+/* Firmware update progress (server: OTA_PROGRESS in app.py). A node checks
+   for its update once a minute, downloads it, restarts and reports the new
+   version; until then nothing on the page used to change. */
+const OTA_ACTIVE = ['waiting', 'downloading', 'restarting'];
+function otaStageText(p) {
+  const s = Math.max(0, Math.round((Date.now() - (p.requested || Date.now())) / 1000));
+  const t = {
+    waiting: ['⏳', 'waiting for the node (it checks once a minute)'],
+    downloading: ['⬇', 'downloading the image'],
+    restarting: ['↻', 'installing and restarting'],
+    done: ['✓', `now runs ${p.version}`],
+    failed: ['✗', `failed: ${p.error || 'unknown'}`],
+    'no-response': ['✗', `no answer (${p.error || 'timeout'}): check the node`],
+  }[p.stage] || ['?', p.stage];
+  return { icon: t[0], text: t[1], secs: s, active: OTA_ACTIVE.includes(p.stage) };
+}
+
+let otaWatchTimer = null;
+async function otaWatch() {
+  clearTimeout(otaWatchTimer);
+  let info;
+  try { info = await (await fetch('/api/v1/ota')).json(); } catch (e) { otaWatchTimer = setTimeout(otaWatch, 3000); return; }
+  const rows = (info.devices || []).filter((d) => d.progress);
+  const active = rows.filter((d) => OTA_ACTIVE.includes(d.progress.stage));
+  if (rows.length) {
+    $('ota-result').innerHTML = rows.map((d) => {
+      const t = otaStageText(d.progress);
+      const cls = d.progress.stage === 'done' ? 'good' : (t.active ? '' : 'bad');
+      return `<div class="otarow"><span class="${cls}">${t.icon} ${esc(d.id)}: ${esc(t.text)}</span>` +
+             `<span class="t">${t.secs} s</span></div>`;
+    }).join('');
+  }
+  if (document.querySelector('[data-panel="devices"]:not([hidden])')) renderDevices();
+  if (active.length) {
+    otaWatchTimer = setTimeout(otaWatch, 2000);
+  } else if (rows.length && otaWatch.wasActive) {
+    const ok = rows.filter((d) => d.progress.stage === 'done').length;
+    toast(ok === rows.length ? `Firmware updated on ${ok} device(s).` : `Update finished: ${ok} of ${rows.length} done.`);
+    if (ok === rows.length) Audio2.success(); else Audio2.error();
+    loadOta();
+  }
+  otaWatch.wasActive = active.length > 0;
+}
 
 // Cancel a queued update.
 async function cancelOta(deviceId) {
@@ -2838,8 +2992,14 @@ function initUi() {
       syncRoomInputs();
     };
   });
-  $('save').onclick = async () => { busy($('save'), true); try { await saveScene(); } finally { busy($('save'), false); } };
-  $('reload').onclick = async () => { busy($('reload'), true); try { await loadScene(); } finally { busy($('reload'), false); } };
+  for (const id of ['save', 'save-bar']) {
+    $(id).onclick = async () => { busy($(id), true); try { await saveScene(); } finally { busy($(id), false); } };
+  }
+  $('reload').onclick = async () => {
+    if (S.dirty && !confirm('Throw away the unsaved floor-plan changes?')) return;
+    busy($('reload'), true);
+    try { await loadScene(); setSaved(); } finally { busy($('reload'), false); }
+  };
   $('trail').onchange = (e) => { S.showTrail = e.target.checked; buildTrail(); };
   $('rings').onchange = (e) => { S.showRings = e.target.checked; buildLinks(); };
   $('coords').onchange = (e) => { S.showCoords = e.target.checked; buildTags(); };
@@ -2865,12 +3025,21 @@ function initUi() {
   $('scr-on').onchange = applyScreenPolicy;
   $('trk-smooth').onchange = setSmooth;
   $('cal-measure').onclick = calMeasure;
+  $('acc-test').onclick = accTest;
   $('cal-apply').onclick = calApply;
   $('cal-clear').onclick = calClear;
   $('rec-toggle').onclick = recToggle;
   $('rec-mark').onclick = recMark;
 
   addEventListener('keydown', (e) => {
+    // One save for every place the floor plan is edited: the 3D view, the
+    // Inspector and the Setup table.
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      if (document.activeElement?.blur) document.activeElement.blur();   // commit a half-typed value
+      if (S.dirty) $('save-bar').click(); else toast('Nothing to save.');
+      return;
+    }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (document.activeElement.tagName !== 'INPUT') {
         if (S.selected) Audio2.remove();          // keyboard path has no click event

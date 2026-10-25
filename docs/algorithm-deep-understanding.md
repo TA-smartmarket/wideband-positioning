@@ -469,7 +469,7 @@ Kondisi anchor (`anchorStatus` di `app.js`):
 
 ## 11. Parameter dan cara mengulang
 
-Tabel ini adalah parameter **versi riset** (`tools/tracker_lab.py`, `LAB_DEFAULTS`; default = algoritma G). Server hanya menjalankan algoritma final K + G + Z + L dengan nilai tetap (`server/tracker.py` `PARAMS`, lihat [ALGORITHMS.md](ALGORITHMS.md#parameter-tetap)); satu-satunya pilihan di server adalah "Smooth the path".
+Tabel ini adalah parameter **versi riset** (`tools/tracker_lab.py`, `LAB_DEFAULTS`; default = algoritma G). Server hanya menjalankan algoritma final CALF-UWB (K + G + Z + L) dengan nilai tetap (`server/tracker.py` `PARAMS`, lihat [ALGORITHMS.md](ALGORITHMS.md#parameter-tetap)); satu-satunya pilihan di server adalah "Smooth the path".
 
 | Parameter | Default | Satuan | Keterangan |
 |---|---|---|---|

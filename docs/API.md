@@ -53,6 +53,9 @@ NVS and used until the server provides one.
 
 ### Field notes
 - `position` — anchor placement in metres, origin at room corner (0,0).
+- `uwb.robust_round` — optional, firmware ≥ 1.0.36 (use ≥ 1.0.37), experimental (tag only).
+  Sent only when the server runs with `--robust-round 0|1`; otherwise a node
+  keeps its own setting (default off). See `docs/riset/RISET_LANJUTAN.md`.
   Ignored for tags. **This is what makes corner placement configurable.**
 - `room` — used by the solver to disambiguate the 2-anchor mirror solution
   (pick the intersection that falls inside the room).
@@ -148,10 +151,16 @@ required on `/api/v1/*` **only if** the server was started with a token.
 | `GET`  | `/api/v1/devices` | List known devices + last seen |
 | `PUT`  | `/api/v1/config` | Web UI writes config for a device |
 | `POST` | `/api/v1/position` | Current tracker estimate of every tag (debug) |
-| `GET`  | `/api/v1/calibration` | Stored calibration points + per-anchor correction |
-| `POST` | `/api/v1/calibration/point` | `{"x","y","seconds":15,"store":true}` — tag held still on a measured spot; returns range error per anchor + position error (mean error, σ, RMSE, CEP50/95). Blocks for `seconds` |
-| `POST` | `/api/v1/calibration/apply` | Fit `measured = scale·true + bias` per anchor from the stored points |
-| `POST` | `/api/v1/calibration/clear` | Forget points and/or corrections |
+| `GET`  | `/api/v1/calibration` | Stored calibration points + per-anchor correction in use, and `review`: what Apply would do now (dry run, same shape as the Apply reply; `null` with no points) |
+| `POST` | `/api/v1/calibration/point` | `{"x","y","seconds":15,"store":true}` — tag held still on a measured spot; returns range error per anchor + position error (mean error, σ, RMSE, CEP50/95). Blocks for `seconds`. With `store` the reply also has `check` = `{"warnings":[…], "anchors":{id:[…]}, "first"}`: how the new point agrees with the earlier ones (and with its own measured position) |
+| `POST` | `/api/v1/calibration/apply` | Fit `measured = scale·true + bias` per anchor from the stored points, safely: noisy (> 10 cm spread) and inconsistent (> 10 cm from the others) ranges left out, a scale only with ≥ 3 consistent points spread ≥ 1 m. Reply `{"ok","anchors","dropped":[{point,anchor,reason}],"check":[{point,error,without}],"warnings","refused"}`; `check` = each point located with the correction from the other points vs. without calibration. Refused → `409`, nothing changes (2 points that disagree, a point > 15 cm off, or no better than without calibration) |
+| `POST` | `/api/v1/calibration/remove` | `{"point": n}` (1 = first measured) — drop one stored point; the correction in use changes only on the next Apply |
+| `POST` | `/api/v1/calibration/clear` | `{"points":true,"anchors":true}` (both by default) — forget points and/or corrections |
+| `GET`  | `/api/v1/ota` | Devices that can be updated (`id, role, online, ip, fw, key, pending, progress`) and the images in `server/firmware/` (newest first). `progress` = `{"stage","firmware","version","requested","since","error"}` (times in ms) or `null`; stages: `waiting` (queued, the node checks once a minute) → `downloading` → `restarting` → `done` (it reports the new version), or `failed` / `no-response` (no new version within 4 min) |
+| `POST` | `/api/v1/ota/request` | `{"device_id":"anchor-2"\|"all","firmware":"uwb-node-1.0.37.bin"}` queues an update (only forward, never a downgrade → `409`); `{"device_id",…,"cancel":true}` cancels it |
+| `GET`  | `/api/v1/ota/check` | Device side: `?device=&key=` → `{"update":bool,"url","version"}`; an image is served only when one was requested |
+| `GET`  | `/api/v1/ota/firmware/<name>` | Device side: download the image |
+| `POST` | `/api/v1/ota/ack` | Device side: `{"device","key","ok","error"}` outcome of a download |
 | `GET`/`PUT` | `/api/v1/tracking` | The algorithm is fixed; its one setting is "smooth the path". `GET` → `{"ok", "smooth", "calibrated", "params"}` (`calibrated`: every anchor has a calibration entry, so the offsets come from it instead of being learned; `params`: the fixed values, read-only). `PUT {"smooth": true\|false}` switches the smoothing and is stored in the scene; any other key → `400` |
 | `GET`  | `/api/v1/record` | Recorder status + recorded sessions |
 | `POST` | `/api/v1/record/start` | `{"name","note"}` — record every packet + estimate to `server/logs/*.jsonl` |
@@ -230,7 +239,9 @@ not pick a room-interior solution — the position is a mirror guess.
 
 ## 7. Localisation rules (server)
 
-Implemented in `server/tracker.py`; the reasoning and the before/after
+Implemented in `server/tracker.py` — the algorithm is **CALF-UWB**
+(*Correction-Aware Layered Filter for UWB Indoor Positioning*, details in
+`docs/ALGORITHMS.md`); the reasoning and the before/after
 evidence are in `docs/PERBAIKAN_AKURASI.md`.
 
 1. **Each sample once, at its own time.** Samples are deduplicated per
@@ -268,9 +279,7 @@ evidence are in `docs/PERBAIKAN_AKURASI.md`.
    **held** (`held: true`) instead of a guess from one or two anchors.
 8b. **Smooth the path** (the only setting, on by default) — the position
    reported is the mean of the last 3 filter outputs (never across a gap
-   > 4 s); off → the EKF output unchanged. Range and position windows from the
-   research (median/regression windows, the 20 × 20 mean) are not in the
-   server; they live in `tools/tracker_lab.py`.
+   > 4 s); off → the EKF output unchanged.
 9. `confidence = 1 / (1 + sigma)`, `sigma = sqrt(P00 + P11)`; the tag state
    also carries `range_bias` (the range offset b), `anchor_offsets` (dᵢ per
    anchor), `offset_warning` (anchors whose dᵢ exceeds 20 cm: their scene

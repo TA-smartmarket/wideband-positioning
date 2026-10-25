@@ -109,6 +109,20 @@ public:
 	static void useRangeFilter(boolean enabled);
 	// Used for the smoothing algorithm (Exponential Moving Average). newValue must be >= 2. Default 15.
 	static void setRangeFilterValue(uint16_t newValue);
+	// Tag only. Off (default): RANGE goes out when the LAST anchor's POLL_ACK
+	// arrives, to every known anchor -- one missing POLL_ACK from that anchor
+	// voids the round for all of them, and an anchor whose POLL_ACK was missed
+	// gets last round's timestamp (a garbage range). On: RANGE goes out to the
+	// anchors that answered this round, at the latest once every POLL_ACK slot
+	// has passed.
+	static void useRobustRound(boolean enabled);
+	static boolean robustRound() { return _robustRound; };
+	// Tag diagnostics: the slowest POLL_ACK of device i since the last call
+	// came this many ms after the broadcast POLL (both modes; 0 = none; read
+	// and cleared), and how many POLL_ACKs came after the robust deadline.
+	static uint8_t  takeAckMs(uint8_t i);
+	static uint16_t takeAckLate();
+	static DW1000Device* getNetworkDevice(uint8_t i) { return i < _networkDevicesNumber ? &_networkDevices[i] : nullptr; };
 	
 	//Handlers:
 	static void attachNewRange(void (* handleNewRange)(void)) { _handleNewRange = handleNewRange; };
@@ -172,6 +186,13 @@ private:
 	//ranging filter
 	static volatile boolean _useRangeFilter;
 	static uint16_t         _rangeFilterValue;
+	// robust round (see useRobustRound)
+	static boolean          _robustRound;
+	static boolean          _roundOpen;        // broadcast POLL sent, RANGE not yet
+	static uint32_t         _pollSentMs;       // millis() of that POLL
+	static boolean          _ackedThisRound[MAX_DEVICES];
+	static uint8_t          _ackMs[MAX_DEVICES];      // diagnostics, see takeAckMs
+	static uint16_t         _ackLate;
 	//_bias correction
 	static char  _bias_RSL[17]; // TODO remove or use
 	//17*2=34 bytes in SRAM
@@ -184,6 +205,7 @@ private:
 	static void handleSent();
 	static void handleReceived();
 	static void noteActivity();
+	static void noteAckTime(DW1000Device* device);
 	static void resetInactive();
 	
 	//global functions:

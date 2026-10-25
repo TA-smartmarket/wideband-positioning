@@ -81,78 +81,109 @@
 
     <!-- --------------------------------------------------------- SETUP -->
     <section data-panel="setup" hidden>
-      <p class="muted">Only what has to be measured in your room is set here:
-         the room, the anchor positions (click an anchor in the 3D view, or
-         drag it) and the tag height, then the calibration below. The tracking
-         algorithm itself is fixed.</p>
-      <h3>1 · Room <span class="pill">metres</span></h3>
-      <div class="row">
-        <label>Width (X)<input id="r-w" type="number" step="0.1" min="0.5"></label>
-        <label>Depth (Y)<input id="r-d" type="number" step="0.1" min="0.5"></label>
-      </div>
-      <label>Height (Z)<input id="r-h" type="number" step="0.1" min="0.5"></label>
-      <label title="Measure from the floor to the tag's antenna. Ranges are 3D, so a wrong height shifts every position.">Tag height above floor (m)
-        <input id="r-tz" type="number" step="0.05" min="0.05" max="3">
-      </label>
-      <p class="muted" style="margin:-4px 0 10px">Ranges are measured in 3D and
-         projected onto the floor, so a wrong tag height shifts every position.</p>
+      <ol class="steps">
+        <li><b>Room &amp; anchors</b> — measure, fill in, save.</li>
+        <li><b>Calibrate</b> — 3–4 measured spots, then Apply.</li>
+        <li><b>Check accuracy</b> — one more measured spot.</li>
+      </ol>
 
-      <h3 style="margin-top:16px">2 · Calibration &amp; static test</h3>
-      <p class="muted">Every DW1000 adds its own few centimetres to each range.
-         Put the tag still on a spot you measured with the laser meter (same
-         origin as the anchors, not on an anchor), enter its X/Y and press
-         Measure. Do this at 2–4 spots, then press Apply: the tracker then
-         takes each anchor's offset from the calibration instead of learning
-         it. To test the accuracy afterwards, untick "keep" and measure at
-         another spot.</p>
+      <h3>1 · Room &amp; anchors <span class="pill">metres</span></h3>
+      <ul class="points">
+        <li>(0, 0) = the corner anchor. X along one wall, Y along the other.</li>
+        <li>Measure with a tape; check both diagonals.</li>
+        <li>Heights: floor to the antenna.</li>
+      </ul>
       <div class="row">
-        <label>X (m)<input id="cal-x" type="number" step="0.01"></label>
-        <label>Y (m)<input id="cal-y" type="number" step="0.01"></label>
+        <label>Width X<input id="r-w" type="number" step="0.01" min="0.5"></label>
+        <label>Depth Y<input id="r-d" type="number" step="0.01" min="0.5"></label>
+        <label>Height<input id="r-h" type="number" step="0.01" min="0.5"></label>
+      </div>
+      <label title="Floor to the tag's antenna. Ranges are 3D, so a wrong height shifts every position.">Tag height
+        <input id="r-tz" type="number" step="0.01" min="0.05" max="3">
+      </label>
+      <details class="fold">
+        <summary id="anc-summary">Anchor positions</summary>
+        <table class="kv anchors" id="anc-table"></table>
+      </details>
+      <div class="row btns">
+        <button id="save" class="primary">💾 Save room &amp; anchors</button>
+        <button id="reload" title="Throw away unsaved changes and load the saved floor plan">↺ Undo changes</button>
+      </div>
+
+      <h3 style="margin-top:20px">2 · Calibrate</h3>
+      <ul class="points">
+        <li>Tag still on a spot you measured, ≥ 0.7 m from every anchor.</li>
+        <li>Enter its X, Y → <b>Add point</b>. Step away for 15 s.</li>
+        <li>3–4 points around the room → <b>Apply</b>.</li>
+      </ul>
+      <div class="row">
+        <label>Tag X<input id="cal-x" type="number" step="0.01"></label>
+        <label>Tag Y<input id="cal-y" type="number" step="0.01"></label>
         <label>Seconds<input id="cal-sec" type="number" min="3" max="120" step="1" value="15"></label>
       </div>
-      <label><input id="cal-store" type="checkbox" checked> Keep as calibration point
-        (untick for a pure accuracy test)</label>
       <div class="row btns">
-        <button id="cal-measure" class="primary">📍 Measure here</button>
-        <button id="cal-apply">Apply calibration</button>
-        <button id="cal-clear">Clear</button>
+        <button id="cal-measure" class="primary">📍 Add point</button>
       </div>
       <div id="cal-result" class="muted" style="margin-top:8px"></div>
+      <div id="cal-points" style="margin-top:8px"></div>
+      <div class="row btns">
+        <button id="cal-apply">✓ Apply calibration</button>
+        <button id="cal-clear" class="danger">Clear all</button>
+      </div>
 
-      <h3 style="margin-top:16px">3 · Tracker</h3>
+      <h3 style="margin-top:20px">3 · Check accuracy</h3>
+      <ul class="points">
+        <li>Tag on another measured spot (not a calibration point).</li>
+        <li>Shows how far the position is from it. Nothing is stored.</li>
+      </ul>
+      <div class="row">
+        <label>Tag X<input id="acc-x" type="number" step="0.01"></label>
+        <label>Tag Y<input id="acc-y" type="number" step="0.01"></label>
+      </div>
+      <div class="row btns">
+        <button id="acc-test" class="primary">🎯 Test here</button>
+      </div>
+      <div id="acc-result" class="muted" style="margin-top:8px"></div>
+
+      <h3 style="margin-top:20px">4 · Tracker</h3>
       <p class="muted" id="trk-status">Loading…</p>
-      <label title="Ticked: the position shown is the mean of the last 3 positions, so the path is smoother (about 3 times less stipple) but trails the trolley a little more while it drives (simulation: about 13 cm). Unticked: the tracker's own position, slightly more accurate while driving."><input id="trk-smooth" type="checkbox" checked> Smooth the path (mean of the last 3 positions)</label>
+      <label title="Ticked: the mean of the last 3 positions — a smoother line that trails the trolley a little more while it drives. Unticked: the tracker's own position."><input id="trk-smooth" type="checkbox" checked> Smooth the path</label>
 
-      <h3 style="margin-top:16px">View</h3>
-      <label title="The drawn trail uses the points before and after each point (±3), so the line is straighter than the live dot; the live position itself is not delayed."><input id="trail" type="checkbox" checked> Show movement trail</label>
-      <label title="One dashed circle per anchor: where the tag can be according to that anchor's measured range, to scale. Where the circles meet is the position."><input id="rings" type="checkbox" checked> Show measured range circles</label>
-      <label title="A line drops from the centre of the tag straight down to the floor; a cross marks that spot and its X / Y (metres, 2 decimals = centimetres) is written next to it. Two faint lines run from the cross to the rulers on the X and Y edges. Everything is at the real position, so it can be compared with a tape mark on the real floor."><input id="coords" type="checkbox"> Show coordinates (X / Y on the floor under the tag)</label>
+      <h3 style="margin-top:20px">5 · View</h3>
+      <label title="Drawn with the points before and after each point (±3); the live position is not delayed."><input id="trail" type="checkbox" checked> Movement trail</label>
+      <label title="One dashed circle per anchor, to scale: where the tag can be according to that anchor."><input id="rings" type="checkbox" checked> Measured range circles</label>
+      <label title="A line from the tag down to a cross on the floor, with its X / Y next to it, at the real spot."><input id="coords" type="checkbox" checked> Coordinates under the tag</label>
       <label><input id="spin" type="checkbox"> Slow auto-orbit when idle</label>
 
-      <h3 style="margin-top:16px">Record session</h3>
-      <p class="muted">Records every raw packet and estimate to
-         <code>server/logs/</code>. Analyse with
-         <code>python tools/evaluate.py &lt;file&gt; --path x1,y1 x2,y2</code>.</p>
-      <label>Session name<input id="rec-name" type="text" placeholder="line-A-B"></label>
-      <div class="row btns">
-        <button id="rec-toggle" class="primary">⏺ Start recording</button>
-        <button id="rec-mark">Mark</button>
-      </div>
-      <div id="rec-status" class="muted" style="margin-top:8px"></div>
+      <details class="fold tools">
+        <summary>Tools — recording, device screens, firmware</summary>
 
-      <h3 style="margin-top:16px">Device screen (OLED)</h3>
-      <label title="Ticked (default): the OLED of every node stays on. Unticked: each screen turns off after 60 s without a button press, to save power. The node keeps ranging, serving its page and sending telemetry either way. Applied to all devices at once."><input id="scr-on" type="checkbox" checked> Keep device screens on</label>
-      <div id="scr-result" class="muted"></div>
+        <h4>Record session</h4>
+        <ul class="points">
+          <li>Saves every packet to <code>server/logs/</code>.</li>
+          <li>Mark = a note at this moment (e.g. a corner of the route).</li>
+        </ul>
+        <label>Session name<input id="rec-name" type="text" placeholder="line-A-B"></label>
+        <div class="row btns">
+          <button id="rec-toggle" class="primary">⏺ Start recording</button>
+          <button id="rec-mark">Mark</button>
+        </div>
+        <div id="rec-status" class="muted" style="margin-top:8px"></div>
 
-      <h3 style="margin-top:16px">OTA firmware</h3>
-      <p class="muted" id="ota-hint">Loading…</p>
-      <label>Firmware image
-        <select id="ota-file"></select>
-      </label>
-      <div class="row btns">
-        <button id="ota-push-all" class="primary">⬆ Push to all online</button>
-      </div>
-      <div id="ota-result" class="muted" style="margin-top:8px"></div>
+        <h4>Device screens (OLED)</h4>
+        <label title="Unticked: every screen turns off after 60 s idle. Ranging and telemetry continue."><input id="scr-on" type="checkbox" checked> Keep device screens on</label>
+        <div id="scr-result" class="muted"></div>
+
+        <h4>Firmware update (OTA)</h4>
+        <p class="muted" id="ota-hint">Loading…</p>
+        <label>Firmware image
+          <select id="ota-file"></select>
+        </label>
+        <div class="row btns">
+          <button id="ota-push-all" class="primary">⬆ Update all online</button>
+        </div>
+        <div id="ota-result" class="muted" style="margin-top:8px"></div>
+      </details>
     </section>
 
     <!-- ------------------------------------------------------- DEVICES -->
@@ -172,11 +203,17 @@
       <table class="kv" id="mqtttopics"></table>
     </section>
 
+    <!-- Pinned to the bottom of the panel on every tab while there is
+         something to save. -->
+    <div id="unsaved" class="unsaved" hidden>
+      <span>Unsaved floor-plan changes <small>(3D view, Inspector or Setup)</small></span>
+      <button id="save-bar" class="primary">💾 Save</button>
+    </div>
+
     <footer>
-      <button id="save" class="primary full">💾 Save room &amp; anchors</button>
-      <button id="reload" class="full" style="margin-top:8px">↺ Reload from server</button>
       <p class="hint"><b>WASD / arrows</b> move · <b>Q/E</b> down/up ·
-         <b>Shift</b> fast · <b>H</b> reset view · <b>Space</b> pause render<br>
+         <b>Shift</b> fast · <b>H</b> reset view · <b>Space</b> pause render ·
+         <b>Ctrl+S</b> save floor plan<br>
          Drag an object to move · corner handles resize · Delete removes ·
          scroll / pinch zooms</p>
     </footer>

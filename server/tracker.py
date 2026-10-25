@@ -1,5 +1,10 @@
 """Tag tracking engine — measurement bookkeeping + EKF on slant ranges.
 
+The algorithm is CALF-UWB (Correction-Aware Layered Filter for UWB Indoor
+Positioning): range correction from the static calibration (K), a robust EKF
+(G), the standing-still constraints (Z, L) and a validity gate with optional
+smoothing. Points 6-10 below; docs/ALGORITHMS.md has the details.
+
 Why this module exists
 ----------------------
 The first server re-ran the filter on *every* incoming message and fed it

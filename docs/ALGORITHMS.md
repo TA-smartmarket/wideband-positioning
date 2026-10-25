@@ -1,12 +1,12 @@
 # Algoritma Positioning
 
 Dokumen ini menjelaskan algoritma yang **benar-benar jalan** di server
-(`server/tracker.py`). Fokusnya algoritma inti; algoritma pendukung cukup
-digambarkan garis besarnya.
+(`server/tracker.py`), yaitu **CALF-UWB**. Fokusnya algoritma inti; algoritma
+pendukung cukup digambarkan garis besarnya.
 
 - Penurunan rumus, hasil uji lengkap, pembahasan catatan bimbingan, dan
   rujukan per bagian: [`algorithm-deep-understanding.md`](algorithm-deep-understanding.md).
-- Gambar dan Excel hasil simulasi: [`hasil-simulasi/`](hasil-simulasi/).
+- Riset, varian pembanding, dan ide yang tidak dipakai server: [`riset/`](riset/README.md).
 - Arti setiap istilah: [Istilah](#istilah) di akhir dokumen.
 
 Konvensi: koordinat lantai `(x, y)` dalam meter dari pojok 0,0 (anchor A2),
@@ -32,22 +32,32 @@ Konvensi: koordinat lantai `(x, y)` dalam meter dari pojok 0,0 (anchor A2),
    Posisi itu tebakan dari 1–2 anchor dan bisa melenceng keluar ruangan
    (rekaman 23-10 `test-4`).
 
-## Algoritma inti
+## Algoritma inti: CALF-UWB
 
-**EKF + kalibrasi statis + mode diam + tolak jarak kepanjangan + gerbang
-validitas** (di hasil studi disebut "Rekomendasi" = K + G + Z + L).
+**CALF-UWB — *Correction-Aware Layered Filter for UWB Indoor Positioning*.**
+Di hasil studi algoritma ini disebut "Rekomendasi" = K + G + Z + L. Huruf-huruf
+itu tetap dipakai sebagai nama komponennya:
+
+| Lapisan | Komponen | Isi | Bagian |
+|---|---|---|---|
+| 1. Koreksi | **K** (kalibrasi statis) + offset b, dᵢ | Jarak dikoreksi dengan kalibrasi; tanpa kalibrasi, offset dipelajari EKF | §1 |
+| 2. Filter robust | **G** (EKF lengkap) | EKF jarak miring, bobot Huber asimetris, tolak sampel \|e\| > 6, inisialisasi dengan pencarian offset | §1, §4 |
+| 3. Batasan saat diam | **Z** (mode diam) + **L** (tolak jarak kepanjangan) | Kecepatan dikunci 0 saat berhenti; jarak yang kepanjangan dibuang | §2 |
+| 4. Keluaran | Gerbang validitas + haluskan jalur (opsi) | Posisi hanya valid dari ≥ 3 anchor; rata-rata 3 posisi bila dicentang | §3, §5 |
+
+"Berlapis" di sini berarti lapisan **fungsi**. Lapisan 2 dan 3 berjalan dalam
+satu langkah EKF yang sama (Z mengubah prediksi, L memutuskan sampel dipakai atau
+tidak). Jadi bukan dua filter yang dijalankan berurutan.
 
 Ini satu-satunya algoritma di server. Nilainya tetap (tabel
 [Parameter](#parameter-tetap)). Yang bisa diatur pengguna hanya:
 
 - ukuran ruangan, tinggi tag, posisi anchor, dan kalibrasi (Setup → Room,
   Live → Inspector, Setup → Calibration);
-- centang **Smooth the path** (Setup → Tracker), lihat §6.
+- centang **Smooth the path** (Setup → Tracker), lihat §5.
 
-Varian lain yang dipakai saat riset (jendela pada jarak, jendela posisi,
-rata-rata C 20 × 20, bayangan badan B/R, dan seterusnya) dipindah ke
-`tools/tracker_lab.py`. File itu hanya dipakai skrip simulasi di `tools/`,
-tidak oleh server.
+Asal pilihan komponen-komponen ini dan varian yang dibandingkan ada di
+[`riset/`](riset/README.md).
 
 ![Alur algoritma](img/alur_algoritma.png)
 
@@ -100,8 +110,7 @@ Poin-poin penting:
 
 ### 2. Mode diam (Z) dan tolak jarak kepanjangan (L)
 
-Keduanya selalu aktif. Hasil studi semua kombinasi pada troli robot di antara
-pembeli ada di [RISET_JENDELA.md](hasil-simulasi/RISET_JENDELA.md).
+Keduanya selalu aktif.
 
 ```
 masuk mode diam : kecepatan EKF < 0,2 m/s selama 0,4 s
@@ -122,11 +131,6 @@ keluar          : 3 dari 4 jarak terakhir |e| > 1,5
   bisa terus terbaca kepanjangan. Tanpa pengaman ini posisi menjadi tidak valid
   (rekaman `test-2`: ketersediaan turun ke 78%, dengan pengaman kembali 98%).
 - **Saat bergerak** posisi = keluaran EKF langsung, tanpa jeda tambahan.
-
-Mode ini menggantikan "jendela adaptif" versi sebelumnya (rata-rata sampai 20
-keluaran saat diam, varian G). Di simulasi bacaan di rak turun dari
-4,4 / 6,7 / 10,0 cm (G) ke 3,0 / 3,4 / 5,4 cm (K + G + Z + L), untuk dunia
-kosong / sepi / ramai.
 
 ### 3. Gerbang validitas dan tahan posisi
 
@@ -156,16 +160,7 @@ Langkah inisialisasi:
    - pilih `b` dengan residu terkecil.
 3. Hasilnya hanya dipakai bila residu ≤ 30 cm dan posisinya di dalam ruangan.
 
-### 5. Jendela (hanya untuk riset)
-
-Jendela pada jarak (median / mean / garis regresi N sampel sebelum EKF) dan
-jendela pada posisi (rata-rata 20 × 20 versi catatan bimbingan, varian C)
-tidak ada lagi di server. Pada laju ±2,5 sampel per anchor per detik, jendela
-N sampel menunda ±(N−1)/5 detik, dan di simulasi varian C meleset ±63 cm.
-Kodenya tetap ada di `tools/tracker_lab.py` (`window_fit`, `LabEngine`) supaya
-hasil studi bisa diulang.
-
-### 6. Haluskan jalur (satu-satunya pilihan, Setup → Tracker)
+### 5. Haluskan jalur (satu-satunya pilihan, Setup → Tracker)
 
 ```
 centang "Smooth the path" → posisi = rata-rata 3 keluaran EKF terakhir
@@ -219,55 +214,44 @@ bawah viewport menjelaskan elemen mana yang berskala nyata.
 
 ### Simulasi
 
-Ruangan 9,5 × 5,9 m, laju anchor seperti hardware, 10 kali Monte-Carlo
-(`tools/smoothing_study.py`, gambar di [`hasil-simulasi/`](hasil-simulasi/)).
+Troli robot berjalan sendiri di antara pembeli, ruangan 9,5 × 5,9 m, 4 anchor,
+laju ranging seperti hardware, 20 rute per dunia (`tools/window_study.py`).
+Bacaan di rak = galat posisi pada detik terakhir setiap berhenti.
 
-| Algoritma | Galat bergerak (MAE) | Galat diam (MAE) | Sebaran diam (CEP50) | Kegoyahan garis | Galat maks saat anchor hilang |
-|---|---|---|---|---|---|
-| A. EKF saja (sebelum) | 20,6 cm | 18,2 cm | 6,6 cm | 21,2 cm | 85 cm |
-| B. A + rata-rata 500 ms (Fable) | 22,8 cm | 18,0 cm | 6,3 cm | 15,8 cm | 84 cm |
-| C. A + jendela 20 × 20 (catatan bimbingan) | 228 cm | 170 cm | 50 cm | 3,9 cm | 298 cm |
-| D. A + median 3 pada jarak | 42,2 cm | 15,8 cm | 4,0 cm | 15,8 cm | 87 cm |
-| E. A + garis regresi 10 pada posisi | 25,2 cm | 24,7 cm | 11,0 cm | 10,0 cm | 92 cm |
-| F. A + jendela adaptif + gerbang | 20,8 cm | 17,5 cm | 3,5 cm | 20,2 cm | 50 cm |
-| **G. F + offset per anchor + bobot jarak panjang** | **17,3 cm** | **15,5 cm** | **2,0 cm** | **15,4 cm** | **44 cm** |
-
-Studi ini berhenti di G. Algoritma final (G + kalibrasi + mode diam + tolak
-jarak kepanjangan) diuji di dunia troli robot di antara pembeli, dengan semua
-kombinasi lain: [RISET_JENDELA.md](hasil-simulasi/RISET_JENDELA.md).
-
-| Algoritma (dunia troli robot) | Bacaan di rak: kosong / sepi / ramai |
-|---|---|
-| G | 4,4 / 6,7 / 10,0 cm |
-| G + Z + L (tanpa kalibrasi) | 3,5 / 4,7 / 7,4 cm |
-| **K + G + Z + L (final)** | **3,0 / 3,4 / 5,4 cm** |
-| K + G + Z + L + haluskan jalur | 3,1 / 3,5 / 5,5 cm |
-| C / G + C (jendela 20) | ±63 cm |
-
-Kondisi line of sight (tanpa halangan tubuh), saat diam:
-
-- G tanpa kalibrasi manual: **5,0 cm**, lalu **4,5 cm** setelah tiga putaran
-  karena offset tiap anchor makin terpelajari.
-- G dengan kalibrasi: 4,7 cm.
+| CALF-UWB | Bacaan di rak: kosong / sepi / ramai | Galat bergerak |
+|---|---|---|
+| **Dengan kalibrasi (K)** | **3,0 / 3,4 / 5,4 cm** | 23,2 cm |
+| Dengan kalibrasi + haluskan jalur | 3,1 / 3,5 / 5,5 cm | 34,5 cm |
+| Belum dikalibrasi (offset dipelajari) | 3,5 / 4,7 / 7,4 cm | – |
 
 ### Data rekaman nyata
 
-Diputar ulang lewat versi lama dan versi final.
+Rekaman diputar ulang lewat CALF-UWB dengan pengaturan server (haluskan jalur
+dicentang; belum dikalibrasi, jadi offset dipelajari sendiri). Rekaman ini
+**tidak punya ground truth**, jadi yang diukur hanya kestabilan.
 
-| Rekaman | Sebelum | Final |
-|---|---|---|
-| `statis-final` (diam), CEP50 / CEP95 | 5,1 / 12,0 cm | **1,6 / 4,3 cm** |
-| `statis-malam-20mnt` (diam) | 6,1 / 16,1 cm | **2,1 / 5,8 cm** |
-| `verifikasi-final` (diam) | 4,8 / 11,6 cm | **1,2 / 4,2 cm** |
-| `test-1` (bergerak), lompatan > 40 cm / kegoyahan | 47 / 32,6 cm | **28 / 20,3 cm** |
-| `test-2` (bergerak) | 49 / 32,8 cm | **8 / 11,6 cm** |
-| `test-4` (bergerak) | 46 / 27,9 cm | **30 / 21,3 cm** |
+| Rekaman | Keadaan | Sebaran diam CEP50 / CEP95 | Kegoyahan saat bergerak | Valid |
+|---|---|---|---|---|
+| `statis-final` | Tag diam, ruangan 2,6 × 1,3 m | 0,2 / 0,3 cm | – | 82% |
+| `verifikasi-final` | Tag diam | 0,2 / 0,3 cm | – | 96% |
+| `statis-malam-20mnt` | Tag diam 20 menit, tanpa orang | 0,3 / 0,6 cm | – | 98% |
+| `test-1` | Bergerak, ruangan 9,5 × 5,9 m | 1,3 / 2,1 cm | 8,8 cm | 99% |
+| `test-2` | Bergerak | 0,6 / 1,1 cm | 4,7 cm | 98% |
+| `test-3` | Rekaman pendek, hampir tidak bergerak | 1,2 / 2,1 cm | 0,2 cm | 98% |
+| `test-4` | Bergerak | 0,3 / 0,5 cm | 10,7 cm | 97% |
+
+- **Rata-rata empat rekaman 23-10:** CEP95 1,4 cm, kegoyahan 6,1 cm, valid
+  98%, tidak ada posisi di luar ruangan.
+- **Valid di bawah 100%** berarti saat itu posisi ditahan (HOLD): kurang dari 3
+  anchor punya jarak baru, atau σ > 0,5 m.
+- **Dua rekaman 16-10 di ruangan 9,8 × 6,8 m tidak dimasukkan.** Scene-nya salah
+  setting: tinggi tag 2,0 m, lebih tinggi dari anchor (1,74 m).
 
 ### Target 2–4 cm
 
 | Ukuran | Hasil | Status |
 |---|---|---|
-| **Presisi** (sebaran saat diam) | CEP95 1,4 cm (rekaman 23-10, algoritma final) | Tercapai |
+| **Presisi** (sebaran saat diam) | CEP95 1,4 cm (rekaman 23-10, CALF-UWB) | Tercapai |
 | **Akurasi** saat diam, tanpa orang | 3,0 cm (simulasi, final) | Tercapai |
 | **Akurasi** saat diam, sedikit pembeli | 3,4 cm (simulasi, final) | Tercapai |
 | **Akurasi** saat diam, ramai pembeli | 5,4 cm (simulasi, final) | Hampir |
@@ -304,7 +288,7 @@ Yang bisa diubah pengguna:
 | Ukuran ruangan, tinggi tag `tag_z` | Setup → Room | Ukur dengan meteran; salah ukur `tag_z` menggeser semua posisi |
 | Posisi dan tinggi anchor | Live → Inspector (klik anchor) | Offset > 20 cm memunculkan peringatan "periksa posisi" |
 | Titik kalibrasi | Setup → Calibration | Taruh tag di titik yang diukur, isi x, y, lalu Apply |
-| Haluskan jalur | Setup → Tracker | Satu centang, lihat §6 |
+| Haluskan jalur | Setup → Tracker | Satu centang, lihat §5 |
 
 ## Peta kode
 
@@ -319,10 +303,7 @@ Yang bisa diubah pengguna:
 | Satu-satunya pengaturan (`smooth`) | `server/app.py` `api_tracking` |
 | `valid` untuk navigasi | `server/app.py` `_nav_position_doc` (`NAV_STALE_MS`) |
 | Tampilan 3D, kondisi anchor, istilah | `server/static/app.js` (`buildRoom`, `anchorStatus`, `TIP`) |
-| Varian riset (jendela, C, B/R, dst.) | `tools/tracker_lab.py` `LabEngine` (hanya dipakai `tools/`) |
-| Studi semua kombinasi | `tools/window_study.py` + `tools/window_report.py` → `docs/hasil-simulasi/` |
-| Studi simulasi awal (A–G) | `tools/smoothing_study.py` → `docs/smoothing_study.json` |
-| Putar ulang rekaman | `tools/evaluate.py LOG --replay` (algoritma server) atau `--set …` (varian riset) |
+| Putar ulang rekaman | `tools/evaluate.py LOG --replay` |
 
 ---
 
@@ -330,24 +311,102 @@ Yang bisa diubah pengguna:
 
 | Istilah | Arti |
 |---|---|
-| **Jarak (range)** | Jarak tag ke satu anchor hasil UWB, garis lurus 3D (termasuk beda tinggi) |
+Hanya istilah yang dipakai sistem ini, dikelompokkan supaya mudah dicari.
+Singkatan ditulis dengan kepanjangannya. Istilah yang hanya muncul di riset ada
+di [`riset/README.md`](riset/README.md#istilah-riset).
+
+### Sistem dan hardware
+
+| Istilah | Arti |
+|---|---|
+| **UWB** (*Ultra-Wideband*) | Radio pita sangat lebar. Waktu tempuh sinyalnya bisa diukur sangat teliti, sehingga jarak bisa diukur sampai sentimeter |
+| **DW1000** | Chip UWB (Decawave, sekarang Qorvo) yang dipakai di setiap node |
+| **ESP32** | Mikrokontroler di setiap node: menjalankan firmware, WiFi, layar |
+| **Node** | Satu papan ESP32 + DW1000 |
+| **Anchor** | Node tetap di pojok ruangan, posisinya diukur dengan meteran |
+| **Tag** | Node yang menempel di troli; posisinya yang dicari |
+| **Firmware** | Program di ESP32 (`src/`) |
+| **OLED** | Layar kecil di papan; menampilkan jarak terbaru |
+| **OTA** (*Over-The-Air*) | Memperbarui firmware lewat WiFi tanpa kabel |
+| **Server** | Program Python (`server/`) yang menerima data, menghitung posisi, dan menampilkan dashboard |
+
+### Pengukuran jarak
+
+| Istilah | Arti |
+|---|---|
+| **Jarak (range)** | Jarak tag ke satu anchor hasil UWB, garis lurus 3D (termasuk beda tinggi). Disebut juga jarak miring |
+| **ToF** (*Time of Flight*) | Waktu tempuh sinyal dari satu node ke node lain; jarak = ToF × kecepatan cahaya |
+| **TWR** (*Two-Way Ranging*) | Mengukur ToF dengan pesan bolak-balik, sehingga jam kedua node tidak perlu sama |
+| **ADS-TWR** (*Asymmetric Double-Sided TWR*) | TWR dengan dua kali kirim-balas: galat beda jam saling membatalkan, tetap teliti walau jeda balasan kedua sisi berbeda. **Yang dipakai firmware** |
+| **Delay antena** | Waktu sinyal di dalam rangkaian antena; tanpa kalibrasi menambah ±75–100 cm ke setiap jarak |
+| **Beda jam (*clock drift*)** | Kristal setiap node berdetak sedikit berbeda; membuat ToF sedikit salah |
+| **raw** | Jarak mentah dari firmware. **Yang dipakai server** |
+| **range** (kolom paket) | Jarak yang sudah dihaluskan firmware (tolak lompatan > 5 m + median 3 + EMA). Hanya untuk OLED |
+| **LOS / NLOS** (*(Non-)Line of Sight*) | Jalur sinyal bebas / terhalang (badan, rak). NLOS membuat jarak lebih **panjang** |
+
+### CALF-UWB dan komponennya
+
+| Istilah | Arti |
+|---|---|
+| **CALF-UWB** | *Correction-Aware Layered Filter for UWB Indoor Positioning*: nama algoritma di server = K + G + Z + L + keluaran |
+| **K** (Kalibrasi statis) | Lapisan koreksi: `jarak = (raw − offset) / scale` dari titik-titik yang diukur dengan meteran |
+| **G** (nama varian di studi pemilihan algoritma) | EKF lengkap: jarak miring, offset b dan d, bobot Huber asimetris, tolak \|e\| > 6, inisialisasi dengan pencarian offset |
+| **Z** (*Zero-velocity*, mode diam) | Saat troli berhenti (< 0,2 m/s selama 0,4 s), kecepatan dikunci 0 supaya posisi tidak bergoyang |
+| **L** (*Long*, tolak jarak kepanjangan) | Saat diam, jarak yang lebih panjang dari perkiraan lebih dari 1σ dibuang (badan menghalangi) |
+| **ZUPT** (*Zero-velocity UPdaTe*) | Nama umum teknik di balik Z |
 | **Offset jarak (b)** | Kelebihan jarak yang sama di semua anchor karena delay antena DW1000 (±75–100 cm). Dihitung otomatis dan dikurangkan. Dulu disebut "bias" |
 | **Offset anchor (d)** | Selisih satu anchor terhadap anchor lain (beberapa cm). Lebih dari 20 cm = posisi anchor di denah kemungkinan salah |
-| **Margin error (±σ)** | Ketidakpastian posisi menurut EKF: ±2 dari 3 posisi berada dalam radius ini. Bukan galat sebenarnya; galat dari posisi anchor yang salah ketik tidak termasuk |
+| **EKF** (*Extended Kalman Filter*) | "Otak" penghitung posisi: menggabungkan model gerak troli dengan setiap jarak baru, sambil menghitung seberapa yakin hasilnya |
+| **State** | Isi yang dilacak EKF: posisi x, y, kecepatan vx, vy, dan offset b, d₁…d₄ |
+| **Prediksi / Update** | Dua langkah EKF: geser posisi sesuai kecepatan, lalu koreksi dengan jarak baru |
+| **Model Singer** | Model gerak di mana kecepatan pelan-pelan meluruh bila tidak ada data baru |
 | **Residu** | Jarak terukur − jarak yang diharapkan dari posisi dan offset. Mendekati 0 = anchor itu sepakat dengan yang lain |
 | **e (residu ternormalisasi)** | Residu dibagi simpangan yang diharapkan; dipakai untuk menolak / menurunkan bobot sampel |
-| **LOS / NLOS** | Jalur bebas / terhalang |
-| **Presisi** | Seberapa rapat posisi saat diam (tidak butuh posisi benar) |
-| **Akurasi** | Seberapa dekat posisi dengan posisi benar (butuh meteran laser atau simulasi) |
-| **MAE** | Rata-rata galat (*mean absolute error*) |
-| **RMSE** | Seperti MAE, tetapi galat besar lebih berpengaruh |
-| **CEP50 / CEP95** | Radius yang memuat 50% / 95% posisi |
-| **Kegoyahan** | Seberapa patah-patah garis (RMS beda-kedua posisi berurutan) |
-| **Jendela (window)** | Sekelompok sampel terakhir yang dirata-rata / diambil mediannya |
-| **HOLD** | Posisi ditahan karena data kurang (< 3 anchor); ditandai tidak valid |
-| **EKF** | Extended Kalman Filter: menggabungkan model gerak troli dengan setiap jarak baru |
 | **Huber** | Cara menurunkan bobot sampel yang menyimpang tanpa membuangnya |
-| **Model Singer** | Model gerak di mana kecepatan pelan-pelan meluruh bila tidak ada data baru |
+| **Huber asimetris** | Jarak kepanjangan (e > 1) lebih cepat diturunkan bobotnya daripada jarak kependekan (e < −2,5) |
+| **Gerbang validitas** | Posisi hanya valid bila ≥ 3 anchor diterima dalam 1,5 s terakhir dan σ ≤ 0,5 m |
+| **HOLD** | Posisi ditahan karena data kurang (< 3 anchor); ditandai tidak valid |
+| **Margin error (±σ)** | Ketidakpastian posisi menurut EKF: ±2 dari 3 posisi berada dalam radius ini. Bukan galat sebenarnya; galat dari posisi anchor yang salah ketik tidak termasuk |
+| **Multilaterasi** | Menghitung posisi dari beberapa jarak sekaligus; dipakai untuk posisi pertama (inisialisasi) |
+| **Inisialisasi (*bootstrap*)** | Posisi pertama sebelum EKF berjalan, dari median jarak 0,7 s terakhir |
+| **Jepit ke ruangan** | Posisi tidak boleh lebih dari 0,5 m di luar ruangan |
+| **Haluskan jalur** | Pilihan di Setup: posisi yang ditampilkan = rata-rata 3 posisi terakhir |
+
+### Pengolahan sinyal dan jendela
+
+| Istilah | Arti |
+|---|---|
+| **Median 3** | Nilai tengah dari 3 sampel terakhir; membuang satu lonjakan |
+| **EMA** (*Exponential Moving Average*) | Rata-rata berjalan: nilai baru dicampur sebagian (di firmware 35%) dengan nilai lama |
+| **Jendela (*window*)** | Sekelompok sampel terakhir yang dirata-rata / diambil mediannya |
+| **Geser-1 (*sliding*)** | Jendela maju satu sampel tiap kali: 1–3, 2–4, 3–5, … Dipakai "haluskan jalur" |
+
+### Ukuran hasil
+
+| Istilah | Arti |
+|---|---|
+| **Ground truth** | Posisi sebenarnya: dari simulasi, atau titik yang diukur meteran laser |
+| **Presisi** | Seberapa rapat posisi saat diam (tidak butuh posisi benar) |
+| **Akurasi** | Seberapa dekat posisi dengan posisi benar (butuh ground truth) |
+| **Galat** | Jarak antara posisi hasil hitung dan posisi benar |
+| **RMSE** (*Root Mean Square Error*) | Rata-rata galat di mana galat besar lebih berpengaruh; ditampilkan di uji statis (Setup → Calibration) |
+| **CEP50 / CEP95** (*Circular Error Probable*) | Radius yang memuat 50% / 95% posisi |
+| **Kegoyahan** | Seberapa patah-patah garis (RMS beda-kedua posisi berurutan) |
+| **Bacaan di rak** | Galat posisi saat troli berhenti di depan rak (ukuran utama target 2–4 cm) |
+| **Galat bergerak** | Galat rata-rata selama troli berjalan |
+| **Valid (%)** | Bagian waktu di mana posisi valid (tidak HOLD) |
+| **Kosong / sepi / ramai** | Tiga dunia simulasi: tanpa pembeli, sedikit pembeli, banyak pembeli |
+
+### Jaringan
+
+| Istilah | Arti |
+|---|---|
+| **Paket telemetri** | Kiriman tag ke server tiap 200 ms: daftar jarak + waktu ukurnya |
+| **JSON** | Format teks paket dan API |
+| **HTTP / REST API** | Cara kirim lewat permintaan web (`/api/v1/...`); yang dipakai saat ini |
+| **MQTT** | Cara kirim lewat langganan topik dengan koneksi yang tetap terbuka; sedikit lebih cepat |
+| **Broker** | Program perantara MQTT (misalnya Mosquitto) |
+| **Latensi (jeda)** | Waktu dari jarak diukur sampai posisinya tampil |
 
 ## Rujukan singkat
 
@@ -358,10 +417,9 @@ Yang bisa diubah pengguna:
 | Model Singer | Singer 1970 |
 | Offset per anchor (self-calibration) | Hapsari 2025 (paper 09) |
 | Bobot asimetris NLOS | Fan & Du 2022 (NLOS selalu memperpanjang jarak) |
-| Rata-rata saat diam | Ide *zero-velocity update* (Foxlin 2005) |
-| Jendela, Nyquist, garis regresi | Shannon 1949, Savitzky–Golay 1964 |
-| Data sebelum & sesudah | Rauch–Tung–Striebel 1965 |
+| Mode diam (Z) | Ide *zero-velocity update* (Foxlin 2005) |
 | Penempatan anchor | Kramarić 2025 |
+| ADS-TWR (dipakai firmware) | Neirynck dkk. 2016, *An alternative double-sided two-way ranging method* |
 
 Detail dan bagian mana yang didukung tiap rujukan ada di
 [`algorithm-deep-understanding.md`](algorithm-deep-understanding.md#12-rujukan).
