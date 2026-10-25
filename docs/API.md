@@ -271,7 +271,8 @@ evidence are in `docs/PERBAIKAN_AKURASI.md`.
 7. **Standing still** (always on) — once the EKF speed stayed below 0.2 m/s
    for 0.4 s the velocity is pinned to 0 and the process noise drops to
    0.05 m/s² (`still: true` meanwhile), until 3 of the last 4 ranges disagree
-   by > 1.5σ. While standing, a range that comes in more than 1σ too LONG (a
+   by > 1.5σ or 2 of the last 10 come in more than 1σ too SHORT (a body only
+   lengthens a range); not again for 1 s after. While standing, a range that comes in more than 1σ too LONG (a
    body in the way) is dropped, as long as ≥ 3 other anchors had an accepted
    range in the last 1.5 s.
 8. **Validity** — `valid` only while ≥ 3 anchors had an accepted range in the

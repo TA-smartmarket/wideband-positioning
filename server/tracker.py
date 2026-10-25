@@ -109,7 +109,8 @@ PARAMS = {
     # 0.4 s the trolley is taken to stand: its velocity is pinned to 0 and the
     # process noise made small, so one bad round of ranges can no longer move
     # the position; it ends as soon as 3 of the last 4 ranges disagree with
-    # the position by more than 1.5 sigma.
+    # the position by more than 1.5 sigma, or 2 of the last 10 come in more
+    # than 1 sigma SHORTER than expected (a body only lengthens a range).
     "zero_velocity": 1.0,
     # While standing, a range LONGER than expected by more than this (sigma)
     # is dropped instead of down-weighted, as long as the other anchors can
@@ -379,6 +380,18 @@ ANCHOR_OFF_LIMIT = 0.30    # |d_i| bound (m)
 ZUPT_SLOW, ZUPT_AFTER_MS = 0.20, 400     # enter: speed < 0.2 m/s for 0.4 s
 ZUPT_SIGMA_A, ZUPT_SIGMA_V = 0.05, 0.02  # standing: m/s^2 of process noise, m/s on v = 0
 ZUPT_EXIT_NU, ZUPT_EXIT_N = 1.5, 3       # leave: 3 of the last 4 |nu| > 1.5
+# ... or 2 of the last 10 ranges (~0.8 s) nu < -1. A body or a blocked path only
+# lengthens a range, so a range clearly SHORTER than expected means the tag
+# moved towards that anchor. Setting off diagonally between two anchors
+# hardly changes their ranges and the anchor behind is dropped as "a body",
+# so "3 of the last 4" alone held the position for up to 3 s while the tag
+# had moved 1.3 m (tools/room_walk.py). Any anchor counts: the one ahead may
+# miss a few rounds.
+ZUPT_EXIT_SHORT, ZUPT_EXIT_SHORT_N, ZUPT_EXIT_SHORT_OF = 1.0, 2, 10
+# Not standing again for 1 s after leaving: when the anchors ahead miss a few
+# rounds the speed has not grown yet, and the mode came back while the tag
+# drove on.
+ZUPT_HOLD_MS = 1000
 
 
 class TagFilter:
@@ -407,6 +420,8 @@ class TagFilter:
         self.drop_ok = True           # set by the engine: enough other anchors for still_long
         self.slow_since = None
         self.recent = []              # standing: |nu| > ZUPT_EXIT_NU of the last updates
+        self.short = []               # standing: nu < -ZUPT_EXIT_SHORT of the last updates
+        self.left_at = None           # when the zero-velocity mode last ended
 
     def predict(self, t_ms):
         dt = (t_ms - self.t) / 1000.0
@@ -479,18 +494,23 @@ class TagFilter:
             return
         if self.standing:
             self.recent = (self.recent + [abs(nu) > ZUPT_EXIT_NU])[-4:]
-            if sum(self.recent) >= ZUPT_EXIT_N:   # the ranges keep moving: it goes
-                self.standing, self.slow_since, self.recent = False, None, []
+            self.short = (self.short + [nu < -ZUPT_EXIT_SHORT])[-ZUPT_EXIT_SHORT_OF:]
+            if sum(self.recent) >= ZUPT_EXIT_N or sum(self.short) >= ZUPT_EXIT_SHORT_N:
+                # the ranges keep moving, or the tag came closer to an anchor: it goes
+                self.standing, self.slow_since, self.recent, self.short = False, None, [], []
+                self.left_at = self.t
                 self.P[2][2] += 0.36              # let the velocity grow again
                 self.P[3][3] += 0.36
                 self.P[0][0] += 0.01
                 self.P[1][1] += 0.01
             return
-        if math.hypot(self.x[2], self.x[3]) < ZUPT_SLOW:
+        if self.left_at is not None and self.t - self.left_at < ZUPT_HOLD_MS:
+            self.slow_since = None
+        elif math.hypot(self.x[2], self.x[3]) < ZUPT_SLOW:
             if self.slow_since is None:
                 self.slow_since = self.t
             elif self.t - self.slow_since >= ZUPT_AFTER_MS:
-                self.standing, self.recent = True, []
+                self.standing, self.recent, self.short = True, [], []
         else:
             self.slow_since = None
 

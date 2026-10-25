@@ -342,7 +342,7 @@ def alur_algoritma():
     drop = d.box(870, 352, 190, 86, f"<b>Buang</b> sampel<br>{small('badan menghalangi; hanya<br>bila ≥ 3 anchor lain ada')}", OLD, fs=15)
     c5 = d.circle(940, 462)
     upd = d.box(580, 480, 240, 64, f"Update EKF robust<br>{small('bobot turun bila e &gt; 1 atau e &lt; −2,5')}", OURS, fs=15)
-    zupt = d.box(580, 572, 240, 84, f"Perbarui <b>mode diam</b><br>{small('masuk: v &lt; 0,2 m/s selama 0,4 s<br>keluar: 3 dari 4 |e| &gt; 1,5')}", OURS, fs=15)
+    zupt = d.box(580, 566, 240, 104, f"Perbarui <b>mode diam</b><br>{small('masuk: v &lt; 0,2 m/s selama 0,4 s<br>keluar: 3 dari 4 |e| &gt; 1,5<br>atau 2 dari 10 e &lt; −1 (memendek)')}", OURS, fs=15)
     clamp = d.box(580, 684, 240, 56, "Batasi posisi<br>dalam ruangan", OURS, fs=15)
     d4 = d.decision(570, 765, 260, 110, "Masih ada sampel<br>di paket ini?")
     c4 = d.circle(940, 800)

@@ -118,11 +118,30 @@ selama diam     : σa 0,8 → 0,05 m/s²; pengukuran semu v = 0 (σ 0,02 m/s)
                   jarak dengan e > 1 dibuang, bila ≥ 3 anchor lain diterima
                   dalam 1,5 s terakhir
 keluar          : 3 dari 4 jarak terakhir |e| > 1,5
+                  atau 2 dari 10 jarak terakhir e < −1 (lebih PENDEK)
+setelah keluar  : tidak masuk mode diam lagi selama 1 s
 ```
 
 - **Mode diam (Z, *zero-velocity update*).** Saat troli berhenti, kecepatan
   dikunci 0 dan derau proses dikecilkan. Satu putaran jarak yang buruk tidak
   lagi menggeser posisi. Keluaran `still` = sedang dalam mode diam.
+- **Keluar dari mode diam.** Ada dua tanda bahwa troli mulai bergerak:
+  - beberapa jarak berturut-turut tidak cocok lagi dengan posisi (3 dari 4);
+  - jarak ke anchor mana pun terbaca lebih **pendek** dari perkiraan (2 dari
+    10 jarak terakhir). Badan atau halangan hanya bisa memperpanjang jarak,
+    jadi jarak yang memendek berarti tag benar-benar mendekati anchor itu.
+
+  Tanda kedua dibutuhkan saat troli berangkat **diagonal**. Jarak ke dua
+  anchor di samping hampir tidak berubah, dan jarak ke anchor di belakang
+  dibuang sebagai "badan". Dengan tanda pertama saja, posisi bisa tertahan
+  sampai 3 s sementara troli sudah berjalan 1,3 m (simulasi
+  `tools/room_walk.py`, galat sampai 140 cm). Dengan tanda kedua posisi
+  lepas ±1 s setelah berangkat. Setelah keluar, mode diam tidak boleh masuk
+  lagi selama 1 s, karena kecepatan EKF butuh waktu untuk naik.
+  - Hasilnya ada di
+    [`hasil-simulasi/RUANG_UJI.md`](hasil-simulasi/RUANG_UJI.md).
+  - Pada rekaman asli, semua pelepasan baru terjadi saat tag memang bergerak.
+    Sebaran posisi saat diam tidak berubah.
 - **Tolak jarak kepanjangan (L).** Selama mode diam, jarak yang lebih panjang
   dari perkiraan lebih dari 1σ dibuang, bukan hanya diturunkan bobotnya.
   Alasannya, badan orang hanya bisa memperpanjang jarak.
@@ -275,7 +294,7 @@ mengisi yang memang harus diukur. Alasan tiap nilai tertulis di
 | `sigma_r` | 0,12 m | Derau satu jarak |
 | `vel_tau_s` | 1,0 s | Berapa lama kecepatan dipertahankan saat data berhenti |
 | `huber_k` / `huber_k_long` / `gate` | 2,5 / 1,0 / 6 | Mulai turunkan bobot (jarak pendek / jarak panjang) / tolak sampel |
-| Mode diam | masuk < 0,2 m/s selama 0,4 s; keluar 3 dari 4 \|e\| > 1,5 | `ZUPT_*` di `tracker.py` |
+| Mode diam | masuk < 0,2 m/s selama 0,4 s; keluar 3 dari 4 \|e\| > 1,5 atau 2 dari 10 e < −1; masuk lagi paling cepat 1 s setelah keluar | `ZUPT_*` di `tracker.py` |
 | `still_long` | 1,0σ | Ambang buang jarak kepanjangan saat diam |
 | `min_anchors`, `fresh_ms`, `valid_sigma` | 3, 1500 ms, 0,5 m | Gerbang validitas |
 | `reinit_ms`, `room_margin` | 1500 ms, 0,5 m | Mulai ulang tanpa data / batas ruangan |
