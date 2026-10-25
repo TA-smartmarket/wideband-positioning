@@ -210,6 +210,7 @@ bawah viewport menjelaskan elemen mana yang berskala nyata.
 | Tiang anchor | Dari lantai sampai tinggi anchor sebenarnya |
 | Warna tiang anchor | Kondisi anchor: hijau OK · kuning periksa (tidak ada jarak, residu besar, WiFi mati, atau offset > 20 cm) · merah masalah (terhalang / jarak ditolak) · abu-abu offline. Alasannya tertulis di label; klik anchor untuk detail |
 | Garis jejak | Rata-rata ±3 titik sebelum dan sesudah (hanya gambar; posisi live tidak ditunda) |
+| Garis tegak + silang di lantai (centang Setup → View → *Show coordinates*) | Titik lantai tepat di bawah pusat tag, **berskala nyata**. X / Y tertulis di sebelahnya (meter, 2 desimal = cm). Dua garis tipis dari silang ke penggaris tepi y = 0 (merah, membaca X) dan x = 0 (hijau, membaca Y). Bisa dibandingkan langsung dengan tanda lakban di lantai asli |
 | Kepala tag dan anchor | Penanda, bukan ukuran asli |
 
 ---

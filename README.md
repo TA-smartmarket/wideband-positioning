@@ -437,7 +437,7 @@ Buka `http://<server>:8080`. Ada **4 tab**:
 | Tab | Isi |
 |---|---|
 | **Live** | inspector objek + daftar tag (posisi, σ, IP, confidence) |
-| **Setup** | ukuran ruangan + tinggi tag, kalibrasi, centang *Smooth the path*, tampilan, rekam, **OTA firmware** |
+| **Setup** | ukuran ruangan + tinggi tag, kalibrasi, centang *Smooth the path*, tampilan (jejak, lingkaran jarak, *Show coordinates*), rekam, **OTA firmware** |
 | **Devices** | tiap node: IP, RSSI, firmware, tombol **OTA** + **🔑 key** |
 | **API** | daftar endpoint REST (dibaca live dari `/api/v1/meta`) + topik MQTT |
 

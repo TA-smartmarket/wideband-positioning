@@ -18,6 +18,7 @@ const S = {
   trail: {},
   showTrail: true,
   showRings: true,          // measured range circle per anchor
+  showCoords: false,        // drop line + floor cross + X / Y under each tag
   autoSpin: false,
 };
 
@@ -222,7 +223,7 @@ function updateLabelScale() {
         // made a label jump in size when its line count changed).
         const target = LABEL_PX * weight * worldPerPx * ((c.userData.hPx || 1) / (c.userData.unitPx || c.userData.hPx || 1));
         c.scale.set(target * (c.userData.aspect || 1), target, 1);
-        c.visible = dist < farLabels;                 // drop the far ones
+        c.visible = dist < farLabels && !c.userData.off;   // drop the far / switched-off ones
       }
     }
   }
@@ -858,6 +859,10 @@ function floorLabel(text, pos, color, size = 0.17, rotY = 0) {
   return mesh;
 }
 
+// Lift the whole ruler clear of the floor edge. Sitting exactly on the edge,
+// the near side's numbers visually crossed the floor they measure.
+const RULER_OFFSET = 0.30;
+
 function makeRuler(from, to, outward, rotY = 0) {
   const g = new THREE.Group();
   const len = from.distanceTo(to);
@@ -868,11 +873,8 @@ function makeRuler(from, to, outward, rotY = 0) {
     const toCentre = outward.clone().sub(mid);
     if (side.dot(toCentre) > 0) side.negate();           // face away from the room
   }
-  // Lift the whole ruler clear of the floor edge. Sitting exactly on the edge,
-  // the near side's numbers visually crossed the floor they measure.
-  const OFFSET = 0.30;
-  from = from.clone().addScaledVector(side, OFFSET);
-  to = to.clone().addScaledVector(side, OFFSET);
+  from = from.clone().addScaledVector(side, RULER_OFFSET);
+  to = to.clone().addScaledVector(side, RULER_OFFSET);
 
   g.add(new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([from, to]),
@@ -1252,6 +1254,7 @@ function buildTags() {
         : '±' + ((t.sigma || 0) * 100).toFixed(0) + ' cm'}`, undefined,
         t.held ? COL.anchorWarn : null);
     }
+    updateCoords(mesh, t);
     mesh.visible = true;
 
     // trail (a held position is not a new point)
@@ -1270,6 +1273,66 @@ function buildTags() {
   buildTrail();
   updateSelRig();          // meshes rebuilt
 }
+
+/* Coordinates in the 3D view (Setup → View → Show coordinates). From the
+   centre of the tag a line drops straight down to the floor; a cross marks
+   that floor spot and its X / Y is written next to it. Two faint guides run
+   from the cross to the rulers on the y = 0 edge (X ruler) and the x = 0 edge
+   (Y ruler), so the value can also be read off the ruler ticks. All of it sits
+   at the real position, so a tape mark on the real floor compares directly.
+   Updated in place, like the trail: no new geometry per poll. */
+const COORD_FLOOR = 0.012;       // above the floor grid (0.004), so it never flickers
+const COORD_CROSS = 0.10;        // half-length of the floor cross, metres
+
+function coordSegs(name, points) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(points * 3), 3));
+  const l = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ transparent: true }));
+  l.name = name;
+  l.frustumCulled = false;
+  return l;
+}
+
+function setSegs(l, pts, color, opacity) {
+  const a = l.geometry.attributes.position;
+  pts.forEach((p, i) => a.setXYZ(i, p[0], p[1], p[2]));
+  a.needsUpdate = true;
+  l.material.color.setHex(color);       // follows the theme
+  l.material.opacity = opacity;
+}
+
+function updateCoords(mesh, t) {
+  let g = mesh.getObjectByName('coords');
+  let lb = mesh.getObjectByName('clabel');
+  if (!g) {
+    g = new THREE.Group();
+    g.name = 'coords';
+    for (const [n, k] of [['drop', 2], ['cross', 4], ['guideX', 2], ['guideY', 2]])
+      g.add(coordSegs(n, k));
+    mesh.add(g);
+    // A direct child of the tag, so updateLabelScale keeps it a constant size.
+    lb = label('', new THREE.Vector3(), COL.labelTag, 0.12, true);
+    lb.name = 'clabel';
+    lb.center.set(-0.12, -0.3);         // up and to the right of the cross
+    mesh.add(lb);
+  }
+  g.visible = S.showCoords;
+  lb.userData.off = !S.showCoords;
+  lb.visible = S.showCoords;
+  if (!S.showCoords) return;
+
+  // Local frame of the tag: (0, 0, 0) is its centre, f the floor below it.
+  const f = -tagZ(t) + COORD_FLOOR;
+  const C = COORD_CROSS;
+  setSegs(g.getObjectByName('drop'), [[0, 0, 0], [0, f, 0]], COL.tag, 0.9);
+  setSegs(g.getObjectByName('cross'), [[-C, f, 0], [C, f, 0], [0, f, -C], [0, f, C]], COL.tag, 1);
+  setSegs(g.getObjectByName('guideX'), [[0, f, 0], [0, f, -(t.y + RULER_OFFSET)]], COL.axisX, 0.45);
+  setSegs(g.getObjectByName('guideY'), [[0, f, 0], [-(t.x + RULER_OFFSET), f, 0]], COL.axisY, 0.45);
+  lb.position.set(0, f, 0);
+  lb.userData.setText(`X ${t.x.toFixed(2)}  Y ${t.y.toFixed(2)} m`, COL.labelTag,
+                      t.held ? COL.anchorWarn : null);
+}
+
 // The trail is updated IN PLACE: rebuilding the Line objects every poll
 // (500 ms) allocated two geometries per second per tag for no reason.
 const trailLines = {};
@@ -1905,6 +1968,7 @@ function buildLegend() {
     <summary>Legend — what the 3D view shows</summary>
     <div><span class="lg-line" style="border-color:${hex(COL.ruler)}"></span>grid: 1 m (thin: 0.5 m)</div>
     <div><span class="lg-ring" style="border-color:${hex(COL.tag)}"></span>around the tag: margin of error ±1σ <b>to scale</b></div>
+    <div><span class="lg-line" style="border-color:${hex(COL.tag)}"></span>line from the tag to a floor cross: its X / Y <b>at the real spot</b> (Setup → View → Show coordinates)</div>
     <div><span class="lg-dash" style="border-color:${hex(COL.los)}"></span>dashed circle: range measured by one anchor <b>to scale</b></div>
     <div><span class="lg-line" style="border-color:${hex(COL.los)}"></span><span class="lg-line" style="border-color:${hex(COL.nlos)}"></span>tag–anchor line: clear (LOS) / blocked (NLOS)</div>
     <div><span class="lg-box" style="background:${hex(COL.anchor)}"></span>anchor post: floor to its real height; colour = condition</div>
@@ -2630,7 +2694,18 @@ function applyTheme(theme) {
     if (roomGroup) buildRoom();
     if (anchorGroup) buildAnchors();
     if (obstacleGroup) buildObstacles();
-    if (tagGroup) buildTags();
+    if (tagGroup) {
+      // Tag meshes are made once and only moved after that, so they kept the
+      // old palette (the tag label went blank). Drop them; buildTags makes new
+      // ones. The selection rig may sit on a tag: lift it off before disposing.
+      if (selRig) selRig.removeFromParent();
+      for (const id of Object.keys(tagMeshes)) {
+        tagGroup.remove(tagMeshes[id]);
+        disposeSubtree(tagMeshes[id]);
+        delete tagMeshes[id];
+      }
+      buildTags();
+    }
     if (linkGroup) buildLinks();
     updateAnchorLabels();
     buildPalette();          // legend swatches follow the 3D palette
@@ -2767,6 +2842,7 @@ function initUi() {
   $('reload').onclick = async () => { busy($('reload'), true); try { await loadScene(); } finally { busy($('reload'), false); } };
   $('trail').onchange = (e) => { S.showTrail = e.target.checked; buildTrail(); };
   $('rings').onchange = (e) => { S.showRings = e.target.checked; buildLinks(); };
+  $('coords').onchange = (e) => { S.showCoords = e.target.checked; buildTags(); };
   $('spin').onchange = (e) => { S.autoSpin = e.target.checked; };
   $('view-top').onclick = () => setView('top');
   $('view-iso').onclick = () => setView('iso');
